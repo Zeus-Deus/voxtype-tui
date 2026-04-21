@@ -26,3 +26,6 @@ venv/
 # voxtype-tui's own first-write backup files (should only appear next to a
 # real user config, not in the repo — but harmless to ignore)
 *.voxtype-tui-bak
+
+# Claude Code local config (project-scoped skills, settings, etc.)
+.claude/
