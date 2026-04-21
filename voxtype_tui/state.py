@@ -16,6 +16,21 @@ from tomlkit import TOMLDocument
 from . import config, sidecar
 
 
+def _toml_equals(a: object, b: object) -> bool:
+    """Compare a tomlkit-wrapped value with a Python primitive. tomlkit bool
+    isn't a bool subclass so direct == can be surprising — fall back to string
+    form for a defensive last check."""
+    try:
+        if a == b:
+            return True
+    except Exception:
+        pass
+    try:
+        return str(a) == str(b)
+    except Exception:
+        return False
+
+
 @dataclass
 class AppState:
     doc: TOMLDocument
@@ -151,14 +166,22 @@ class AppState:
         return True
 
     def set_setting(self, path: str, value: object) -> None:
-        """Set any dotted config path. Creates intermediate sections if needed."""
+        """Idempotent set of any dotted config path.
+
+        Creates intermediate sections if needed. If the resolved value already
+        equals `value`, the write is skipped so `config_dirty` stays False —
+        crucial for widgets that fire Changed events during programmatic
+        population (e.g. Settings pane hydrating from state on mount)."""
         parts = path.split(".")
         node = self.doc
         for p in parts[:-1]:
             if p not in node:
                 node[p] = tomlkit.table()
             node = node[p]
-        node[parts[-1]] = value
+        key = parts[-1]
+        if key in node and _toml_equals(node[key], value):
+            return
+        node[key] = value
         self.config_dirty = True
 
     # --- save ---

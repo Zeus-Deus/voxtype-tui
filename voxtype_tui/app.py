@@ -19,6 +19,7 @@ from textual.widgets import Button, Footer, Input, Label, Static, TabbedContent,
 
 from . import config, sidecar, voxtype_cli
 from .dictionary import DictionaryPane
+from .settings import SettingsPane
 from .state import AppState
 from .vocabulary import VocabularyPane
 
@@ -174,11 +175,6 @@ class ConfirmQuitModal(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class SettingsPane(Vertical):
-    def compose(self) -> ComposeResult:
-        yield Static("Settings tab — coming soon.")
-
-
 class VoxtypeTUI(App[None]):
     TITLE = "voxtype-tui"
 
@@ -257,6 +253,8 @@ class VoxtypeTUI(App[None]):
         for pane in self.query(VocabularyPane):
             pane.sync_from_state()
         for pane in self.query(DictionaryPane):
+            pane.sync_from_state()
+        for pane in self.query(SettingsPane):
             pane.sync_from_state()
 
     def refresh_dirty(self) -> None:
