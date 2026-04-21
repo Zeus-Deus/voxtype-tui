@@ -22,6 +22,7 @@ from .theme import MODAL_BORDER_STYLE
 from .dictionary import DictionaryPane
 from .models import ModelsPane
 from .screens.export import ExportBundleModal
+from .screens.import_bundle import ImportBundleModal
 from .settings import SettingsPane
 from .state import AppState
 from .vocabulary import VocabularyPane
@@ -222,6 +223,7 @@ class VoxtypeTUI(App[None]):
         Binding("ctrl+r", "reload_config", "Reload", priority=True),
         Binding("ctrl+shift+r", "restart_daemon", "Restart daemon", priority=True),
         Binding("ctrl+e", "export_bundle", "Export", priority=True),
+        Binding("ctrl+i", "import_bundle", "Import", priority=True),
         Binding("ctrl+t", "test_mutate", "Fake mutation", show=False),
         Binding("ctrl+q", "request_quit", "Quit", priority=True),
     ]
@@ -277,6 +279,8 @@ class VoxtypeTUI(App[None]):
         # Ctrl+E while editing a vocab phrase is almost always a typo and
         # opening the export modal would clobber the user's input focus.
         if action == "export_bundle" and isinstance(self.focused, Input):
+            return False
+        if action == "import_bundle" and isinstance(self.focused, Input):
             return False
         return True
 
@@ -508,6 +512,37 @@ class VoxtypeTUI(App[None]):
             )
 
         self.push_screen(ExportBundleModal(self.state), after)
+
+    def action_import_bundle(self) -> None:
+        """Open the manual-import modal. On apply, the shadow state is
+        merged in-place and dirty flags flip — user still needs Ctrl+S
+        to persist. We re-sync every tab so the newly-merged vocab,
+        replacements, and settings land in the UI immediately."""
+        if self.state is None:
+            return
+
+        def after(applied: bool | None) -> None:
+            if not applied:
+                return
+            # Refresh each pane so merged content shows up without a
+            # reload. refresh_dirty flips the top-bar pill to `● dirty`
+            # — the save action is the user's next step.
+            for pane in self.query(VocabularyPane):
+                pane.sync_from_state()
+            for pane in self.query(DictionaryPane):
+                pane.sync_from_state()
+            for pane in self.query(SettingsPane):
+                pane.sync_from_state()
+            for pane in self.query(ModelsPane):
+                pane.sync_from_state()
+            self.refresh_dirty()
+            self.notify(
+                "Imported. Press Ctrl+S to persist.",
+                title="Import applied",
+                timeout=6,
+            )
+
+        self.push_screen(ImportBundleModal(self.state), after)
 
     def action_request_quit(self) -> None:
         if self.state is None or not self.state.dirty:

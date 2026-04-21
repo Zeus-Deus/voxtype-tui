@@ -60,6 +60,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+import tomlkit
+
 from .sidecar import (
     CATEGORIES,
     DEFAULT_CATEGORY,
@@ -1041,6 +1043,422 @@ def build_export_bundle(
         device_label=device_label or get_device_label(),
         include_secrets=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Manual import (Step 4): foreign / native bundle → merged state
+# ---------------------------------------------------------------------------
+
+@dataclass
+class VocabDiff:
+    added: list[str] = field(default_factory=list)
+    unchanged: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ReplacementDiff:
+    added: list[tuple[str, str]] = field(default_factory=list)  # (from, to)
+    updated: list[tuple[str, str, str]] = field(default_factory=list)
+    # (from, old_to, new_to)
+    unchanged: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SettingChange:
+    path: str
+    old: Any
+    new: Any
+    dangerous: bool = False
+
+
+@dataclass
+class ImportPreview:
+    """Structured diff between an imported bundle and current state.
+
+    The import modal renders this as human-readable bullets. `dangerous`
+    entries in `settings` are also rendered verbatim so the user can
+    read the exact API key / shell command before accepting — the
+    preview is the last line of defense against a malicious bundle.
+    """
+    source: str
+    vocab: VocabDiff = field(default_factory=VocabDiff)
+    replacements: ReplacementDiff = field(default_factory=ReplacementDiff)
+    settings: list[SettingChange] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+def load_bundle_file(path: Path) -> tuple[Bundle, list[str]]:
+    """Read a JSON file at `path` and return (bundle, warnings).
+
+    Accepts three formats:
+      * voxtype-tui native (our own export / sync.json)
+      * Vexis dictionary (list of {trigger, replacement, category})
+      * Vexis vocabulary (list of strings OR list of {id, word})
+
+    Vexis formats are wrapped into a synthetic voxtype-tui Bundle so
+    downstream logic (preview, apply) doesn't need to branch. The
+    `generated_by_device` field is set to the Vexis format name so the
+    preview modal can label the source honestly.
+
+    Raises BundleError with a user-readable message on any failure —
+    oversize file, invalid JSON, unrecognized shape, schema too new,
+    etc. Callers should surface the message in the modal and keep the
+    dialog open for retry.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError as e:
+        raise BundleError(f"could not read file: {e}") from e
+    if len(raw) > MAX_BUNDLE_BYTES:
+        raise BundleError(
+            f"file is {len(raw)} bytes; limit {MAX_BUNDLE_BYTES}"
+        )
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise BundleError(f"invalid JSON: {e}") from e
+
+    fmt = detect_format(parsed)
+    warnings: list[str] = []
+
+    if fmt == VOXTYPE_TUI_FORMAT:
+        # Delegate to from_json for full schema + length validation.
+        return from_json(raw.decode("utf-8")), warnings
+
+    if fmt == VEXIS_DICTIONARY_FORMAT:
+        reps = adapt_vexis_dictionary(parsed)
+        warnings.append(
+            f"Imported Vexis dictionary format: {len(reps)} replacement(s)."
+        )
+        return _synthesize_bundle_from_vexis(
+            vocabulary=[], replacements=reps, source=VEXIS_DICTIONARY_FORMAT,
+        ), warnings
+
+    if fmt == VEXIS_VOCABULARY_FORMAT:
+        vocab = adapt_vexis_vocabulary(parsed)
+        warnings.append(
+            f"Imported Vexis vocabulary format: {len(vocab)} phrase(s)."
+        )
+        return _synthesize_bundle_from_vexis(
+            vocabulary=vocab, replacements=[], source=VEXIS_VOCABULARY_FORMAT,
+        ), warnings
+
+    raise BundleError(
+        "Unrecognized file format. Expected a voxtype-tui bundle or a "
+        "Vexis export (vexis-dictionary.json / vexis-vocabulary.json)."
+    )
+
+
+def _synthesize_bundle_from_vexis(
+    vocabulary: list[dict[str, Any]],
+    replacements: list[dict[str, Any]],
+    source: str,
+) -> Bundle:
+    """Wrap Vexis-adapted data in a synthetic voxtype-tui Bundle so the
+    preview/apply pipeline is single-path."""
+    sync_block: dict[str, Any] = {
+        "vocabulary": vocabulary,
+        "replacements": replacements,
+        "settings": {},
+    }
+    return Bundle(
+        schema_version=SCHEMA_VERSION,
+        format=FORMAT_TAG,
+        generated_at=_iso_now(),
+        generated_by_device=source,
+        local_sync_hash=stable_hash(sync_block),
+        sync=sync_block,
+        local={},
+        secrets=None,
+    )
+
+
+def diff_bundle_against_state(
+    bundle: Bundle,
+    doc: Any,
+    sc: Sidecar,
+    *,
+    include_local: bool = False,
+) -> ImportPreview:
+    """Compute what applying `bundle` would change vs current state.
+
+    Pure: no mutations. `include_local=True` also diffs the `local`
+    block (matches the "import local settings too" checkbox in the
+    preview modal).
+    """
+    preview = ImportPreview(source=bundle.generated_by_device or bundle.format)
+
+    # --- Vocabulary
+    existing_phrases = {v.phrase for v in sc.vocabulary}
+    for entry in bundle.sync.get("vocabulary", []):
+        phrase = entry.get("phrase")
+        if not isinstance(phrase, str) or not phrase:
+            continue
+        if phrase in existing_phrases:
+            preview.vocab.unchanged.append(phrase)
+        else:
+            preview.vocab.added.append(phrase)
+
+    # --- Replacements
+    current_reps: dict[str, str] = {}
+    text_node = doc.get("text") if hasattr(doc, "get") else None
+    if text_node is not None:
+        rep_table = text_node.get("replacements") if hasattr(text_node, "get") else None
+        if rep_table is not None:
+            for k, v in rep_table.items():
+                current_reps[str(k)] = str(v)
+    for entry in bundle.sync.get("replacements", []):
+        frm = entry.get("from")
+        to = entry.get("to")
+        if not isinstance(frm, str) or not isinstance(to, str):
+            continue
+        if frm not in current_reps:
+            preview.replacements.added.append((frm, to))
+        elif current_reps[frm] != to:
+            preview.replacements.updated.append((frm, current_reps[frm], to))
+        else:
+            preview.replacements.unchanged.append(frm)
+
+    # --- Settings (sync + optionally local)
+    settings_changes = _diff_settings(
+        current=doc,
+        incoming=bundle.sync.get("settings", {}),
+    )
+    if include_local:
+        settings_changes.extend(_diff_settings(
+            current=doc,
+            incoming=bundle.local or {},
+        ))
+
+    # --- Secrets: only non-blank values propose a change
+    if bundle.secrets:
+        settings_changes.extend(_diff_settings(
+            current=doc,
+            incoming=bundle.secrets,
+            skip_empty_strings=True,
+        ))
+
+    preview.settings = settings_changes
+    return preview
+
+
+def _diff_settings(
+    current: Any,
+    incoming: dict[str, Any],
+    *,
+    skip_empty_strings: bool = False,
+    path: tuple[str, ...] = (),
+) -> list[SettingChange]:
+    out: list[SettingChange] = []
+    for key, new_value in incoming.items():
+        current_path = path + (key,)
+        if isinstance(new_value, dict):
+            out.extend(_diff_settings(
+                current=current,
+                incoming=new_value,
+                skip_empty_strings=skip_empty_strings,
+                path=current_path,
+            ))
+            continue
+        if skip_empty_strings and new_value == "":
+            continue
+        old_value = _resolve(current, current_path)
+        # tomlkit's String / Integer / Bool wrap raw values; coerce to
+        # Python primitives for an honest comparison. Otherwise
+        # `tomlkit.Integer(5) != 5` would produce a false-positive diff.
+        old_coerced = _coerce_toml_scalar(old_value)
+        if old_coerced == new_value:
+            continue
+        out.append(SettingChange(
+            path=".".join(current_path),
+            old=old_coerced,
+            new=new_value,
+            dangerous=current_path in DANGEROUS_PATHS,
+        ))
+    return out
+
+
+def _coerce_toml_scalar(v: Any) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return bool(v)
+    if isinstance(v, int):
+        return int(v)
+    if isinstance(v, float):
+        return float(v)
+    if isinstance(v, str):
+        return str(v)
+    if isinstance(v, (list, tuple)):
+        return [_coerce_toml_scalar(x) for x in v]
+    return v
+
+
+def apply_bundle_to_state(
+    bundle: Bundle,
+    doc: Any,
+    sc: Sidecar,
+    *,
+    include_local: bool = False,
+) -> list[str]:
+    """Merge bundle contents into `doc` + `sc` in place.
+
+    Merge semantics (not replace):
+      * Vocabulary: imported phrases APPENDED if not already present;
+        existing phrases kept. `initial_prompt` rebuilt to include all.
+      * Replacements: imported `from→to` upserted. Existing replacements
+        not in import are kept. Category may update.
+      * Settings: field-by-field overwrite for sync block. Each leaf
+        imported by the bundle replaces the corresponding doc value.
+        `None` / missing leaves are no-ops (preserve local).
+      * Local: only applied when `include_local=True`.
+      * Secrets: non-blank values overwrite; blank ("") values skipped
+        (see `diff_dangerous` redaction contract).
+
+    Does NOT call save. The caller owns when to persist — typically the
+    user reviews the merged shadow state in the tabs and hits Ctrl+S
+    explicitly.
+
+    Returns a list of human-readable warnings (e.g. initial_prompt
+    would exceed Whisper's token budget). Empty list on clean imports.
+    """
+    warnings: list[str] = []
+
+    # --- Vocabulary: append missing phrases (preserve existing order)
+    existing_phrases = {v.phrase for v in sc.vocabulary}
+    for entry in bundle.sync.get("vocabulary", []):
+        phrase = entry.get("phrase")
+        if not isinstance(phrase, str) or not phrase:
+            continue
+        if phrase in existing_phrases:
+            continue
+        sc.vocabulary.append(VocabEntry(
+            phrase=phrase,
+            added_at=entry.get("added_at") or _iso_now(),
+            notes=entry.get("notes"),
+        ))
+        existing_phrases.add(phrase)
+
+    # Rewrite initial_prompt to match the new vocabulary. Do this via
+    # tomlkit tables so the existing file's comments survive.
+    phrases = [v.phrase for v in sc.vocabulary]
+    if phrases:
+        _set_nested(doc, ", ".join(phrases), "whisper", "initial_prompt")
+    elif _resolve(doc, ("whisper", "initial_prompt")) is not None:
+        # Only delete if present — avoid creating an empty [whisper]
+        # table on a minimal config.
+        try:
+            del doc["whisper"]["initial_prompt"]
+        except Exception:
+            pass
+    if exceeds_initial_prompt_limit(phrases):
+        warnings.append(
+            "Vocabulary is close to Whisper's prompt limit; transcription "
+            "quality may degrade beyond ~224 tokens."
+        )
+
+    # --- Replacements: upsert into config.text.replacements + sidecar
+    rep_node = _resolve(doc, ("text", "replacements"))
+    # Snapshot current values so we can compare and choose between
+    # creating a fresh inline table vs. incremental updates.
+    current_reps: dict[str, str] = {}
+    if rep_node is not None:
+        for k, v in rep_node.items():
+            current_reps[str(k)] = str(v)
+
+    existing_from = {r.from_text for r in sc.replacements}
+    for entry in bundle.sync.get("replacements", []):
+        frm = entry.get("from")
+        to = entry.get("to")
+        if not isinstance(frm, str) or not isinstance(to, str):
+            continue
+        current_reps[frm] = to
+        new_cat = _normalize_category(
+            entry.get("category", DEFAULT_CATEGORY) or DEFAULT_CATEGORY
+        )
+        if frm in existing_from:
+            for r in sc.replacements:
+                if r.from_text == frm and r.category != new_cat:
+                    r.category = new_cat
+                    break
+        else:
+            sc.replacements.append(ReplacementEntry(
+                from_text=frm,
+                category=new_cat,
+                added_at=entry.get("added_at") or _iso_now(),
+            ))
+            existing_from.add(frm)
+
+    # Write merged replacements back into the doc.
+    if current_reps:
+        _write_replacements_table(doc, current_reps)
+
+    # --- Settings (sync block)
+    _apply_settings_dict(doc, bundle.sync.get("settings", {}))
+
+    # --- Local (opt-in)
+    if include_local:
+        _apply_settings_dict(doc, bundle.local or {})
+
+    # --- Secrets (non-blank only)
+    if bundle.secrets:
+        _apply_settings_dict(doc, bundle.secrets, skip_empty_strings=True)
+
+    return warnings
+
+
+def _set_nested(doc: Any, value: Any, *path: str) -> None:
+    """Set `value` at nested `path` in a tomlkit document, creating
+    intermediate tables via `tomlkit.table()`. Skips the write if the
+    current value already equals the new value (avoids spurious
+    `loaded_dump != current` dirty flagging)."""
+    node = doc
+    for key in path[:-1]:
+        if key not in node:
+            node[key] = tomlkit.table()
+        node = node[key]
+    last = path[-1]
+    current = _coerce_toml_scalar(node.get(last)) if hasattr(node, "get") else None
+    if current == value:
+        return
+    node[last] = value
+
+
+def _apply_settings_dict(
+    doc: Any,
+    incoming: dict[str, Any],
+    *,
+    skip_empty_strings: bool = False,
+    path: tuple[str, ...] = (),
+) -> None:
+    """Walk `incoming` recursively and write each leaf into `doc`."""
+    for key, value in incoming.items():
+        current_path = path + (key,)
+        if isinstance(value, dict):
+            _apply_settings_dict(
+                doc, value,
+                skip_empty_strings=skip_empty_strings,
+                path=current_path,
+            )
+            continue
+        if value is None:
+            continue
+        if skip_empty_strings and value == "":
+            continue
+        _set_nested(doc, value, *current_path)
+
+
+def _write_replacements_table(doc: Any, reps: dict[str, str]) -> None:
+    """Replace `[text.replacements]` in `doc` with exactly `reps`. Uses
+    tomlkit's inline-table form to match the template's commented-out
+    hint; users who prefer multi-line tables can flip it after import."""
+    if "text" not in doc:
+        doc["text"] = tomlkit.table()
+    text = doc["text"]
+    inline = tomlkit.inline_table()
+    for k, v in reps.items():
+        inline[k] = v
+    text["replacements"] = inline
 
 
 def write_export_bundle(
