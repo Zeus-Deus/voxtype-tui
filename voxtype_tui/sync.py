@@ -1461,6 +1461,262 @@ def _write_replacements_table(doc: Any, reps: dict[str, str]) -> None:
     text["replacements"] = inline
 
 
+# ---------------------------------------------------------------------------
+# Startup reader (Step 5): conflict detection + staleness compare + apply
+# ---------------------------------------------------------------------------
+
+# Where Voxtype stores downloaded whisper models. Used by the reader's
+# missing-model check — if a sync bundle applies a model we don't have,
+# the app surfaces a banner so the user can download it explicitly
+# (never an auto-fetch).
+DEFAULT_MODELS_DIR: Path = Path.home() / ".local" / "share" / "voxtype" / "models"
+
+# Timestamp parsing tolerances. A bundle minted from another device may
+# carry a `generated_at` in a slightly different ISO format (trailing Z,
+# fractional seconds, different timezone offset). `datetime.fromisoformat`
+# is lax enough for our inputs but needs the trailing `Z` swapped for
+# `+00:00`.
+_ISO_TRAILING_Z = "Z"
+
+
+@dataclass
+class SyncReconcileResult:
+    """What happened during startup's sync reconciliation.
+
+    Only one of `applied_from` / `conflict_files` / `skipped_reason` is
+    typically meaningful at a time. The app shell reads these to drive
+    banners:
+
+      * `conflict_files` non-empty → persistent error banner, no apply.
+      * `applied_from` set         → dismissible success banner.
+      * `missing_model` set        → dismissible warning banner with a
+                                     Download action (wired in Step 6).
+      * `skipped_reason` alone     → silent; common single-device case.
+    """
+    applied_from: str | None = None
+    applied_at: str | None = None
+    conflict_files: list[Path] = field(default_factory=list)
+    missing_model: str | None = None
+    skipped_reason: str | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+def find_sync_conflict_files(sync_path: Path | None = None) -> list[Path]:
+    """Return Syncthing conflict-copy files next to `sync_path`.
+
+    Syncthing names conflicts as `<stem>.sync-conflict-<ts>-<hash>.<ext>`
+    (see https://docs.syncthing.net/users/syncing.html#conflicting-changes).
+    We glob for that pattern and return the list sorted by mtime so the
+    oldest is first (matches chronological resolution UX).
+    """
+    path = sync_path or SYNC_PATH
+    parent = path.parent
+    if not parent.exists():
+        return []
+    pattern = f"{path.stem}.sync-conflict-*{path.suffix}"
+    matches = list(parent.glob(pattern))
+    matches.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
+    return matches
+
+
+def read_sync_bundle(sync_path: Path | None = None) -> Bundle | None:
+    """Read and parse a bundle from disk, tolerantly.
+
+    Returns None for:
+      * File absent (common first-run case; no banner)
+      * File unreadable (permissions, etc. — debug log, no banner)
+      * Corrupt JSON / unknown format / schema too new (warning log;
+        caller surfaces a banner)
+
+    We never raise — startup must proceed even when sync.json is
+    garbage, because a bad sync file shouldn't prevent the user from
+    using the app locally.
+    """
+    path = sync_path or SYNC_PATH
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        logger.debug("sync.json unreadable (%s); skipping reconcile", e)
+        return None
+    try:
+        return from_json(raw.decode("utf-8"))
+    except BundleError as e:
+        logger.warning(
+            "sync.json rejected (%s); skipping reconcile. File left in place.",
+            e,
+        )
+        return None
+
+
+def _parse_iso(ts: str) -> datetime | None:
+    if not ts:
+        return None
+    normalized = ts.replace(_ISO_TRAILING_Z, "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        # Treat naive datetimes as UTC — we always write UTC, and
+        # bundles from other timezones should be explicit.
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _max_local_mtime(config_path: Path, sidecar_path: Path) -> datetime:
+    """Latest mtime across the canonical files, as aware UTC datetime."""
+    mtimes = []
+    for p in (config_path, sidecar_path):
+        try:
+            mtimes.append(p.stat().st_mtime)
+        except FileNotFoundError:
+            continue
+    if not mtimes:
+        return datetime.fromtimestamp(0, tz=timezone.utc)
+    return datetime.fromtimestamp(max(mtimes), tz=timezone.utc)
+
+
+def _model_file_present(model_name: str, models_dir: Path) -> bool:
+    """Best-effort check for whether Voxtype has a whisper model
+    downloaded locally. Matches `ggml-<name>.bin`, the whisper.cpp
+    convention that Voxtype's downloader uses."""
+    if not models_dir.exists():
+        return False
+    return (models_dir / f"ggml-{model_name}.bin").exists()
+
+
+def reconcile_sync_on_startup(
+    doc: Any,
+    sc: Sidecar,
+    *,
+    config_path: Path,
+    sidecar_path: Path,
+    sync_path: Path | None = None,
+    models_dir: Path | None = None,
+) -> SyncReconcileResult:
+    """Startup hook: detect conflicts, apply stale local, flag missing models.
+
+    Decision tree:
+
+    1. **Conflict files present** → set `conflict_files`, return. No
+       apply, no write. The user resolves manually via export/import.
+
+    2. **No sync.json** → `skipped_reason = "no_file"`, return.
+
+    3. **Corrupt / schema-too-new sync.json** → `skipped_reason` set,
+       warning logged. Caller may or may not surface a banner.
+
+    4. **Local mtime ≥ sync.generated_at** → local is equal or newer,
+       `skipped_reason = "local_newer"`. Writer on next save will
+       regenerate sync.json.
+
+    5. **sync.generated_at > local mtime** → sync is newer. Verify the
+       applied bundle would actually change state (content hash
+       differs). If yes, merge into doc + sc AND write back to disk
+       atomically so loaded state stays consistent with what's on disk.
+       Set `applied_from` to the device label for the banner.
+
+    6. Post-apply, check whisper.model against the local models dir;
+       set `missing_model` if absent.
+
+    Mutates `doc` and `sc` in place when apply fires. The caller's
+    `loaded_dump` snapshot should be re-taken after this returns — it's
+    AppState's responsibility to do that.
+
+    Does NOT touch the daemon. A restart (if needed) is the user's
+    explicit Ctrl+Shift+R.
+    """
+    result = SyncReconcileResult()
+    sync_path = sync_path or SYNC_PATH
+    models_dir = models_dir or DEFAULT_MODELS_DIR
+
+    # --- 1. Conflict files short-circuit
+    result.conflict_files = find_sync_conflict_files(sync_path)
+    if result.conflict_files:
+        result.skipped_reason = "conflict"
+        return result
+
+    # --- 2 & 3. Read + parse
+    bundle = read_sync_bundle(sync_path)
+    if bundle is None:
+        # Distinguish "no file" from "corrupt/rejected" for banner logic.
+        if sync_path.exists():
+            result.skipped_reason = "corrupt"
+            result.warnings.append(
+                "sync.json could not be parsed; ignored. "
+                "Next save will regenerate it."
+            )
+        else:
+            result.skipped_reason = "no_file"
+        return result
+
+    # --- 4. Timestamp compare
+    sync_dt = _parse_iso(bundle.generated_at)
+    if sync_dt is None:
+        result.skipped_reason = "corrupt"
+        result.warnings.append(
+            f"sync.json has unparseable generated_at "
+            f"{bundle.generated_at!r}; skipping apply."
+        )
+        return result
+
+    local_dt = _max_local_mtime(config_path, sidecar_path)
+    if sync_dt <= local_dt:
+        result.skipped_reason = "local_newer"
+        return result
+
+    # --- 5. Sync is newer. Content check: if the bundle's sync block
+    # distills to the same content as current state, there's nothing
+    # meaningful to apply (someone else's device happened to regenerate
+    # a bundle with identical data). Skip to avoid a dirty-rewrite loop.
+    current_sync = distill_sync(doc, sc.vocabulary, sc.replacements)
+    if stable_hash(current_sync) == stable_hash(bundle.sync):
+        result.skipped_reason = "identical"
+        return result
+
+    warnings = apply_bundle_to_state(bundle, doc, sc, include_local=False)
+    result.warnings.extend(warnings)
+
+    # Persist immediately so the loaded in-memory state stays in sync
+    # with disk. This avoids the next save having to re-apply and
+    # prevents a partial-state window if the app crashes.
+    _persist_after_apply(doc, sc, config_path, sidecar_path)
+
+    result.applied_from = bundle.generated_by_device or "(unknown device)"
+    result.applied_at = bundle.generated_at
+
+    # --- 6. Missing-model check on the applied settings
+    model_name = _get(bundle.sync, "settings", "whisper", "model")
+    if isinstance(model_name, str) and model_name:
+        if not _model_file_present(model_name, models_dir):
+            result.missing_model = model_name
+
+    return result
+
+
+def _persist_after_apply(
+    doc: Any,
+    sc: Sidecar,
+    config_path: Path,
+    sidecar_path: Path,
+) -> None:
+    """Atomically write doc + sc back to disk after a sync-apply.
+
+    Uses `config.save_atomic` (NOT `config.safe_save`) to skip the
+    voxtype-binary validation — voxtype may not be installed (test
+    envs) or the sync may have introduced a config voxtype doesn't
+    recognize yet, and we don't want startup to crash because of it.
+    The next user-driven Ctrl+S goes through `safe_save` and gets
+    validated there.
+    """
+    from . import config as _config  # avoid import cycle at module load
+    from . import sidecar as _sidecar
+    _config.save_atomic(doc, config_path)
+    _sidecar.save_atomic(sc, sidecar_path)
+
+
 def write_export_bundle(
     bundle: Bundle,
     target: Path,

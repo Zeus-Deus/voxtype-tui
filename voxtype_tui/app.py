@@ -86,6 +86,143 @@ class HeaderBar(Horizontal):
         yield Static("ctrl+s save · ctrl+r reload", id="hint")
 
 
+class SyncConflictBanner(Horizontal):
+    """Persistent banner shown when Syncthing has deposited
+    `.sync-conflict-*.json` files next to `sync.json`. Red background,
+    not dismissible — resolving requires the user to manually export
+    one side and re-import the preferred state. No auto-merge (v1.1
+    non-goal).
+
+    Clicking the banner fires a toast listing the conflict file paths
+    so the user can find them."""
+
+    DEFAULT_CSS = """
+    SyncConflictBanner {
+        height: auto;
+        background: $error 30%;
+        color: $text;
+        padding: 0 1;
+        border-bottom: solid $error;
+    }
+    SyncConflictBanner > #msg { width: 1fr; padding: 0 1; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="msg")
+
+    def on_mount(self) -> None:
+        self.display = False
+        self.conflict_files: list[Path] = []
+
+    def set_conflicts(self, paths: list[Path]) -> None:
+        self.conflict_files = list(paths)
+        if not paths:
+            self.display = False
+            return
+        self.query_one("#msg", Static).update(
+            f"⚠ Sync conflict detected ({len(paths)} file"
+            f"{'s' if len(paths) != 1 else ''}). Resolve manually — "
+            "click for details."
+        )
+        self.display = True
+
+    def on_click(self) -> None:
+        if not self.conflict_files:
+            return
+        lines = "\n".join(str(p) for p in self.conflict_files)
+        self.app.notify(
+            lines,
+            title="Sync conflict files",
+            severity="warning",
+            timeout=15,
+        )
+
+
+class AppliedSyncBanner(Horizontal):
+    """One-shot banner after a successful sync-apply at startup.
+    Dismissible; fades from the UI when the user clicks Dismiss."""
+
+    DEFAULT_CSS = """
+    AppliedSyncBanner {
+        height: auto;
+        background: $success 20%;
+        color: $text;
+        padding: 0 1;
+        border-bottom: solid $success;
+    }
+    AppliedSyncBanner > #msg { width: 1fr; padding: 0 1; }
+    AppliedSyncBanner > Button { height: 1; min-width: 9; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="msg")
+        yield Button("Dismiss", id="dismiss-synced", variant="default")
+
+    def on_mount(self) -> None:
+        self.display = False
+
+    def set_applied(self, device_label: str) -> None:
+        self.query_one("#msg", Static).update(
+            f"✓ Synced from {device_label}"
+        )
+        self.display = True
+
+    def hide_banner(self) -> None:
+        self.display = False
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "dismiss-synced":
+            self.hide_banner()
+            event.stop()
+
+
+class MissingModelBanner(Horizontal):
+    """Shown when a sync-apply references a model not present in
+    `~/.local/share/voxtype/models/`. Has a Download button wired in
+    Step 6; Dismiss hides it until next startup."""
+
+    DEFAULT_CSS = """
+    MissingModelBanner {
+        height: auto;
+        background: $warning 25%;
+        color: $text;
+        padding: 0 1;
+        border-bottom: solid $warning;
+    }
+    MissingModelBanner > #msg { width: 1fr; padding: 0 1; }
+    MissingModelBanner > Button { height: 1; min-width: 10; margin-left: 1; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="msg")
+        yield Button("Download", variant="primary", id="missing-download")
+        yield Button("Dismiss", id="missing-dismiss", variant="default")
+
+    def on_mount(self) -> None:
+        self.display = False
+        self.model_name: str | None = None
+
+    def set_missing(self, model_name: str) -> None:
+        self.model_name = model_name
+        self.query_one("#msg", Static).update(
+            f"Model '{model_name}' is not downloaded locally. "
+            "Transcription will fail until it's fetched."
+        )
+        self.display = True
+
+    def hide_banner(self) -> None:
+        self.display = False
+        self.model_name = None
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        # Download action is wired in Step 6 on the app class. We only
+        # handle Dismiss here; the app delegates Download to the Models
+        # tab's existing pipeline.
+        if event.button.id == "missing-dismiss":
+            self.hide_banner()
+            event.stop()
+
+
 class ReconcileBanner(Horizontal):
     DEFAULT_CSS = """
     ReconcileBanner {
@@ -242,6 +379,9 @@ class VoxtypeTUI(App[None]):
 
     def compose(self) -> ComposeResult:
         yield HeaderBar()
+        yield SyncConflictBanner(id="conflict-banner")
+        yield AppliedSyncBanner(id="applied-banner")
+        yield MissingModelBanner(id="missing-model-banner")
         yield ReconcileBanner(id="banner")
         with TabbedContent(id="tabs", initial="vocabulary"):
             with TabPane("Vocabulary", id="vocabulary"):
@@ -329,6 +469,12 @@ class VoxtypeTUI(App[None]):
             banner.show_warnings(self.state.reconcile_warnings)
         else:
             banner.hide_banner()
+
+        # Drive the sync banners from the reconcile result. Conflict
+        # never auto-clears (user resolves explicitly); applied +
+        # missing-model are dismissible. Every reload goes through this
+        # path so Ctrl+R after resolving conflicts does the right thing.
+        self._update_sync_banners()
         self.refresh_dirty()
         # Give each tab a chance to resync to the freshly-loaded state.
         for pane in self.query(VocabularyPane):
@@ -346,6 +492,35 @@ class VoxtypeTUI(App[None]):
             widget.update("● dirty")
         else:
             widget.update("✓ saved")
+
+    def _update_sync_banners(self) -> None:
+        """Reflect state.sync_reconcile in the three sync banners.
+        Safe to call from any reload path — a no-op reconcile clears
+        all three banners (conflict goes back to hidden; applied +
+        missing close if previously open).
+        """
+        if self.state is None:
+            return
+        result = self.state.sync_reconcile
+
+        try:
+            conflict = self.query_one(SyncConflictBanner)
+            applied = self.query_one(AppliedSyncBanner)
+            missing = self.query_one(MissingModelBanner)
+        except Exception:
+            # Banners not yet mounted (very early in on_mount). Skip;
+            # load_state will re-run post-mount when they exist.
+            return
+
+        conflict.set_conflicts(result.conflict_files)
+        if result.applied_from:
+            applied.set_applied(result.applied_from)
+        else:
+            applied.hide_banner()
+        if result.missing_model:
+            missing.set_missing(result.missing_model)
+        else:
+            missing.hide_banner()
 
     def refresh_stale_pill(self) -> None:
         """Toggle the header's daemon-stale pill based on state.daemon_stale.

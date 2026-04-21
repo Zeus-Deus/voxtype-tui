@@ -49,6 +49,13 @@ class AppState:
     # restarting the TUI itself re-derives from scratch on load.
     daemon_stale: bool = False
     reconcile_warnings: list[str] = field(default_factory=list)
+    # Populated at load time. Banners in the app shell read this to
+    # decide what to surface (conflict files, applied-from device,
+    # missing model). Defaults to an empty result; same shape no matter
+    # whether the feature applied, skipped, or hit an error.
+    sync_reconcile: "sync.SyncReconcileResult" = field(
+        default_factory=lambda: sync.SyncReconcileResult()
+    )
 
     @property
     def dirty(self) -> bool:
@@ -75,6 +82,18 @@ class AppState:
         new_vocab = [v.phrase for v in sc.vocabulary]
         sidecar_dirty = raw_cats != new_cats or raw_vocab != new_vocab
 
+        # Startup sync reconcile. Mutates `doc` + `sc` in place when a
+        # newer sync.json is applied (and writes them back to disk
+        # atomically so loaded state matches disk). The `loaded_dump`
+        # snapshot below therefore captures post-apply doc, which is
+        # correct — dirty flags stay at their current derived values
+        # because apply + immediate persist leaves nothing pending.
+        sync_result = sync.reconcile_sync_on_startup(
+            doc, sc,
+            config_path=config_path,
+            sidecar_path=sidecar_path,
+        )
+
         return cls(
             doc=doc,
             sc=sc,
@@ -83,6 +102,7 @@ class AppState:
             loaded_dump=tomlkit.dumps(doc),
             sidecar_dirty=sidecar_dirty,
             reconcile_warnings=w1 + w2,
+            sync_reconcile=sync_result,
         )
 
     # --- mutations (all set config_dirty and/or sidecar_dirty) ---
