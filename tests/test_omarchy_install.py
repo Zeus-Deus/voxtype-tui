@@ -1,8 +1,10 @@
 """Bash-level tests for the Omarchy install/uninstall scripts.
 
-Each test runs the script against a sandboxed `$HOME` so nothing touches the
-real user config. `hyprctl` is absent in the test environment; the scripts
-detect that via `command -v` and skip the reload silently."""
+Scripts assume voxtype-tui is already on PATH (AUR / pipx install), so each
+test provides a sandbox PATH containing a stub `voxtype-tui` binary. The
+"missing from PATH" test omits it to verify the exit-1 guard. `hyprctl` is
+deliberately absent so the scripts' reload branch always no-ops.
+"""
 from __future__ import annotations
 
 import os
@@ -16,10 +18,18 @@ INSTALL = REPO / "scripts" / "install-omarchy.sh"
 UNINSTALL = REPO / "scripts" / "uninstall-omarchy.sh"
 
 
+def _make_stub_voxtype_tui(dest: Path) -> Path:
+    """Drop a trivial stub binary at dest/voxtype-tui so `command -v` finds
+    it. The stub never actually runs during these tests."""
+    dest.mkdir(parents=True, exist_ok=True)
+    stub = dest / "voxtype-tui"
+    stub.write_text("#!/usr/bin/env bash\necho stub\n")
+    stub.chmod(0o755)
+    return stub
+
+
 @pytest.fixture
 def sandbox_home(tmp_path: Path) -> Path:
-    """A fake $HOME with an Omarchy config layout minimal enough for the
-    scripts to proceed past their sanity checks."""
     home = tmp_path
     (home / ".config" / "omarchy").mkdir(parents=True)
     hypr = home / ".config" / "hypr"
@@ -32,15 +42,26 @@ def sandbox_home(tmp_path: Path) -> Path:
         "# existing windows.conf content\n"
         "windowrule = float, class:^(some-app)$\n"
     )
+    _make_stub_voxtype_tui(home / ".local" / "bin")
     return home
 
 
-def run(script: Path, home: Path) -> subprocess.CompletedProcess:
-    """Run a script with HOME pointed at the sandbox. Strip PATH of any
-    hyprctl so the scripts' reload branch always no-ops."""
+def run(
+    script: Path,
+    home: Path,
+    *,
+    include_stub: bool = True,
+) -> subprocess.CompletedProcess:
+    """Run a script with HOME pointed at the sandbox. PATH is a minimal list
+    that optionally includes $HOME/.local/bin so the voxtype-tui stub is
+    discoverable. Omit the stub by passing include_stub=False to exercise the
+    missing-from-PATH guard."""
+    path_parts = ["/usr/bin", "/bin"]
+    if include_stub:
+        path_parts.insert(0, str(home / ".local" / "bin"))
     env = {
         "HOME": str(home),
-        "PATH": "/usr/bin:/bin",  # no hyprctl
+        "PATH": ":".join(path_parts),
         "LANG": os.environ.get("LANG", "C.UTF-8"),
     }
     return subprocess.run(
@@ -69,16 +90,18 @@ def test_install_writes_managed_lines(sandbox_home: Path) -> None:
     assert "match:initial_class org.omarchy.voxtype-tui" in windows
 
 
-def test_install_creates_wrapper(sandbox_home: Path) -> None:
-    result = run(INSTALL, sandbox_home)
-    assert result.returncode == 0, result.stderr
-
-    wrapper = sandbox_home / ".local" / "bin" / "voxtype-tui"
-    assert wrapper.exists()
-    assert os.access(wrapper, os.X_OK)
-    content = wrapper.read_text()
-    assert 'conda activate "voxtype-tui"' in content
-    assert "python -m voxtype_tui" in content
+def test_install_does_not_drop_a_wrapper(sandbox_home: Path) -> None:
+    """AUR install provides /usr/bin/voxtype-tui directly; install-omarchy
+    must NOT create a conda-activating wrapper."""
+    # Remove the stub first, then re-create after install to see what was added
+    stub_dir = sandbox_home / ".local" / "bin"
+    stub = stub_dir / "voxtype-tui"
+    before = stub.read_text()
+    run(INSTALL, sandbox_home)
+    # Stub wasn't overwritten with a conda wrapper
+    after = stub.read_text()
+    assert after == before
+    assert "conda" not in after
 
 
 def test_install_is_idempotent(sandbox_home: Path) -> None:
@@ -95,11 +118,22 @@ def test_install_is_idempotent(sandbox_home: Path) -> None:
 
 # ---- install: guards ----
 
+def test_install_bails_when_voxtype_tui_missing_from_path(sandbox_home: Path) -> None:
+    """The script assumes voxtype-tui is installed system-wide — if it's
+    not on PATH, refuse with exit 1 and a message pointing at AUR/pipx."""
+    result = run(INSTALL, sandbox_home, include_stub=False)
+    assert result.returncode == 1
+    assert "voxtype-tui not found on PATH" in result.stderr
+    assert "yay -S voxtype-tui" in result.stderr
+    assert "pipx install voxtype-tui" in result.stderr
+
+
 def test_install_bails_without_omarchy(tmp_path: Path) -> None:
     """If ~/.config/omarchy/ doesn't exist, install refuses with exit 1
     and a helpful message."""
     home = tmp_path
     (home / ".config").mkdir()  # no omarchy dir
+    _make_stub_voxtype_tui(home / ".local" / "bin")
     result = run(INSTALL, home)
     assert result.returncode == 1
     assert "Omarchy not detected" in result.stderr
@@ -116,7 +150,7 @@ def test_install_bails_on_conflicting_keybind(sandbox_home: Path) -> None:
     result = run(INSTALL, sandbox_home)
     assert result.returncode == 2
     assert "already exists on SUPER CTRL ALT, X" in result.stderr
-    assert "edit BIND_KEY" in result.stderr.lower() or "BIND_KEY" in result.stderr
+    assert "BIND_KEY" in result.stderr
 
 
 def test_install_doesnt_touch_configs_when_conflicting(sandbox_home: Path) -> None:
@@ -149,12 +183,14 @@ def test_uninstall_removes_managed_lines(sandbox_home: Path) -> None:
     assert "class:^(some-app)$" in windows
 
 
-def test_uninstall_removes_wrapper(sandbox_home: Path) -> None:
+def test_uninstall_does_not_remove_voxtype_tui_binary(sandbox_home: Path) -> None:
+    """Uninstall should only touch Hyprland config — never the package
+    binary (which might be system-owned, managed by pacman)."""
     run(INSTALL, sandbox_home)
-    wrapper = sandbox_home / ".local" / "bin" / "voxtype-tui"
-    assert wrapper.exists()
+    stub = sandbox_home / ".local" / "bin" / "voxtype-tui"
+    assert stub.exists()
     run(UNINSTALL, sandbox_home)
-    assert not wrapper.exists()
+    assert stub.exists()
 
 
 def test_uninstall_is_noop_when_not_installed(sandbox_home: Path) -> None:

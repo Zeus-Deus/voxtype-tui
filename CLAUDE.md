@@ -106,21 +106,27 @@ Put this at `~/.config/voxtype-tui/metadata.json` (or `.toml`). On load, merge w
 
 **Decision:** Python TUI using [Textual](https://textual.textualize.io/). Rationale: this app only reads/writes a TOML file and shells out to `voxtype` — no performance-critical work, so Rust/Ratatui's advantages don't apply here. Textual gets us to v1 faster.
 
-### Environment
+### Distribution
 
-Uses **miniconda** at `/home/zeus/miniconda3`. Dedicated env named **`voxtype-tui`** — do not install into `base` or global pip.
+**Shipped installs go through AUR (`yay -S voxtype-tui`) or pipx** (`pipx install voxtype-tui`). The PKGBUILD uses the modern `python-build` + `python-installer` flow; `.SRCINFO` lives at the repo root and must be regenerated with `makepkg --printsrcinfo > .SRCINFO` whenever PKGBUILD changes. `tests/test_pkgbuild.py` fails loudly when the committed `.SRCINFO` diverges from what PKGBUILD produces.
+
+`scripts/install-omarchy.sh` assumes `voxtype-tui` is already on `$PATH` from a system-level install (AUR / pipx). It does **not** drop a conda wrapper — if the binary isn't found it exits with a message pointing at the package managers.
+
+### Development environment
+
+**Conda is for local dev only**, not a supported user install path. Zeus's machine has **miniconda** at `/home/zeus/miniconda3` with a dedicated env named **`voxtype-tui`**.
 
 ```bash
 # Activate before doing anything in this project
 source /home/zeus/miniconda3/etc/profile.d/conda.sh
 conda activate voxtype-tui
 
-# Python 3.12, with: textual, tomlkit (+ transitive deps)
-# Dependencies locked in ./requirements.txt
+# Python 3.12, with: textual, tomlkit, pytest (+ transitive deps)
+# Dependencies pinned in ./requirements.txt; also declared in pyproject.toml.
 # Recreate from scratch if needed:
 #   conda create -n voxtype-tui python=3.12 pip -y
 #   conda activate voxtype-tui
-#   pip install -r requirements.txt
+#   pip install -e ".[dev]"
 ```
 
 ### Key libraries

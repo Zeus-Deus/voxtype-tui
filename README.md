@@ -4,24 +4,26 @@ A Textual-based TUI for managing [Voxtype](https://voxtype.io) — a push-to-tal
 
 ## Install
 
-Miniconda is recommended so the Textual/tomlkit versions stay pinned away from your system Python.
+### Arch / Omarchy (recommended)
 
 ```bash
-# Create the env (Python 3.12)
-conda create -n voxtype-tui python=3.12 pip -y
-conda activate voxtype-tui
-
-# Install runtime deps + the package itself in editable mode
-pip install -r requirements.txt
-pip install -e .
+yay -S voxtype-tui
 ```
 
-`pip install -e .` installs the `voxtype-tui` console entry point into the active env. You can invoke either:
+Drops `/usr/bin/voxtype-tui`, `/usr/share/applications/voxtype-tui.desktop`, and the Omarchy integration scripts under `/usr/share/voxtype-tui/`. Pulls in `voxtype-bin`, `python-textual`, and `python-tomlkit` as dependencies.
+
+### Other Linux
 
 ```bash
-python -m voxtype_tui
+pipx install voxtype-tui
+```
+
+### Run
+
+```bash
+voxtype-tui
 # or
-voxtype-tui   # from inside the activated env
+python -m voxtype_tui
 ```
 
 ## Omarchy integration (optional)
@@ -29,19 +31,18 @@ voxtype-tui   # from inside the activated env
 If you're running [Omarchy](https://omarchy.org), two scripts wire up a global keybinding and a floating-window rule so the TUI opens as a centered 1100×750 dialog.
 
 ```bash
-bash scripts/install-omarchy.sh     # default keybind: SUPER CTRL ALT, X
-bash scripts/uninstall-omarchy.sh   # removes the managed lines + wrapper
+bash /usr/share/voxtype-tui/install-omarchy.sh     # default keybind: SUPER CTRL ALT, X
+bash /usr/share/voxtype-tui/uninstall-omarchy.sh   # removes the managed lines
 ```
 
 What it does:
 
-- Drops a launcher wrapper at `~/.local/bin/voxtype-tui` that activates the conda env and runs `python -m voxtype_tui`. (The wrapper tries `~/miniconda3`, `~/anaconda3`, `/opt/miniconda3` in that order.)
 - Appends a `windowrule` to `~/.config/hypr/windows.conf` matching `org.omarchy.voxtype-tui` (float, center, size 1100×750).
 - Appends a `bindd` to `~/.config/hypr/bindings.conf` firing `omarchy-launch-or-focus-tui voxtype-tui` on `SUPER CTRL ALT, X`.
 - Each edit is wrapped with a sentinel comment (`# voxtype-tui-managed (do not edit this line manually)`) so uninstall can find them. Re-runs are safe — the script checks for the sentinel and skips if present.
 - Runs `hyprctl reload` at the end.
 
-**Pre-install guardrails:** the script refuses if `~/.config/omarchy/` doesn't exist (non-Omarchy system — just use `python -m voxtype_tui`) or if `SUPER CTRL ALT, X` is already bound to something else. To use a different keybinding, edit `BIND_KEY` at the top of `install-omarchy.sh`.
+**Pre-install guardrails:** the script refuses if `voxtype-tui` isn't on `$PATH` (install it via `yay -S voxtype-tui` or `pipx install voxtype-tui` first), if `~/.config/omarchy/` doesn't exist, or if `SUPER CTRL ALT, X` is already bound to something else. To use a different keybinding, edit `BIND_KEY` at the top of `install-omarchy.sh`.
 
 ### Omarchy key namespace cheatsheet
 
@@ -131,6 +132,22 @@ python -m pytest tests/
 ```
 
 Six TOML fixture configs under `tests/fixtures/` cover representative real-world shapes (stock / heavily customized / externally edited / minimal / unusual whitespace / mostly-commented). Each mutation is parametrized across fixtures and asserts no data loss, preserved comments, touched-scope bounded to intended fields, and post-save validity per `voxtype -c <file> config`. UI behavior is verified with Textual's `Pilot` against tempdir config + sidecar copies — no real writes to `~/.config/voxtype/` happen during tests. The Omarchy install/uninstall scripts have their own bash-level tests that run against a sandboxed `$HOME`.
+
+## Development
+
+```bash
+# Clone + dev env (Python 3.12)
+git clone https://github.com/Zeus-Deus/voxtype-tui
+cd voxtype-tui
+conda create -n voxtype-tui python=3.12 -y
+conda activate voxtype-tui
+pip install -e ".[dev]"
+
+# Run tests
+pytest
+```
+
+Conda is used only for local development isolation. Shipped installs go through AUR or pipx — `install-omarchy.sh` assumes `voxtype-tui` is already on PATH from a system-level install and does not touch your conda environment.
 
 ## Philosophy
 

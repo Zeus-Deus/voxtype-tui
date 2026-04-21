@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Voxtype Config
+Comment=Manage Voxtype vocabulary, dictionary, and settings
+Exec=omarchy-launch-or-focus-tui voxtype-tui
+Icon=microphone-sensitivity-high
+Terminal=false
+Categories=Utility;Settings;Audio;
+StartupWMClass=org.omarchy.voxtype-tui
+Keywords=voxtype;dictation;voice;transcription;whisper;

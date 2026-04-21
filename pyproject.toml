@@ -22,6 +22,3 @@ voxtype-tui = "voxtype_tui.app:main"
 
 [tool.setuptools.packages.find]
 include = ["voxtype_tui*"]
-
-[tool.pytest.ini_options]
-asyncio_mode = "auto"

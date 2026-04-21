@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 # Remove voxtype-tui's Omarchy integration bits:
 #   - sentinel-tagged lines from hypr/windows.conf and hypr/bindings.conf
-#   - the ~/.local/bin/voxtype-tui wrapper
 #   - hyprctl reload
 #
-# Safe to re-run (no-op if nothing's there).
+# Safe to re-run (no-op if nothing's there). Does not remove the voxtype-tui
+# package itself — use your package manager for that.
 
 set -euo pipefail
 
 SENTINEL_PATTERN="voxtype-tui-managed"
 HYPR_WINDOWS="$HOME/.config/hypr/windows.conf"
 HYPR_BINDINGS="$HOME/.config/hypr/bindings.conf"
-WRAPPER_PATH="$HOME/.local/bin/voxtype-tui"
 
 # Delete the sentinel line AND the immediately-following managed line.
 remove_managed_block() {
@@ -20,10 +19,6 @@ remove_managed_block() {
     local tmp
     tmp=$(mktemp)
     awk -v sentinel="$SENTINEL_PATTERN" '
-        /^[[:space:]]*$/ && hold != "" {
-            # trailing blank that precedes the sentinel — print buffered
-            # and fall through
-        }
         {
             if ($0 ~ sentinel) {
                 skip_next = 1
@@ -42,12 +37,8 @@ remove_managed_block() {
 remove_managed_block "$HYPR_WINDOWS"
 remove_managed_block "$HYPR_BINDINGS"
 
-if [[ -f "$WRAPPER_PATH" ]]; then
-    rm -f "$WRAPPER_PATH"
-fi
-
 if command -v hyprctl >/dev/null 2>&1; then
     hyprctl reload >/dev/null 2>&1 || true
 fi
 
-echo "Uninstalled."
+echo "Uninstalled Omarchy integration. The voxtype-tui package itself is untouched."
