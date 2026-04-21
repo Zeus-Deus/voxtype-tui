@@ -17,7 +17,7 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Input, Label, Static, TabbedContent, TabPane
 
-from . import config, sidecar, voxtype_cli
+from . import config, sidecar, theme as theme_mod, voxtype_cli
 from .dictionary import DictionaryPane
 from .models import ModelsPane
 from .settings import SettingsPane
@@ -222,6 +222,7 @@ class VoxtypeTUI(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
+        self._register_themes()
         self.load_state()
         self.set_interval(0.5, self.poll_daemon_state)
         self.poll_daemon_state()
@@ -240,6 +241,40 @@ class VoxtypeTUI(App[None]):
         if action == "switch_tab" and isinstance(self.focused, Input):
             return False
         return True
+
+    def _register_themes(self) -> None:
+        """Register Omarchy / user themes if available, and set the initial
+        theme from ui.json."""
+        default_name = "textual-dark"
+
+        om_colors = theme_mod.load_omarchy_colors()
+        if om_colors:
+            self.register_theme(theme_mod.build_theme("omarchy-auto", om_colors))
+            default_name = "omarchy-auto"
+
+        user_colors = theme_mod.load_user_colors()
+        if user_colors:
+            self.register_theme(theme_mod.build_theme("user", user_colors))
+            default_name = "user"
+
+        prefs = theme_mod.load_ui_prefs()
+        saved = prefs.get("theme", default_name)
+        try:
+            self.theme = saved
+        except Exception:
+            self.theme = default_name
+
+    def watch_theme(self, new_theme: str) -> None:
+        """Textual fires this on theme change — persist so the choice
+        survives restart."""
+        prefs = theme_mod.load_ui_prefs()
+        if prefs.get("theme") == new_theme:
+            return
+        prefs["theme"] = new_theme
+        try:
+            theme_mod.save_ui_prefs(prefs)
+        except OSError:
+            pass
 
     def load_state(self) -> None:
         try:
