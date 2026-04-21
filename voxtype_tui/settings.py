@@ -343,6 +343,76 @@ class SettingsPane(VerticalScroll):
                 )
 
         with Collapsible(
+            title=f"VAD{engine_section_restart_hint()}",
+            collapsed=True,
+            id="settings-vad-section",
+        ):
+            with Horizontal(classes="field-row"):
+                yield Label("Enabled", classes="label")
+                yield Switch(value=False, id="settings-vad-enabled")
+            with Horizontal(classes="field-row"):
+                yield Label("Model path", classes="label")
+                yield Input(
+                    placeholder="/path/to/silero-vad.onnx (empty = auto)",
+                    id="settings-vad-model",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Threshold", classes="label")
+                yield Input(
+                    placeholder="0.0 – 1.0",
+                    id="settings-vad-threshold",
+                )
+
+        with Collapsible(
+            title="Post-processing",
+            collapsed=True,
+            id="settings-post-section",
+        ):
+            with Horizontal(classes="field-row"):
+                yield Label("Command", classes="label")
+                yield Input(
+                    placeholder="e.g. ollama run llama3.2:1b '…'",
+                    id="settings-post-command",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Timeout (ms)", classes="label")
+                yield Input(
+                    placeholder="30000",
+                    id="settings-post-timeout",
+                )
+
+        with Collapsible(
+            title=f"Remote backend{engine_section_restart_hint()}",
+            collapsed=True,
+            id="settings-remote-section",
+        ):
+            with Horizontal(classes="field-row"):
+                yield Label("Endpoint", classes="label")
+                yield Input(
+                    placeholder="http://192.168.1.42:8080",
+                    id="settings-remote-endpoint",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Model name", classes="label")
+                yield Input(
+                    placeholder="whisper-1",
+                    id="settings-remote-model",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("API key", classes="label")
+                yield Input(
+                    placeholder="(leave blank to use $VOXTYPE_WHISPER_API_KEY)",
+                    password=True,
+                    id="settings-remote-api-key",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Timeout (s)", classes="label")
+                yield Input(
+                    placeholder="30",
+                    id="settings-remote-timeout",
+                )
+
+        with Collapsible(
             title="GPU acceleration",
             collapsed=False,
             id="settings-gpu-section",
@@ -502,6 +572,42 @@ class SettingsPane(VerticalScroll):
             self.query_one(
                 "#settings-text-spoken-punctuation", Switch
             ).value = bool(text.get("spoken_punctuation", False))
+
+            vad = doc.get("vad") or {}
+            self.query_one("#settings-vad-enabled", Switch).value = bool(
+                vad.get("enabled", False)
+            )
+            self.query_one("#settings-vad-model", Input).value = str(
+                vad.get("model", "")
+            )
+            vad_thresh = vad.get("threshold", "")
+            self.query_one("#settings-vad-threshold", Input).value = (
+                str(vad_thresh) if vad_thresh != "" else ""
+            )
+
+            post = (doc.get("output") or {}).get("post_process") or {}
+            self.query_one("#settings-post-command", Input).value = str(
+                post.get("command", "")
+            )
+            post_to = post.get("timeout_ms", "")
+            self.query_one("#settings-post-timeout", Input).value = (
+                str(post_to) if post_to != "" else ""
+            )
+
+            whisper = doc.get("whisper") or {}
+            self.query_one("#settings-remote-endpoint", Input).value = str(
+                whisper.get("remote_endpoint", "")
+            )
+            self.query_one("#settings-remote-model", Input).value = str(
+                whisper.get("remote_model", "")
+            )
+            self.query_one("#settings-remote-api-key", Input).value = str(
+                whisper.get("remote_api_key", "")
+            )
+            remote_to = whisper.get("remote_timeout_secs", "")
+            self.query_one("#settings-remote-timeout", Input).value = (
+                str(remote_to) if remote_to != "" else ""
+            )
         finally:
             self._suppress_events = False
 
@@ -674,6 +780,65 @@ class SettingsPane(VerticalScroll):
             if ms >= 0:
                 self.tui.state.set_setting("output.type_delay_ms", ms)
                 self.tui.refresh_dirty()
+        elif event.input.id == "settings-vad-model":
+            value = event.value.strip()
+            if value:
+                self.tui.state.set_setting("vad.model", value)
+                self.tui.refresh_dirty()
+        elif event.input.id == "settings-vad-threshold":
+            value = event.value.strip()
+            if not value:
+                return
+            try:
+                t = float(value)
+            except ValueError:
+                return
+            if 0.0 <= t <= 1.0:
+                self.tui.state.set_setting("vad.threshold", t)
+                self.tui.refresh_dirty()
+        elif event.input.id == "settings-post-command":
+            value = event.value
+            if value:
+                self.tui.state.set_setting("output.post_process.command", value)
+                self.tui.refresh_dirty()
+        elif event.input.id == "settings-post-timeout":
+            value = event.value.strip()
+            if not value:
+                return
+            try:
+                ms = int(value)
+            except ValueError:
+                return
+            if ms > 0:
+                self.tui.state.set_setting("output.post_process.timeout_ms", ms)
+                self.tui.refresh_dirty()
+        elif event.input.id == "settings-remote-endpoint":
+            value = event.value.strip()
+            if value:
+                self.tui.state.set_setting("whisper.remote_endpoint", value)
+                self.tui.refresh_dirty()
+        elif event.input.id == "settings-remote-model":
+            value = event.value.strip()
+            if value:
+                self.tui.state.set_setting("whisper.remote_model", value)
+                self.tui.refresh_dirty()
+        elif event.input.id == "settings-remote-api-key":
+            # Allow empty to clear the key
+            self.tui.state.set_setting(
+                "whisper.remote_api_key", event.value
+            )
+            self.tui.refresh_dirty()
+        elif event.input.id == "settings-remote-timeout":
+            value = event.value.strip()
+            if not value:
+                return
+            try:
+                secs = int(value)
+            except ValueError:
+                return
+            if secs > 0:
+                self.tui.state.set_setting("whisper.remote_timeout_secs", secs)
+                self.tui.refresh_dirty()
 
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
         if self._suppress_events or self.tui.state is None:
@@ -745,6 +910,9 @@ class SettingsPane(VerticalScroll):
             self.tui.state.set_setting(
                 "text.spoken_punctuation", bool(event.value)
             )
+            self.tui.refresh_dirty()
+        elif event.switch.id == "settings-vad-enabled":
+            self.tui.state.set_setting("vad.enabled", bool(event.value))
             self.tui.refresh_dirty()
 
     def _write_model(self, engine: str, model: str) -> None:
