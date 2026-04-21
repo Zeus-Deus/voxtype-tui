@@ -248,6 +248,45 @@ async def test_add_requires_both_fields(tmp_env):
         assert app.state.sc.replacements == []
 
 
+def test_vocab_and_dict_share_vim_nav_mixin() -> None:
+    """Structural: both panes get their j/k/gg/G/N from the shared mixin so
+    future tabs (Models, etc.) can pick it up the same way."""
+    from voxtype_tui.dictionary import DictionaryPane
+    from voxtype_tui.vim_nav import VimTableNav
+    from voxtype_tui.vocabulary import VocabularyPane
+    assert issubclass(VocabularyPane, VimTableNav)
+    assert issubclass(DictionaryPane, VimTableNav)
+
+
+async def test_dictionary_vim_jk_navigate_cursor(tmp_env):
+    cfg, side = tmp_env
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _goto_dictionary(pilot, app)
+        pane = app.query_one(DictionaryPane)
+        for name in ["alpha", "beta", "gamma"]:
+            app.state.upsert_replacement(name, name.upper(), "Replacement")
+        pane.sync_from_state()
+        await pilot.pause()
+
+        table = pane.query_one(DataTable)
+        table.focus()
+        table.move_cursor(row=0)
+        await pilot.pause()
+
+        await pilot.press("j")
+        await pilot.pause()
+        assert table.cursor_row == 1
+        await pilot.press("G")
+        await pilot.pause()
+        assert table.cursor_row == 2
+        await pilot.press("g")
+        await pilot.press("g")
+        await pilot.pause()
+        assert table.cursor_row == 0
+
+
 async def test_vim_n_on_dictionary_focuses_from_input(tmp_env):
     cfg, side = tmp_env
     app = VoxtypeTUI(config_path=cfg, sidecar_path=side)

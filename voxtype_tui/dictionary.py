@@ -7,7 +7,6 @@ from→to updates both.
 """
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -17,11 +16,10 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Input, Select, Static
 
 from . import sidecar
+from .vim_nav import VIM_NAV_ACTIONS, VIM_NAV_BINDINGS, VimTableNav
 
 if TYPE_CHECKING:
     from .app import VoxtypeTUI
-
-GG_SEQUENCE_WINDOW = 0.5
 
 
 @dataclass
@@ -32,7 +30,7 @@ class UndoEntry:
     index: int
 
 
-class DictionaryPane(Vertical):
+class DictionaryPane(VimTableNav, Vertical):
     DEFAULT_CSS = """
     DictionaryPane { padding: 1 2; }
     DictionaryPane #dict-add-row { height: 3; margin-bottom: 1; }
@@ -46,22 +44,16 @@ class DictionaryPane(Vertical):
 
     BINDINGS = [
         Binding("n", "vim_n", "Add / next match"),
-        Binding("N", "vim_prev_match", "Prev match", show=False),
         Binding("/", "focus_search", "Search"),
         Binding("d", "delete_selected", "Delete"),
         Binding("u", "undo_delete", "Undo"),
         Binding("c", "cycle_category", "Cycle category"),
-        Binding("j", "cursor_down", "Down", show=False),
-        Binding("k", "cursor_up", "Up", show=False),
-        Binding("g", "vim_g", "Top (gg)", show=False),
-        Binding("G", "vim_bottom", "Bottom", show=False),
         Binding("escape", "focus_table", "Back to list", show=False),
-    ]
+    ] + VIM_NAV_BINDINGS
 
     def __init__(self) -> None:
         super().__init__()
         self.undo_stack: list[UndoEntry] = []
-        self._last_g_time: float = 0.0
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="dict-add-row"):
@@ -90,12 +82,11 @@ class DictionaryPane(Vertical):
     # --- check_action ---
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
-        disabled_on_input = {
+        pane_actions = {
             "focus_search", "delete_selected", "undo_delete",
-            "vim_n", "vim_prev_match", "cycle_category",
-            "cursor_down", "cursor_up", "vim_g", "vim_bottom",
+            "vim_n", "cycle_category",
         }
-        if action in disabled_on_input and isinstance(self.app.focused, Input):
+        if action in pane_actions | VIM_NAV_ACTIONS and isinstance(self.app.focused, Input):
             return False
         if action == "focus_table":
             if not isinstance(self.app.focused, Input):
@@ -160,41 +151,6 @@ class DictionaryPane(Vertical):
             self._move_cursor_wrap(+1)
         else:
             self.action_focus_add()
-
-    def action_vim_prev_match(self) -> None:
-        self._move_cursor_wrap(-1)
-
-    def action_cursor_down(self) -> None:
-        table = self.query_one(DataTable)
-        if table.row_count > 0:
-            table.action_cursor_down()
-
-    def action_cursor_up(self) -> None:
-        table = self.query_one(DataTable)
-        if table.row_count > 0:
-            table.action_cursor_up()
-
-    def action_vim_g(self) -> None:
-        now = time.monotonic()
-        if now - self._last_g_time < GG_SEQUENCE_WINDOW:
-            table = self.query_one(DataTable)
-            if table.row_count > 0:
-                table.move_cursor(row=0)
-            self._last_g_time = 0.0
-        else:
-            self._last_g_time = now
-
-    def action_vim_bottom(self) -> None:
-        table = self.query_one(DataTable)
-        if table.row_count > 0:
-            table.move_cursor(row=table.row_count - 1)
-
-    def _move_cursor_wrap(self, delta: int) -> None:
-        table = self.query_one(DataTable)
-        if table.row_count == 0:
-            return
-        target = (table.cursor_row + delta) % table.row_count
-        table.move_cursor(row=target)
 
     def action_cycle_category(self) -> None:
         if self.tui.state is None:
