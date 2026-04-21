@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voxtype-tui"
-version = "0.1.1"
+version = "0.1.2"
 description = "Textual-based TUI for managing Voxtype (Linux voice-to-text daemon)"
 readme = "README.md"
 license = "MIT"
