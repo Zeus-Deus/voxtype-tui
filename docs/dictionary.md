@@ -43,6 +43,6 @@ Press `c` on a selected row to cycle its category.
 
 Deleting the only remaining replacement removes the entire `[text.replacements]` section from `config.toml`. The TUI shows a warning toast the first time this happens — any inline comments you had attached to entries inside that section are dropped along with it.
 
-## Changes take effect immediately
+## Changes are restart-sensitive
 
-`text.replacements` is read per-transcription. No daemon restart needed.
+`[text].replacements` is read into the daemon's text-layer cache at startup, not per-transcription. After saving, the TUI raises a RestartModal the first time (or leaves a persistent `⚠ Daemon restart needed` pill if you've already dismissed it this session); press `ctrl+shift+r` to restart the daemon once you're done editing.

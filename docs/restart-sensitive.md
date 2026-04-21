@@ -1,18 +1,19 @@
 # Restart-sensitive fields
 
-Some config fields are read by the voxtype daemon **once at startup** and cached for the life of the process. Changing them requires `systemctl --user restart voxtype` for the change to take effect. Others are read **per-transcription** (by the `transcribe-worker` subprocess that spawns for each recording) and apply on the next dictation without a restart.
+Most config fields are read by the voxtype daemon **once at startup** and cached for the life of the process. Changing them requires `systemctl --user restart voxtype` for the change to take effect. A few fields (language hint, output mode, typing delay) do apply immediately on the next transcription without a restart.
 
 ## Fields that need a restart
 
 ```
-state_file                      # daemon opens this once
-engine                          # which backend loads at start
+state_file
+engine
 whisper.model                   # model weights loaded into RAM at start
 whisper.mode                    # local vs remote decided at start
 whisper.backend                 # deprecated alias of the above
-whisper.gpu_isolation           # subprocess topology baked in
-whisper.remote_endpoint         # remote backend connection established at start
-parakeet.model_type             # same pattern for each engine's model key
+whisper.gpu_isolation
+whisper.remote_endpoint
+whisper.initial_prompt          # your Vocabulary — read into the text-layer cache
+parakeet.model_type             # per-engine model keys
 moonshine.model
 sensevoice.model
 paraformer.model
@@ -22,46 +23,44 @@ hotkey.key                      # evdev listener registers at start
 hotkey.modifiers
 hotkey.mode
 hotkey.enabled
-audio.device                    # audio capture initialized at start
+audio.device
 audio.sample_rate
-audio.feedback.enabled          # feedback theme loaded at start
+audio.feedback.enabled
 audio.feedback.theme
 audio.feedback.volume
-vad.enabled                     # VAD model loaded at start (if enabled)
+vad.enabled
 vad.model
 vad.threshold
+text.replacements               # your Dictionary — cached alongside the prompt
+text.spoken_punctuation
+text.smart_auto_submit
 ```
 
 ## Fields that apply immediately
 
 ```
-whisper.initial_prompt          # your Vocabulary list
-whisper.language                # language hint
+whisper.language
 whisper.translate
-text.replacements               # your Dictionary
-text.spoken_punctuation
-text.smart_auto_submit
 output.mode                     # type / clipboard / paste
 output.fallback_to_clipboard
 output.auto_submit
 output.type_delay_ms
-output.post_process.*           # LLM cleanup command + timeout
+output.post_process.*
 output.notification.*
 ```
 
-## How voxtype-tui uses this
+## How voxtype-tui communicates this
 
-After a successful save, the TUI compares the pre-save and post-save docs against the list above. If nothing restart-sensitive changed, it just shows a "Saved" toast and you're done.
+After every save, the TUI compares the pre-save and post-save docs against the restart-sensitive list. If anything flagged changed, three things happen:
 
-If something restart-sensitive did change, **and** `systemctl --user is-active voxtype` reports `active`, the TUI pushes a `RestartModal` that lists the specific fields that changed and offers Restart / Later buttons. It never restarts the daemon automatically — you always decide.
+1. **First save that creates staleness** — a `RestartModal` lists the specific fields that changed and offers **Restart now** / **Later**. Picking Restart runs `systemctl --user restart voxtype` asynchronously and clears the state. Picking Later leaves the daemon stale.
+2. **A persistent pill** appears in the header: `⚠ Daemon restart needed (Ctrl+Shift+R)`. It stays visible across tab switches for the rest of the session — no more dismissing a modal and forgetting the daemon is stale. Click the pill, or press **ctrl+shift+r** from anywhere, to restart.
+3. **Subsequent saves while stale** just update dirty indicators + toast `"Saved — daemon still needs restart (ctrl+shift+r)"`. The modal doesn't re-appear for every save; the pill is the persistent signal.
 
-If the daemon isn't running under systemd (e.g. you launched `voxtype daemon` manually), the modal doesn't appear. Handle the restart yourself.
+Once the daemon is restarted (via the TUI or externally), the pill clears and the next restart-sensitive save can fire a fresh modal.
 
-## How we know which is which
+If the daemon isn't running under systemd (e.g. you launched `voxtype daemon` manually), the modal and pill don't appear — restart it yourself when you want the new config active.
 
-Empirical, not documented by voxtype directly:
+## Design note
 
-- Static analysis of the `/usr/bin/voxtype` binary — explicit error strings like `"Restart daemon to use new model: systemctl --user restart voxtype"` and the existence of a `voxtype setup model --restart` flag confirm the model/engine/hotkey category.
-- `/proc/<voxtype-pid>/fd` inspection showed that `config.toml` is **not** held open by the running daemon — it's parsed at startup and closed. That means the fields not loaded at start are picked up fresh when the `transcribe-worker` subprocess parses the config on each recording.
-
-See `voxtype_tui/config.py::RESTART_SENSITIVE_PATHS` for the authoritative list.
+An earlier version of this file claimed `whisper.initial_prompt` and `text.*` were read per-transcription. That was wrong — the daemon caches those alongside the model weights at startup. The authoritative list lives at `voxtype_tui/config.py::RESTART_SENSITIVE_PATHS`; when in doubt, a field is added there. A false-positive restart prompt is much cheaper than silent staleness where you save a new vocabulary word and the daemon keeps using the old prompt.

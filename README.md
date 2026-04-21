@@ -108,7 +108,10 @@ Some Voxtype fields are baked in at daemon startup and need `systemctl --user re
 - `audio.{device, sample_rate}` and `audio.feedback.*`
 - `vad.{enabled, model, threshold}`
 
-Everything else (initial_prompt, replacements, language, output mode, spoken punctuation, etc.) is re-read per-transcription and takes effect on the next dictation without a restart. The TUI prompts to restart only when one of these fields actually changed in the current save AND `systemctl --user is-active voxtype` reports `active`. It never restarts automatically — you decide when that happens.
+- `whisper.initial_prompt` (your Vocabulary)
+- `text.replacements` (your Dictionary), `text.spoken_punctuation`, `text.smart_auto_submit`
+
+The TUI prompts to restart whenever any of these actually changed AND `systemctl --user is-active voxtype` reports `active`. After the first modal in a session, a persistent pill — `⚠ Daemon restart needed (Ctrl+Shift+R)` — lives in the header until you restart the daemon, so subsequent edits don't spam modals but you never lose the signal that your daemon is stale. Click the pill or press `ctrl+shift+r` from anywhere to restart. It never restarts automatically — you decide when.
 
 ## Theme
 

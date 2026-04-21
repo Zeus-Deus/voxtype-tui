@@ -186,11 +186,52 @@ def test_change_model_only_touches_whisper_model(fixture_path: Path) -> None:
 # Restart-sensitive detection
 # ---------------------------------------------------------------------------
 
-def test_vocab_change_not_restart_sensitive(fixture_path: Path) -> None:
+def test_vocab_change_is_restart_sensitive(fixture_path: Path) -> None:
+    """Adding or changing whisper.initial_prompt must flag as restart-
+    sensitive. Empirically the daemon caches the text layer at startup — if
+    we say 'saved' and don't prompt for restart, the user's new vocab words
+    silently have no effect on the next transcription."""
     before = config.load(fixture_path)
     after = config.load(fixture_path)
     config.set_initial_prompt(after, "Hello, World")
-    assert config.diff_restart_sensitive(before, after) == []
+    assert "whisper.initial_prompt" in config.diff_restart_sensitive(before, after)
+
+
+def test_replacement_add_is_restart_sensitive(fixture_path: Path) -> None:
+    before = config.load(fixture_path)
+    after = config.load(fixture_path)
+    config.add_replacement(after, "slash deploy", "/deploy")
+    assert "text.replacements" in config.diff_restart_sensitive(before, after)
+
+
+def test_replacement_remove_is_restart_sensitive(fixture_path: Path) -> None:
+    before = config.load(fixture_path)
+    # Seed a replacement we can then remove
+    config.add_replacement(before, "temp one", "temp")
+    config.save_atomic(before, fixture_path)
+    before = config.load(fixture_path)
+    after = config.load(fixture_path)
+    config.remove_replacement(after, "temp one")
+    assert "text.replacements" in config.diff_restart_sensitive(before, after)
+
+
+def test_spoken_punctuation_toggle_is_restart_sensitive(fixture_path: Path) -> None:
+    # Flip whichever boolean is in the fixture, so the diff is non-empty
+    before = config.load(fixture_path)
+    current = config._get_in(before, "text.spoken_punctuation")
+    new_val = False if bool(current) else True
+    after = config.load(fixture_path)
+    _set_nested(after, "text.spoken_punctuation", new_val)
+    assert "text.spoken_punctuation" in config.diff_restart_sensitive(before, after)
+
+
+def test_smart_auto_submit_toggle_is_restart_sensitive(fixture_path: Path) -> None:
+    before = config.load(fixture_path)
+    current = config._get_in(before, "text.smart_auto_submit")
+    new_val = False if bool(current) else True
+    after = config.load(fixture_path)
+    _set_nested(after, "text.smart_auto_submit", new_val)
+    assert "text.smart_auto_submit" in config.diff_restart_sensitive(before, after)
 
 
 def test_model_change_is_restart_sensitive(fixture_path: Path) -> None:

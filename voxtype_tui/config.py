@@ -111,9 +111,17 @@ def safe_save(
         raise
 
 # Fields where a change requires `systemctl --user restart voxtype` to take
-# effect. Confirmed by static analysis of /usr/bin/voxtype (explicit restart
-# prompts around model/engine) and by /proc/PID/fd probe on the running daemon
-# (input devices and inotify watches are resident resources set at startup).
+# effect. When in doubt, a field goes on this list — a false-positive restart
+# prompt is much cheaper than silent staleness where the user saves a change
+# and the daemon keeps using the old value.
+#
+# Confirmed empirically:
+#   * model/engine/hotkey/audio baked in at startup (error strings + behavior
+#     after `voxtype setup model --restart`).
+#   * whisper.initial_prompt AND text.* (replacements, spoken_punctuation,
+#     smart_auto_submit) are read once into a text-layer cache and do NOT
+#     refresh per-transcription, despite config.toml's fd being closed after
+#     the initial parse. Earlier assumption otherwise was wrong.
 RESTART_SENSITIVE_PATHS: frozenset[str] = frozenset({
     "state_file",
     "engine",
@@ -122,6 +130,7 @@ RESTART_SENSITIVE_PATHS: frozenset[str] = frozenset({
     "whisper.backend",
     "whisper.gpu_isolation",
     "whisper.remote_endpoint",
+    "whisper.initial_prompt",
     "parakeet.model_type",
     "moonshine.model",
     "sensevoice.model",
@@ -140,6 +149,9 @@ RESTART_SENSITIVE_PATHS: frozenset[str] = frozenset({
     "vad.enabled",
     "vad.model",
     "vad.threshold",
+    "text.replacements",
+    "text.spoken_punctuation",
+    "text.smart_auto_submit",
 })
 
 

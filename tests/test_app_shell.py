@@ -156,6 +156,160 @@ async def test_save_with_invalid_config_is_rejected(tmp_env):
     assert cfg.read_bytes() == original_bytes
 
 
+async def test_pill_hidden_by_default(tmp_env):
+    cfg, side = tmp_env
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        from voxtype_tui.app import StalePill
+        pill = app.query_one("#daemon-stale", StalePill)
+        assert not pill.has_class("visible")
+        assert app.state.daemon_stale is False
+
+
+async def test_restart_sensitive_save_sets_stale_and_shows_pill(tmp_env):
+    """Saving a restart-sensitive change makes daemon_stale True and the
+    pill becomes visible even when the daemon's inactive (no modal path)."""
+    cfg, side = tmp_env
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Add a vocab word — whisper.initial_prompt is restart-sensitive
+        app.state.add_vocab("NewWord")
+        app.refresh_dirty()
+        await pilot.pause()
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+
+        assert app.state.daemon_stale is True
+        from voxtype_tui.app import StalePill
+        pill = app.query_one("#daemon-stale", StalePill)
+        assert pill.has_class("visible")
+
+
+async def test_modal_fires_only_on_first_stale_transition(tmp_env, monkeypatch):
+    """First restart-sensitive save shows the modal; subsequent saves during
+    an already-stale session just update the pill + toast, no modal spam."""
+    cfg, side = tmp_env
+
+    # The modal only appears when the daemon is reachable — override the
+    # tmp_env default so the modal path is actually exercised.
+    async def fake_active():
+        return True
+    monkeypatch.setattr(voxtype_cli, "is_daemon_active_async", fake_active)
+
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+
+    modal_opens: list[str] = []
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        orig_push = app.push_screen
+
+        def track_push(screen, *args, **kwargs):
+            modal_opens.append(type(screen).__name__)
+            return orig_push(screen, *args, **kwargs)
+
+        app.push_screen = track_push  # type: ignore[method-assign]
+
+        # First restart-sensitive save — modal expected
+        app.state.add_vocab("Alpha")
+        app.refresh_dirty()
+        await pilot.pause()
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        from voxtype_tui.app import RestartModal
+        if isinstance(app.screen, RestartModal):
+            await pilot.press("escape")
+            await pilot.pause()
+
+        first_wave_modals = [m for m in modal_opens if m == "RestartModal"]
+        assert len(first_wave_modals) == 1
+        assert app.state.daemon_stale is True
+
+        # Second restart-sensitive save — no new modal
+        app.state.add_vocab("Beta")
+        app.refresh_dirty()
+        await pilot.pause()
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        # still only one RestartModal across both saves
+        second_wave_modals = [m for m in modal_opens if m == "RestartModal"]
+        assert len(second_wave_modals) == 1
+        assert app.state.daemon_stale is True
+
+
+async def test_ctrl_shift_r_triggers_restart(tmp_env, monkeypatch):
+    """Pressing ctrl+shift+r from anywhere invokes restart_daemon_async and
+    clears daemon_stale on success."""
+    cfg, side = tmp_env
+    called = []
+
+    async def fake_active():
+        return True
+
+    async def fake_restart():
+        called.append("restart")
+        return True, "voxtype restarted"
+
+    monkeypatch.setattr(voxtype_cli, "is_daemon_active_async", fake_active)
+    monkeypatch.setattr(voxtype_cli, "restart_daemon_async", fake_restart)
+
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.state.daemon_stale = True
+        app.refresh_stale_pill()
+        await pilot.pause()
+
+        await pilot.press("ctrl+shift+r")
+        await pilot.pause()
+
+    assert called == ["restart"]
+    assert app.state.daemon_stale is False
+
+
+async def test_ctrl_shift_r_noop_when_not_stale(tmp_env, monkeypatch):
+    """No damage if the user hammers ctrl+shift+r when the daemon is fine."""
+    cfg, side = tmp_env
+    called = []
+
+    async def fake_restart():
+        called.append("restart")
+        return True, ""
+
+    monkeypatch.setattr(voxtype_cli, "restart_daemon_async", fake_restart)
+
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app.state.daemon_stale is False
+        await pilot.press("ctrl+shift+r")
+        await pilot.pause()
+    assert called == []
+
+
+async def test_ctrl_shift_r_clears_pill_when_daemon_is_down(tmp_env, monkeypatch):
+    """If ctrl+shift+r fires but the daemon isn't active, we clear
+    daemon_stale to stop lying with the pill — there's nothing to restart."""
+    cfg, side = tmp_env
+
+    async def fake_inactive():
+        return False
+
+    monkeypatch.setattr(voxtype_cli, "is_daemon_active_async", fake_inactive)
+
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.state.daemon_stale = True
+        app.refresh_stale_pill()
+        await pilot.pause()
+
+        await pilot.press("ctrl+shift+r")
+        await pilot.pause()
+    assert app.state.daemon_stale is False
+
+
 async def test_daemon_status_poll_does_not_crash(tmp_env):
     """Even if the state file doesn't exist (tests run outside the daemon's
     user), the poller should update to 'no-daemon' without raising."""

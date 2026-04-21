@@ -32,6 +32,29 @@ STATUS_ICONS = {
 }
 
 
+class StalePill(Static):
+    """Persistent warning in the header bar whenever the voxtype daemon is
+    running with stale config (a restart-sensitive field was saved and the
+    daemon hasn't been restarted since). Click fires the same action as
+    ctrl+shift+r."""
+
+    DEFAULT_CSS = """
+    StalePill {
+        width: auto;
+        height: 1;
+        padding: 0 1;
+        background: $warning;
+        color: $background;
+        text-style: bold;
+        display: none;
+    }
+    StalePill.visible { display: block; }
+    """
+
+    def on_click(self) -> None:
+        self.app.action_restart_daemon()
+
+
 class HeaderBar(Horizontal):
     DEFAULT_CSS = """
     HeaderBar {
@@ -53,6 +76,10 @@ class HeaderBar(Horizontal):
         yield Static("voxtype-tui", id="title")
         yield Static("○ ?", id="status")
         yield Static("✓ saved", id="dirty")
+        yield StalePill(
+            "⚠ Daemon restart needed (Ctrl+Shift+R)",
+            id="daemon-stale",
+        )
         yield Static("ctrl+s save · ctrl+r reload", id="hint")
 
 
@@ -191,6 +218,7 @@ class VoxtypeTUI(App[None]):
         Binding("4", "switch_tab('models')", "Models", priority=True),
         Binding("ctrl+s", "save", "Save", priority=True),
         Binding("ctrl+r", "reload_config", "Reload", priority=True),
+        Binding("ctrl+shift+r", "restart_daemon", "Restart daemon", priority=True),
         Binding("ctrl+t", "test_mutate", "Fake mutation", show=False),
         Binding("ctrl+q", "request_quit", "Quit", priority=True),
     ]
@@ -305,6 +333,19 @@ class VoxtypeTUI(App[None]):
         else:
             widget.update("✓ saved")
 
+    def refresh_stale_pill(self) -> None:
+        """Toggle the header's daemon-stale pill based on state.daemon_stale.
+        Safe to call before the header has mounted (e.g. during early
+        on_mount sequencing) — missing widget is a no-op."""
+        try:
+            pill = self.query_one("#daemon-stale", StalePill)
+        except Exception:
+            return
+        if self.state and self.state.daemon_stale:
+            pill.add_class("visible")
+        else:
+            pill.remove_class("visible")
+
     def poll_daemon_state(self) -> None:
         self.daemon_state = voxtype_cli.read_state() or "no-daemon"
 
@@ -346,6 +387,7 @@ class VoxtypeTUI(App[None]):
         if not self.state.dirty:
             self.notify("Nothing to save")
             return
+        was_stale = self.state.daemon_stale
         try:
             restart_fields = await self.state.save_async()
         except config.ValidationError as e:
@@ -360,21 +402,30 @@ class VoxtypeTUI(App[None]):
             self.notify(f"Save failed: {e}", severity="error", timeout=10)
             return
         self.refresh_dirty()
+        self.refresh_stale_pill()
+
+        # Modal only on the first-time transition into stale state. Once the
+        # pill is up the user already has a persistent signal — further
+        # saves during the stale session just toast.
+        newly_stale = bool(restart_fields) and not was_stale
+        if not restart_fields:
+            self.notify("Saved", timeout=2)
+            return
         daemon_active = await voxtype_cli.is_daemon_active_async()
-        if restart_fields and daemon_active:
+        if not daemon_active:
+            self.notify("Saved — daemon isn't running", timeout=3)
+            return
+        if newly_stale:
             async def after(do_restart: bool | None) -> None:
                 if not do_restart:
                     return
-                self.notify("Restarting voxtype…", timeout=3)
-                ok, msg = await voxtype_cli.restart_daemon_async()
-                self.notify(
-                    msg,
-                    severity="information" if ok else "error",
-                    timeout=5 if ok else 10,
-                )
+                await self._do_restart()
             self.push_screen(RestartModal(restart_fields), after)
         else:
-            self.notify("Saved", timeout=2)
+            self.notify(
+                "Saved — daemon still needs restart (ctrl+shift+r)",
+                timeout=4,
+            )
 
     def action_reload_config(self) -> None:
         if self.state and self.state.dirty:
@@ -396,6 +447,38 @@ class VoxtypeTUI(App[None]):
         self.state.add_vocab(f"TestWord{count}")
         self.refresh_dirty()
         self.notify(f"Added TestWord{count} (not saved)")
+
+    async def action_restart_daemon(self) -> None:
+        """Manually triggered by ctrl+shift+r or a click on the stale pill.
+        No-op when the daemon isn't stale (no damage if the user just hammers
+        the binding)."""
+        if self.state is None:
+            return
+        if not self.state.daemon_stale:
+            self.notify("Daemon is already up to date", timeout=2)
+            return
+        if not await voxtype_cli.is_daemon_active_async():
+            self.notify(
+                "Daemon isn't running — nothing to restart",
+                severity="warning", timeout=4,
+            )
+            # Clear the flag so the pill doesn't mislead the user.
+            self.state.daemon_stale = False
+            self.refresh_stale_pill()
+            return
+        await self._do_restart()
+
+    async def _do_restart(self) -> None:
+        self.notify("Restarting voxtype daemon…", timeout=3)
+        ok, msg = await voxtype_cli.restart_daemon_async()
+        if ok and self.state is not None:
+            self.state.daemon_stale = False
+            self.refresh_stale_pill()
+        self.notify(
+            msg,
+            severity="information" if ok else "error",
+            timeout=5 if ok else 10,
+        )
 
     def action_request_quit(self) -> None:
         if self.state is None or not self.state.dirty:

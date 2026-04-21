@@ -37,5 +37,5 @@ The TUI keeps each phrase as a structured entry in `~/.config/voxtype-tui/metada
 
 ## Gotchas
 
-- Changes take effect on the **next transcription**. No daemon restart needed.
+- **Changes are restart-sensitive** — the daemon caches the initial_prompt at startup. After saving, the TUI raises a RestartModal (first time) or leaves a persistent `⚠ Daemon restart needed` pill in the header; press `ctrl+shift+r` to restart once your edits are done.
 - If you hand-edit `config.toml`'s `initial_prompt` directly, the TUI notices on next load, drops a reconcile warning banner, and rebuilds its sidecar list from what's on disk.

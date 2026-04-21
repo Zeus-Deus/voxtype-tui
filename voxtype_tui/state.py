@@ -40,6 +40,11 @@ class AppState:
     loaded_dump: str
     config_dirty: bool = False
     sidecar_dirty: bool = False
+    # True after a save touched a restart-sensitive field and the user
+    # hasn't yet restarted the daemon. Cleared by a successful
+    # restart_daemon_async. Persists across the current session only —
+    # restarting the TUI itself re-derives from scratch on load.
+    daemon_stale: bool = False
     reconcile_warnings: list[str] = field(default_factory=list)
 
     @property
@@ -188,7 +193,11 @@ class AppState:
 
     def save(self) -> list[str]:
         """Persist both files. Returns the list of restart-sensitive paths
-        that changed since the last load/save (empty if none).
+        that changed since the last load/save (empty if none). Sets
+        `daemon_stale=True` whenever that list is non-empty — the caller
+        uses the pre-save value of `daemon_stale` to decide whether this is
+        the first-time transition that should raise a modal or just a
+        subsequent save during an already-stale session (pill only).
 
         Sync version — runs `voxtype -c <tmp> config` on the calling thread.
         Use `save_async` from Textual / async contexts to keep the event loop
@@ -197,6 +206,8 @@ class AppState:
         config.safe_save(self.doc, self.config_path)
         sidecar.save_atomic(self.sc, self.sidecar_path)
         restart_fields = config.diff_restart_sensitive(baseline_doc, self.doc)
+        if restart_fields:
+            self.daemon_stale = True
         self.loaded_dump = tomlkit.dumps(self.doc)
         self.config_dirty = False
         self.sidecar_dirty = False
