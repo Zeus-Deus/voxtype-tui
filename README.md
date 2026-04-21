@@ -4,19 +4,11 @@ A Textual-based TUI for managing [Voxtype](https://voxtype.io) — a push-to-tal
 
 ## Install
 
-### Arch / Omarchy (recommended)
-
 ```bash
 yay -S voxtype-tui
 ```
 
 Drops `/usr/bin/voxtype-tui`, `/usr/share/applications/voxtype-tui.desktop`, and the Omarchy integration scripts under `/usr/share/voxtype-tui/`. Pulls in `voxtype-bin`, `python-textual`, and `python-tomlkit` as dependencies.
-
-### Other Linux
-
-```bash
-pipx install voxtype-tui
-```
 
 ### Run
 
@@ -42,16 +34,7 @@ What it does:
 - Each edit is wrapped with a sentinel comment (`# voxtype-tui-managed (do not edit this line manually)`) so uninstall can find them. Re-runs are safe — the script checks for the sentinel and skips if present.
 - Runs `hyprctl reload` at the end.
 
-**Pre-install guardrails:** the script refuses if `voxtype-tui` isn't on `$PATH` (install it via `yay -S voxtype-tui` or `pipx install voxtype-tui` first), if `~/.config/omarchy/` doesn't exist, or if `SUPER CTRL ALT, X` is already bound to something else. To use a different keybinding, edit `BIND_KEY` at the top of `install-omarchy.sh`.
-
-### Omarchy key namespace cheatsheet
-
-As of Omarchy 3.5.x, these `SUPER+CTRL` and `SUPER+CTRL+ALT` combinations are already in use — pick an unused one if `SUPER CTRL ALT, X` conflicts with anything you've added.
-
-| Modifier | Taken by Omarchy defaults |
-|---|---|
-| `SUPER+CTRL` | `A`, `B`, `C`, `E`, `F`, `I`, `L`, `N`, `O`, `S`, `T`, `V`, `W`, `X`, `Z`, `SPACE`, `COMMA`, `BACKSPACE`, `TAB`, `DELETE`, `LEFT`, `RIGHT` (plus `U` for codexbar if installed) |
-| `SUPER+CTRL+ALT` | `T` (time), `B` (battery), `Z` (reset zoom) — everything else free |
+**Pre-install guardrails:** the script refuses if `voxtype-tui` isn't on `$PATH` (install it via `yay -S voxtype-tui` first), if `~/.config/omarchy/` doesn't exist, or if `SUPER CTRL ALT, X` is already bound to something else. To use a different keybinding, edit `BIND_KEY` at the top of `install-omarchy.sh`.
 
 ## Keybindings (in-TUI)
 
@@ -151,7 +134,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-Conda is used only for local development isolation. Shipped installs go through AUR or pipx — `install-omarchy.sh` assumes `voxtype-tui` is already on PATH from a system-level install and does not touch your conda environment.
+Conda is used only for local development isolation. Shipped installs go through AUR — `install-omarchy.sh` assumes `voxtype-tui` is already on PATH from a system-level install and does not touch your conda environment.
 
 ## Philosophy
 
