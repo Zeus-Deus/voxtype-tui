@@ -19,6 +19,7 @@ from textual.widgets import Button, Footer, Input, Label, Static, TabbedContent,
 
 from . import config, sidecar, voxtype_cli
 from .dictionary import DictionaryPane
+from .models import ModelsPane
 from .settings import SettingsPane
 from .state import AppState
 from .vocabulary import VocabularyPane
@@ -187,6 +188,7 @@ class VoxtypeTUI(App[None]):
         Binding("1", "switch_tab('vocabulary')", "Vocab", priority=True),
         Binding("2", "switch_tab('dictionary')", "Dict", priority=True),
         Binding("3", "switch_tab('settings')", "Settings", priority=True),
+        Binding("4", "switch_tab('models')", "Models", priority=True),
         Binding("ctrl+s", "save", "Save", priority=True),
         Binding("ctrl+r", "reload_config", "Reload", priority=True),
         Binding("ctrl+t", "test_mutate", "Fake mutation", show=False),
@@ -215,6 +217,8 @@ class VoxtypeTUI(App[None]):
                 yield DictionaryPane()
             with TabPane("Settings", id="settings"):
                 yield SettingsPane()
+            with TabPane("Models", id="models"):
+                yield ModelsPane()
         yield Footer()
 
     def on_mount(self) -> None:
@@ -255,6 +259,8 @@ class VoxtypeTUI(App[None]):
         for pane in self.query(DictionaryPane):
             pane.sync_from_state()
         for pane in self.query(SettingsPane):
+            pane.sync_from_state()
+        for pane in self.query(ModelsPane):
             pane.sync_from_state()
 
     def refresh_dirty(self) -> None:
