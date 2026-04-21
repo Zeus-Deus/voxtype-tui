@@ -21,6 +21,7 @@ from . import config, sidecar, theme as theme_mod, voxtype_cli
 from .theme import MODAL_BORDER_STYLE
 from .dictionary import DictionaryPane
 from .models import ModelsPane
+from .screens.export import ExportBundleModal
 from .settings import SettingsPane
 from .state import AppState
 from .vocabulary import VocabularyPane
@@ -220,6 +221,7 @@ class VoxtypeTUI(App[None]):
         Binding("ctrl+s", "save", "Save", priority=True),
         Binding("ctrl+r", "reload_config", "Reload", priority=True),
         Binding("ctrl+shift+r", "restart_daemon", "Restart daemon", priority=True),
+        Binding("ctrl+e", "export_bundle", "Export", priority=True),
         Binding("ctrl+t", "test_mutate", "Fake mutation", show=False),
         Binding("ctrl+q", "request_quit", "Quit", priority=True),
     ]
@@ -268,6 +270,13 @@ class VoxtypeTUI(App[None]):
         # Don't steal digit keys while an Input widget has focus — otherwise
         # typing a phrase with a number in it jumps tabs.
         if action == "switch_tab" and isinstance(self.focused, Input):
+            return False
+        # Ctrl+E shouldn't fire from inside an Input either. Textual's
+        # priority bindings still consume the keystroke unless check_action
+        # returns False — e.g. typing an 'E' char elsewhere is fine, but
+        # Ctrl+E while editing a vocab phrase is almost always a typo and
+        # opening the export modal would clobber the user's input focus.
+        if action == "export_bundle" and isinstance(self.focused, Input):
             return False
         return True
 
@@ -480,6 +489,25 @@ class VoxtypeTUI(App[None]):
             severity="information" if ok else "error",
             timeout=5 if ok else 10,
         )
+
+    def action_export_bundle(self) -> None:
+        """Open the manual-export modal. Dismissal callback surfaces the
+        resulting path as a toast; cancellation is silent. The modal
+        itself handles write failures in-place (error label) so the user
+        can fix a bad path without a reopen."""
+        if self.state is None:
+            return
+
+        def after(path: Path | None) -> None:
+            if path is None:
+                return
+            self.notify(
+                f"Exported to {path}",
+                title="Export complete",
+                timeout=6,
+            )
+
+        self.push_screen(ExportBundleModal(self.state), after)
 
     def action_request_quit(self) -> None:
         if self.state is None or not self.state.dirty:

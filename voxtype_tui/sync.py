@@ -446,7 +446,15 @@ def build_bundle(
             f"device_label exceeds {MAX_DEVICE_LABEL_LEN} characters"
         )
 
-    actual_secrets = secrets if (include_secrets and secrets) else None
+    # Explicit None-check rather than truthiness: an empty dict is a
+    # meaningful marker in manual exports ("the dialog asked about
+    # secrets; there weren't any") and must survive to the output,
+    # whereas `include_secrets=False` unconditionally suppresses the
+    # block (auto-sync invariant).
+    if include_secrets:
+        actual_secrets = secrets if secrets is not None else {}
+    else:
+        actual_secrets = None
     return Bundle(
         schema_version=SCHEMA_VERSION,
         format=FORMAT_TAG,
@@ -610,6 +618,31 @@ def _walk_check_string_lengths(node: Any, *, prefix: str) -> None:
 # ---------------------------------------------------------------------------
 # Secret handling
 # ---------------------------------------------------------------------------
+
+def redact_secrets_dict(secrets: dict[str, Any]) -> dict[str, Any]:
+    """Return a secrets dict with all known-secret values replaced by ``""``.
+
+    Manual export with Redact=True wants the exported file to SHOW that
+    these fields were intentionally blanked out — an empty string at the
+    right path reads differently from a missing key. On import:
+
+      * blank (``""``) → "don't overwrite local value" (see
+        ``diff_dangerous``; redacted imports are no-ops for secrets)
+      * missing key → also "don't overwrite"; equivalent on import, but
+        visually louder in the exported file that the export WAS asked
+        for and secrets WERE present at the time, just not copied out.
+
+    Paths not present in the input are left out — we never synthesize
+    keys the user never set.
+    """
+    result: dict[str, Any] = {}
+    for path in SECRET_PATHS:
+        val = _resolve(secrets, path)
+        if val is None:
+            continue
+        _put(result, "", *path)
+    return result
+
 
 def strip_secrets(bundle: Bundle) -> Bundle:
     """Return a copy of `bundle` with its secrets block removed.
@@ -921,6 +954,126 @@ async def write_sync_bundle_async(
     return await asyncio.to_thread(
         write_sync_bundle, doc, sc, path, device_label=device_label,
     )
+
+
+# ---------------------------------------------------------------------------
+# Manual export (Step 3): user-initiated, policy-flexible bundle write
+# ---------------------------------------------------------------------------
+
+SCOPE_SYNC_ONLY = "sync"
+SCOPE_SYNC_PLUS_LOCAL = "sync+local"
+EXPORT_SCOPES = (SCOPE_SYNC_ONLY, SCOPE_SYNC_PLUS_LOCAL)
+
+
+def default_export_filename(today: datetime | None = None) -> str:
+    """Suggested leaf name used by the export dialog.
+
+    `today` is injectable for tests; production callers pass nothing.
+    """
+    stamp = (today or datetime.now()).strftime("%Y-%m-%d")
+    return f"voxtype-tui-export-{stamp}.json"
+
+
+def default_export_path() -> Path:
+    """Suggested absolute path: `~/Downloads/<filename>`. Downloads is the
+    convention the user already thinks in ("where files go when I ask
+    for something to be saved"). Falls back to the home directory if
+    Downloads doesn't exist — we never create it ourselves."""
+    downloads = Path.home() / "Downloads"
+    base = downloads if downloads.exists() else Path.home()
+    return base / default_export_filename()
+
+
+def build_export_bundle(
+    doc: Any,
+    sc: Sidecar,
+    *,
+    scope: str,
+    redact_secrets: bool,
+    device_label: str | None = None,
+) -> Bundle:
+    """Build a bundle for manual export per the user's dialog choices.
+
+    Two orthogonal knobs:
+
+    * ``scope``: ``SCOPE_SYNC_ONLY`` → `local` block is empty dict.
+      ``SCOPE_SYNC_PLUS_LOCAL`` → `local` block populated from doc.
+      Sync-only is the safer default for a "share these settings with my
+      other laptop" workflow; sync+local is the "full backup before
+      wipe" case.
+
+    * ``redact_secrets``:
+
+      - ``True``  → secrets block contains SECRET_PATHS with empty-string
+        values (see ``redact_secrets_dict``). Exported file shows "I was
+        asked about secrets but chose not to share them"; on import
+        these paths become no-ops.
+      - ``False`` → secrets block contains real credential / command
+        strings verbatim. Use this only when you trust the destination
+        (e.g. personal backup drive; encrypted volume). Surface a
+        confirmation in the UI before accepting this choice.
+
+    Manual export ALWAYS includes a secrets block (redacted or not). The
+    auto-sync writer (`write_sync_bundle`) is the only caller that omits
+    the block entirely — absence is the signal that a sync.json file is
+    guaranteed secret-free.
+    """
+    if scope not in EXPORT_SCOPES:
+        raise BundleError(f"unknown export scope: {scope!r}")
+
+    sync_block = distill_sync(doc, sc.vocabulary, sc.replacements)
+    local_block = distill_local(doc) if scope == SCOPE_SYNC_PLUS_LOCAL else {}
+    secrets_source = distill_secrets(doc)
+    if redact_secrets:
+        secrets_block: dict[str, Any] = redact_secrets_dict(secrets_source)
+    else:
+        secrets_block = secrets_source
+
+    return build_bundle(
+        sync=sync_block,
+        local=local_block,
+        # Always pass secrets through (possibly redacted / possibly
+        # empty). `include_secrets=True` keeps the block in the output
+        # even when it's an empty dict — manual exports benefit from a
+        # visible (even if empty) block so the user can tell at a glance
+        # that the file was produced with the manual-export dialog.
+        secrets=secrets_block,
+        device_label=device_label or get_device_label(),
+        include_secrets=True,
+    )
+
+
+def write_export_bundle(
+    bundle: Bundle,
+    target: Path,
+) -> Path:
+    """Atomically write a manual-export bundle to `target`.
+
+    Returns the final resolved path (after `~` expansion). Creates the
+    parent directory only if the user's chosen path descends into an
+    existing tree — we never create a whole new directory structure
+    from a user-typed path since that often indicates a typo (they
+    meant `~/Documents/…` but typed `~/Docuements/…`). `mkdir(parents=False)`
+    keeps a small directory creation in scope for the case where the
+    user has `~/Downloads` but not `~/Downloads/voxtype-tui-exports`.
+
+    Same atomic discipline as the sync writer: tempfile in the target
+    directory, `os.replace`. A failure mid-write leaves the original
+    file (if any) intact and cleans up the tempfile.
+    """
+    target = target.expanduser()
+    parent = target.parent
+    if not parent.exists():
+        # Single missing leaf directory: create it. Deeper missing path
+        # means the user probably typoed — surface that as an error.
+        if parent.parent.exists():
+            parent.mkdir(parents=False, exist_ok=True)
+        else:
+            raise FileNotFoundError(
+                f"parent directory does not exist: {parent}"
+            )
+    _atomic_write_text(target, to_json(bundle))
+    return target
 
 
 def _existing_hash_matches(path: Path, new_hash: str) -> bool:
