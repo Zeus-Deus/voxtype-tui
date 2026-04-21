@@ -1,4 +1,4 @@
-"""Tests for Step 3 — manual export (Ctrl+E).
+"""Tests for manual export (Ctrl+E).
 
 Two layers:
 

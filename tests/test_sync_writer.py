@@ -1,5 +1,5 @@
-"""Tests for Step 2 — the writer half of `voxtype_tui.sync` and its
-integration into `AppState.save`.
+"""Tests for the writer half of `voxtype_tui.sync` and its integration
+into `AppState.save`.
 
 Invariants this file exercises:
   * `sync.json` only appears after both primary saves (config + sidecar)
@@ -237,8 +237,9 @@ def test_partial_json_array_is_overwritten(sync_path: Path) -> None:
 def test_existing_file_with_different_hash_is_overwritten(sync_path: Path) -> None:
     """Foreign file with valid shape but different hash — e.g. a sync.json
     received from another device — must be overwritten by local state.
-    (That's the 'local wins' arm of Step 4's staleness compare; Step 2
-    is unconditional local-wins because there's no reader yet.)"""
+    (That's the 'local wins' arm of the startup-reader staleness
+    compare; the writer is unconditional local-wins because it runs
+    after any reader has already reconciled.)"""
     sync_path.write_text(json.dumps({
         "format": sync.FORMAT_TAG,
         "schema_version": 1,

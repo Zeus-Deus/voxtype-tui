@@ -1,5 +1,5 @@
-"""Tests for Step 6 — missing-model banner wired to the Models-tab
-download pipeline, with the post-download "Set active" handoff.
+"""Tests for the missing-model banner wired to the Models-tab download
+pipeline, with the post-download "Set active" handoff.
 
 Strategy: mock `ModelsPane._run_download` so tests don't need a real
 `voxtype` binary. Two modes:

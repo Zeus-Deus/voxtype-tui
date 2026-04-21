@@ -1,4 +1,4 @@
-"""Tests for Step 4 — manual import (Ctrl+I) and Vexis adapter wiring.
+"""Tests for manual import (Ctrl+I) and the Vexis adapter wiring.
 
 Unit tests cover the pure import pipeline (`load_bundle_file`,
 `diff_bundle_against_state`, `apply_bundle_to_state`). Pilot tests cover

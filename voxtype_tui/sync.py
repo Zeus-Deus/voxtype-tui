@@ -867,7 +867,7 @@ def exceeds_initial_prompt_limit(phrases: Iterable[str]) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Writer (Step 2): atomic, idempotent sync.json generation
+# Writer: atomic, idempotent sync.json generation
 # ---------------------------------------------------------------------------
 
 def get_device_label() -> str:
@@ -959,7 +959,7 @@ async def write_sync_bundle_async(
 
 
 # ---------------------------------------------------------------------------
-# Manual export (Step 3): user-initiated, policy-flexible bundle write
+# Manual export: user-initiated, policy-flexible bundle write
 # ---------------------------------------------------------------------------
 
 SCOPE_SYNC_ONLY = "sync"
@@ -994,7 +994,7 @@ def build_export_bundle(
     redact_secrets: bool,
     device_label: str | None = None,
 ) -> Bundle:
-    """Build a bundle for manual export per the user's dialog choices.
+    """Build a bundle for manual export, honoring the scope and redact knobs.
 
     Two orthogonal knobs:
 
@@ -1046,7 +1046,7 @@ def build_export_bundle(
 
 
 # ---------------------------------------------------------------------------
-# Manual import (Step 4): foreign / native bundle → merged state
+# Manual import: foreign / native bundle → merged state
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -1462,7 +1462,7 @@ def _write_replacements_table(doc: Any, reps: dict[str, str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Startup reader (Step 5): conflict detection + staleness compare + apply
+# Startup reader: conflict detection + staleness compare + apply
 # ---------------------------------------------------------------------------
 
 # Where Voxtype stores downloaded whisper models. Used by the reader's
@@ -1490,7 +1490,7 @@ class SyncReconcileResult:
       * `conflict_files` non-empty → persistent error banner, no apply.
       * `applied_from` set         → dismissible success banner.
       * `missing_model` set        → dismissible warning banner with a
-                                     Download action (wired in Step 6).
+                                     Download action.
       * `skipped_reason` alone     → silent; common single-device case.
     """
     applied_from: str | None = None

@@ -1,5 +1,5 @@
-"""Tests for Step 5 — startup reader, staleness compare, conflict
-detection, and the three sync banners.
+"""Tests for the startup reader, staleness compare, conflict detection,
+and the three sync banners.
 
 Unit tests drive `sync.reconcile_sync_on_startup` directly with
 controlled filesystem fixtures. Pilot tests verify the banners render
