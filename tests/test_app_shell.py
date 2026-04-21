@@ -117,7 +117,7 @@ async def test_reconcile_banner_shows_for_orphaned_sidecar(tmp_path: Path, monke
         "version": 1,
         "vocabulary": [],
         "replacements": [
-            {"from_text": "ghost_rule", "category": "Command",
+            {"from_text": "ghost_rule", "category": "Capitalization",
              "added_at": "2026-01-01T00:00:00+00:00"}
         ],
     }))

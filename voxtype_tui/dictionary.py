@@ -1,9 +1,10 @@
 """Dictionary tab — post-transcription text replacements.
 
 Voxtype stores these as one flat `[text].replacements` map on disk. The TUI
-decorates each entry with a category (Replacement / Command / Capitalization)
-kept in the sidecar. Category changes are sidecar-only; adding/editing
-from→to updates both.
+decorates each entry with a category (Replacement / Capitalization) kept in
+the sidecar. Category changes are sidecar-only; adding/editing from→to
+updates both. Category is a UI-organizational tag — voxtype itself sees
+only the flat map and treats every entry as a literal rewrite.
 """
 from __future__ import annotations
 

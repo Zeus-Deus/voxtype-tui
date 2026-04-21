@@ -13,17 +13,18 @@ replacements = { "cloud code" = "Claude Code", "slash deploy" = "/deploy" }
 
 Matching is **case-insensitive** and **literal** — no regex. `"cloud code"` matches `"Cloud Code"`, `"CLOUD CODE"`, etc. It does not match inside larger words (e.g. `"cloudcode"`).
 
-## The three UI categories
+## The two UI categories
 
-All three collapse to the same `[text] replacements` map on disk. The category is a tag *you* use to keep the list organized.
+Both collapse to the same `[text] replacements` map on disk. The category is a tag *you* use to keep the list organized — voxtype itself just sees a flat dict and treats every entry as a literal rewrite. There's no behavioral difference between the two.
 
 | Category | Typical use | Example |
 |---|---|---|
-| **Replacement** | Fix a recurring mis-hear | `cloud code` → `Claude Code` |
-| **Command** | Trigger a slash-command by voice | `slash deploy` → `/deploy` |
+| **Replacement** | Fix a recurring mis-hear, or trigger a slash-command by voice | `cloud code` → `Claude Code` / `slash deploy` → `/deploy` |
 | **Capitalization** | Force a specific case | `type script` → `TypeScript` |
 
 Press `c` on a selected row to cycle its category.
+
+> Sidecar files created by older versions tagged slash-command entries with a third category, `Command`. Voxtype-tui now folds `Command` into `Replacement` (they were functionally identical — both are flat literal rewrites). Migration is silent and happens at load time; the disk file picks up the new tag on the next save.
 
 ## Keybindings
 

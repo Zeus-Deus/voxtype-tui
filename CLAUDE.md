@@ -96,7 +96,7 @@ Voxtype already binds Super+Ctrl+X globally in Hyprland, so an in-app Record but
 
 We need to store UI-only metadata that doesn't belong in Voxtype's config:
 - Per-vocabulary-word category / notes / timestamps
-- Per-replacement-rule category tag (Replacement vs Commands vs Capitalization)
+- Per-replacement-rule category tag (Replacement vs Capitalization) — UI-organizational only; voxtype sees a flat map
 
 Put this at `~/.config/voxtype-tui/metadata.json` (or `.toml`). On load, merge with `~/.config/voxtype/config.toml`. On save, write both files.
 

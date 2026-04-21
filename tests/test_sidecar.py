@@ -33,7 +33,7 @@ def test_save_load_round_trip(tmp_path: Path) -> None:
         ],
         replacements=[
             sidecar.ReplacementEntry(from_text="vox type", category="Replacement"),
-            sidecar.ReplacementEntry(from_text="slash run release", category="Command"),
+            sidecar.ReplacementEntry(from_text="type script", category="Capitalization"),
         ],
     )
     sidecar.save_atomic(sc, p)
@@ -42,7 +42,7 @@ def test_save_load_round_trip(tmp_path: Path) -> None:
     assert reloaded.vocabulary[1].notes == "distro"
     assert [(r.from_text, r.category) for r in reloaded.replacements] == [
         ("vox type", "Replacement"),
-        ("slash run release", "Command"),
+        ("type script", "Capitalization"),
     ]
 
 
@@ -50,11 +50,36 @@ def test_load_tolerates_legacy_from_field(tmp_path: Path) -> None:
     """If someone hand-edits with 'from' instead of 'from_text', still load."""
     p = tmp_path / "metadata.json"
     p.write_text(
-        '{"version":1,"vocabulary":[],"replacements":[{"from":"x","category":"Command","added_at":"2026-01-01T00:00:00+00:00"}]}'
+        '{"version":1,"vocabulary":[],"replacements":[{"from":"x","category":"Capitalization","added_at":"2026-01-01T00:00:00+00:00"}]}'
     )
     sc = sidecar.load(p)
     assert sc.replacements[0].from_text == "x"
-    assert sc.replacements[0].category == "Command"
+    assert sc.replacements[0].category == "Capitalization"
+
+
+def test_load_migrates_legacy_command_category_to_replacement(tmp_path: Path) -> None:
+    """Older sidecar files tagged entries with 'Command', a category we've
+    since folded into 'Replacement'. Loading such a file must silently
+    rewrite the tag — no user prompt, no exception, no warning."""
+    p = tmp_path / "metadata.json"
+    p.write_text(
+        '{"version":1,"vocabulary":[],"replacements":['
+        '{"from_text":"slash deploy","category":"Command","added_at":"2026-01-01T00:00:00+00:00"}'
+        ']}'
+    )
+    sc = sidecar.load(p)
+    assert len(sc.replacements) == 1
+    assert sc.replacements[0].category == "Replacement"
+    assert sc.replacements[0].from_text == "slash deploy"
+    # "Command" must no longer be a valid category at all
+    assert "Command" not in sidecar.CATEGORIES
+
+
+def test_categories_exposes_two_options() -> None:
+    """UI code iterates sidecar.CATEGORIES to build the Dictionary category
+    Select; this test locks in the 2-option shape so the UI stays in sync
+    with the sidecar contract."""
+    assert sidecar.CATEGORIES == ("Replacement", "Capitalization")
 
 
 def test_load_rejects_unknown_category_defaults(tmp_path: Path) -> None:
@@ -118,10 +143,23 @@ def test_reconcile_vocab_empty_disk_clears_sidecar() -> None:
 # ---------------------------------------------------------------------------
 
 def test_reconcile_reps_preserves_category() -> None:
+    sc_reps = [sidecar.ReplacementEntry(from_text="vox type", category="Capitalization")]
+    cfg = {"vox type": "voxtype"}
+    out, warns = sidecar.reconcile_replacements(sc_reps, cfg)
+    assert [(r.from_text, r.category) for r in out] == [("vox type", "Capitalization")]
+    assert warns == []
+
+
+def test_reconcile_reps_normalizes_unknown_category_without_warning() -> None:
+    """A sidecar entry with a category that's no longer valid (e.g. an
+    in-memory 'Command' that slipped past load-time normalization, or any
+    other invalid tag) must be quietly reset to the default. This is NOT a
+    divergence warning — it's a schema migration."""
+    # Construct directly; bypasses load()'s normalization
     sc_reps = [sidecar.ReplacementEntry(from_text="vox type", category="Command")]
     cfg = {"vox type": "voxtype"}
     out, warns = sidecar.reconcile_replacements(sc_reps, cfg)
-    assert [(r.from_text, r.category) for r in out] == [("vox type", "Command")]
+    assert [(r.from_text, r.category) for r in out] == [("vox type", "Replacement")]
     assert warns == []
 
 
@@ -135,7 +173,7 @@ def test_reconcile_reps_unknown_key_defaults_to_replacement() -> None:
 
 def test_reconcile_reps_drops_orphans() -> None:
     sc_reps = [
-        sidecar.ReplacementEntry(from_text="ghost", category="Command"),
+        sidecar.ReplacementEntry(from_text="ghost", category="Capitalization"),
         sidecar.ReplacementEntry(from_text="vox type", category="Replacement"),
     ]
     cfg = {"vox type": "voxtype"}
@@ -146,7 +184,7 @@ def test_reconcile_reps_drops_orphans() -> None:
 
 def test_reconcile_reps_mixed_add_drop() -> None:
     sc_reps = [
-        sidecar.ReplacementEntry(from_text="ghost", category="Command"),
+        sidecar.ReplacementEntry(from_text="ghost", category="Capitalization"),
         sidecar.ReplacementEntry(from_text="vox type", category="Capitalization"),
     ]
     cfg = {"vox type": "voxtype", "cloud code": "Claude Code"}

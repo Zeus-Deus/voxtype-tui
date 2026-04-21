@@ -49,7 +49,7 @@ Letter keys auto-yield to Input widgets too.
 | `/` | Focus search input |
 | `d` | Delete selected row |
 | `u` | Undo last delete |
-| `c` | Cycle the selected row's category (Replacement → Command → Capitalization → Replacement) |
+| `c` | Cycle the selected row's category (Replacement ↔ Capitalization) |
 | `escape` | Blur Input, return focus to the table |
 
 ### Settings

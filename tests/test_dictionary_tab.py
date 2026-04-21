@@ -105,7 +105,7 @@ async def test_cycle_category_only_marks_sidecar_dirty(tmp_env):
         assert app.state.sidecar_dirty is True
         # Category should have advanced to the next one
         cats = [r.category for r in app.state.sc.replacements]
-        assert cats == ["Command"]
+        assert cats == ["Capitalization"]
 
 
 async def test_cycle_category_wraps(tmp_env):
@@ -137,7 +137,7 @@ async def test_delete_and_undo_restores_category(tmp_env):
         await _goto_dictionary(pilot, app)
 
         app.state.upsert_replacement("vox type", "voxtype", "Replacement")
-        app.state.upsert_replacement("slash deploy", "/deploy", "Command")
+        app.state.upsert_replacement("slash deploy", "/deploy", "Capitalization")
         app.state.upsert_replacement("kube ctl", "kubectl", "Capitalization")
         pane = app.query_one(DictionaryPane)
         pane.sync_from_state()
@@ -157,7 +157,7 @@ async def test_delete_and_undo_restores_category(tmp_env):
         await pilot.pause()
         entries = [(r.from_text, r.category) for r in app.state.sc.replacements]
         # Order after undo puts it back; category preserved
-        assert ("slash deploy", "Command") in entries
+        assert ("slash deploy", "Capitalization") in entries
 
 
 async def test_delete_last_replacement_shows_section_warning_toast(tmp_env):

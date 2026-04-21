@@ -57,7 +57,7 @@ def main() -> int:
         ]
         reps2 = list(reps_rec) + [
             sidecar.ReplacementEntry(from_text="cloud code"),
-            sidecar.ReplacementEntry(from_text="slash codemux release", category="Command"),
+            sidecar.ReplacementEntry(from_text="slash codemux release", category="Capitalization"),
         ]
         config.set_initial_prompt(doc2, sidecar.build_initial_prompt(vocab2))
         config.set_replacements(doc2, {
@@ -67,7 +67,11 @@ def main() -> int:
 
         changed = config.diff_restart_sensitive(doc, doc2)
         print(f"vocab/reps edit → restart-sensitive diff: {changed}")
-        assert changed == [], f"unexpected restart diff: {changed}"
+        # Post policy-fix: whisper.initial_prompt and text.replacements are
+        # BOTH restart-sensitive (daemon caches the text layer at startup).
+        assert set(changed) == {"whisper.initial_prompt", "text.replacements"}, (
+            f"unexpected restart diff: {changed}"
+        )
 
         # 2. Flipping a restart-sensitive field is detected
         doc3 = config.load(tmp_cfg)
@@ -119,7 +123,7 @@ def main() -> int:
         config.save_atomic(handedit, tmp_cfg)
         handedit_reloaded = config.get_replacements(config.load(tmp_cfg))
         orphan_sc = [
-            sidecar.ReplacementEntry(from_text="ghost", category="Command"),
+            sidecar.ReplacementEntry(from_text="ghost", category="Capitalization"),
             sidecar.ReplacementEntry(from_text="foo", category="Capitalization"),
         ]
         rec, warns = sidecar.reconcile_replacements(orphan_sc, handedit_reloaded)

@@ -24,8 +24,16 @@ from typing import Iterable
 
 SIDECAR_PATH = Path.home() / ".config" / "voxtype-tui" / "metadata.json"
 
-CATEGORIES: tuple[str, ...] = ("Replacement", "Command", "Capitalization")
+CATEGORIES: tuple[str, ...] = ("Replacement", "Capitalization")
 DEFAULT_CATEGORY = "Replacement"
+
+# Sidecar files created by earlier versions may carry entries tagged
+# "Command". Vexis collapsed this category into "Replacement" (the two are
+# functionally identical — both are flat literal rewrites on disk) and
+# voxtype-tui follows the same simplification. Load-time normalization
+# transparently rewrites "Command" → "Replacement"; the disk file picks up
+# the new spelling on the next save.
+_LEGACY_CATEGORY_MIGRATIONS: dict[str, str] = {"Command": "Replacement"}
 
 
 def _now_iso() -> str:
@@ -64,6 +72,9 @@ def load(path: Path = SIDECAR_PATH) -> Sidecar:
     reps: list[ReplacementEntry] = []
     for r in data.get("replacements", []):
         cat = r.get("category", DEFAULT_CATEGORY)
+        # Silent migration: older sidecar files may tag entries "Command".
+        # We fold that into "Replacement" — no warning, no user prompt.
+        cat = _LEGACY_CATEGORY_MIGRATIONS.get(cat, cat)
         if cat not in CATEGORIES:
             cat = DEFAULT_CATEGORY
         reps.append(ReplacementEntry(
@@ -140,7 +151,19 @@ def reconcile_replacements(
     added = 0
     for from_text in config_reps:
         if from_text in by_from:
-            new_reps.append(by_from[from_text])
+            entry = by_from[from_text]
+            # Defense-in-depth migration: a sidecar entry with a category
+            # that's no longer valid (e.g. legacy "Command" that slipped
+            # past load-time normalization) gets quietly reset to the
+            # default. NOT flagged as a divergence — it's a schema-level
+            # migration, not a user-visible external edit.
+            if entry.category not in CATEGORIES:
+                entry = ReplacementEntry(
+                    from_text=entry.from_text,
+                    category=DEFAULT_CATEGORY,
+                    added_at=entry.added_at,
+                )
+            new_reps.append(entry)
         else:
             new_reps.append(ReplacementEntry(from_text=from_text))
             added += 1

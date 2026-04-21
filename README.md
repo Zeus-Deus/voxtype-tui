@@ -95,7 +95,7 @@ Everything that maps to Voxtype itself — vocabulary phrases, replacement maps,
 
 ### `~/.config/voxtype-tui/metadata.json` — sidecar (owned by voxtype-tui)
 
-UI-only annotations that don't belong in Voxtype's config: vocabulary entries as structured objects (so the UI can show a list rather than parsing the comma-joined string on every render), per-replacement category tags (Replacement / Command / Capitalization), and `added_at` timestamps. On load the sidecar is reconciled against the config. If you hand-edit `config.toml` and the sidecar diverges, **the config wins** — the sidecar is rebuilt from disk and a dismissible warning banner surfaces the divergence at the top of the affected tab.
+UI-only annotations that don't belong in Voxtype's config: vocabulary entries as structured objects (so the UI can show a list rather than parsing the comma-joined string on every render), per-replacement category tags (Replacement / Capitalization), and `added_at` timestamps. On load the sidecar is reconciled against the config. If you hand-edit `config.toml` and the sidecar diverges, **the config wins** — the sidecar is rebuilt from disk and a dismissible warning banner surfaces the divergence at the top of the affected tab.
 
 ## Restart-sensitive fields
 
