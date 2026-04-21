@@ -42,9 +42,9 @@ class UndoEntry:
 class VocabularyPane(Vertical):
     DEFAULT_CSS = """
     VocabularyPane { padding: 1 2; }
-    VocabularyPane #top { height: 3; margin-bottom: 1; }
-    VocabularyPane #add { width: 1fr; }
-    VocabularyPane #tokens {
+    VocabularyPane #vocab-top { height: 3; margin-bottom: 1; }
+    VocabularyPane #vocab-add { width: 1fr; }
+    VocabularyPane #vocab-tokens {
         width: 24;
         height: 3;
         padding: 1;
@@ -52,11 +52,11 @@ class VocabularyPane(Vertical):
         background: $boost;
         content-align: center middle;
     }
-    VocabularyPane #tokens.warn { background: $warning 30%; color: $warning; }
-    VocabularyPane #tokens.over  { background: $error 30%; color: $error; }
-    VocabularyPane #search { margin-bottom: 1; }
+    VocabularyPane #vocab-tokens.warn { background: $warning 30%; color: $warning; }
+    VocabularyPane #vocab-tokens.over  { background: $error 30%; color: $error; }
+    VocabularyPane #vocab-search { margin-bottom: 1; }
     VocabularyPane DataTable { height: 1fr; }
-    VocabularyPane #hints {
+    VocabularyPane #vocab-hints {
         height: 1;
         color: $text-muted;
         margin-top: 1;
@@ -84,18 +84,18 @@ class VocabularyPane(Vertical):
         self._last_g_time: float = 0.0
 
     def compose(self) -> ComposeResult:
-        with Horizontal(id="top"):
+        with Horizontal(id="vocab-top"):
             yield Input(
                 placeholder="Add phrase and press Enter — rapid-add keeps focus here…",
-                id="add",
+                id="vocab-add",
             )
-            yield Static(id="tokens")
-        yield Input(placeholder="Search (press / to focus)", id="search")
-        yield DataTable(id="table", cursor_type="row", zebra_stripes=True)
+            yield Static(id="vocab-tokens")
+        yield Input(placeholder="Search (press / to focus)", id="vocab-search")
+        yield DataTable(id="vocab-table", cursor_type="row", zebra_stripes=True)
         yield Static(
             "n add/next  ·  N prev  ·  / search  ·  d delete  ·  "
             "u undo  ·  j/k gg/G nav  ·  ctrl+s save",
-            id="hints",
+            id="vocab-hints",
         )
 
     def on_mount(self) -> None:
@@ -123,7 +123,7 @@ class VocabularyPane(Vertical):
         return True
 
     def _filter_active(self) -> bool:
-        return bool(self.query_one("#search", Input).value.strip())
+        return bool(self.query_one("#vocab-search", Input).value.strip())
 
     # ---- view refresh ----
 
@@ -139,7 +139,7 @@ class VocabularyPane(Vertical):
     def refresh_table(self) -> None:
         table = self.query_one(DataTable)
         table.clear()
-        q = self.query_one("#search", Input).value.strip().lower()
+        q = self.query_one("#vocab-search", Input).value.strip().lower()
         for v in self._entries():
             if q and q not in v.phrase.lower():
                 continue
@@ -149,7 +149,7 @@ class VocabularyPane(Vertical):
     def refresh_tokens(self) -> None:
         text = sidecar.build_initial_prompt(self._entries())
         count = estimate_tokens(text)
-        widget = self.query_one("#tokens", Static)
+        widget = self.query_one("#vocab-tokens", Static)
         widget.update(f"~{count} / {TOKEN_LIMIT} tok")
         widget.remove_class("warn")
         widget.remove_class("over")
@@ -161,10 +161,10 @@ class VocabularyPane(Vertical):
     # ---- actions ----
 
     def action_focus_add(self) -> None:
-        self.query_one("#add", Input).focus()
+        self.query_one("#vocab-add", Input).focus()
 
     def action_focus_search(self) -> None:
-        self.query_one("#search", Input).focus()
+        self.query_one("#vocab-search", Input).focus()
 
     def action_focus_table(self) -> None:
         self.query_one(DataTable).focus()
@@ -259,7 +259,7 @@ class VocabularyPane(Vertical):
     # ---- input events ----
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id != "add":
+        if event.input.id != "vocab-add":
             return
         phrase = event.value.strip()
         event.stop()
@@ -281,7 +281,7 @@ class VocabularyPane(Vertical):
             event.input.value = ""
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id == "search":
+        if event.input.id == "vocab-search":
             self.refresh_table()
 
     # ---- external hook: called from the app when state reloads ----

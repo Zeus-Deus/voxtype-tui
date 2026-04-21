@@ -44,7 +44,7 @@ async def test_add_replacement_persists_with_category(tmp_env):
         await pilot.press("n")
         await pilot.pause()
         assert isinstance(app.focused, Input)
-        assert app.focused.id == "from-input"
+        assert app.focused.id == "dict-add-from"
 
         for ch in "vox type":
             await pilot.press(ch if ch != " " else "space")
@@ -55,8 +55,8 @@ async def test_add_replacement_persists_with_category(tmp_env):
         await pilot.press("enter")
         await pilot.pause()
 
-        assert pane.query_one("#from-input", Input).value == ""
-        assert pane.query_one("#to-input", Input).value == ""
+        assert pane.query_one("#dict-add-from", Input).value == ""
+        assert pane.query_one("#dict-add-to", Input).value == ""
 
         await pilot.press("ctrl+s")
         await pilot.pause()
@@ -211,7 +211,7 @@ async def test_filter_searches_both_from_and_to(tmp_env):
         pane.sync_from_state()
         await pilot.pause()
 
-        search = pane.query_one("#search", Input)
+        search = pane.query_one("#dict-search", Input)
         search.focus()
         for ch in "kube":
             await pilot.press(ch)
@@ -236,7 +236,7 @@ async def test_add_requires_both_fields(tmp_env):
         await _goto_dictionary(pilot, app)
 
         pane = app.query_one(DictionaryPane)
-        from_input = pane.query_one("#from-input", Input)
+        from_input = pane.query_one("#dict-add-from", Input)
         from_input.focus()
         await pilot.pause()
         for ch in "solo":
@@ -258,4 +258,4 @@ async def test_vim_n_on_dictionary_focuses_from_input(tmp_env):
         await pilot.press("n")
         await pilot.pause()
         assert isinstance(app.focused, Input)
-        assert app.focused.id == "from-input"
+        assert app.focused.id == "dict-add-from"

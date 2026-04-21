@@ -35,13 +35,13 @@ class UndoEntry:
 class DictionaryPane(Vertical):
     DEFAULT_CSS = """
     DictionaryPane { padding: 1 2; }
-    DictionaryPane #add-row { height: 3; margin-bottom: 1; }
-    DictionaryPane #from-input { width: 1fr; }
-    DictionaryPane #to-input { width: 1fr; margin-left: 1; }
-    DictionaryPane #category-select { width: 22; margin-left: 1; }
-    DictionaryPane #search { margin-bottom: 1; }
+    DictionaryPane #dict-add-row { height: 3; margin-bottom: 1; }
+    DictionaryPane #dict-add-from { width: 1fr; }
+    DictionaryPane #dict-add-to { width: 1fr; margin-left: 1; }
+    DictionaryPane #dict-category { width: 22; margin-left: 1; }
+    DictionaryPane #dict-search { margin-bottom: 1; }
     DictionaryPane DataTable { height: 1fr; }
-    DictionaryPane #hints { height: 1; color: $text-muted; margin-top: 1; }
+    DictionaryPane #dict-hints { height: 1; color: $text-muted; margin-top: 1; }
     """
 
     BINDINGS = [
@@ -64,22 +64,22 @@ class DictionaryPane(Vertical):
         self._last_g_time: float = 0.0
 
     def compose(self) -> ComposeResult:
-        with Horizontal(id="add-row"):
-            yield Input(placeholder="From (what you say)…", id="from-input")
-            yield Input(placeholder="To (what appears)…", id="to-input")
+        with Horizontal(id="dict-add-row"):
+            yield Input(placeholder="From (what you say)…", id="dict-add-from")
+            yield Input(placeholder="To (what appears)…", id="dict-add-to")
             yield Select(
                 options=[(c, c) for c in sidecar.CATEGORIES],
                 prompt="Category",
                 value=sidecar.DEFAULT_CATEGORY,
                 allow_blank=False,
-                id="category-select",
+                id="dict-category",
             )
-        yield Input(placeholder="Search from or to (press / to focus)", id="search")
-        yield DataTable(id="table", cursor_type="row", zebra_stripes=True)
+        yield Input(placeholder="Search from or to (press / to focus)", id="dict-search")
+        yield DataTable(id="dict-table", cursor_type="row", zebra_stripes=True)
         yield Static(
             "n add/next  ·  N prev  ·  / search  ·  d delete  ·  "
             "u undo  ·  c cycle category  ·  j/k gg/G nav  ·  ctrl+s save",
-            id="hints",
+            id="dict-hints",
         )
 
     def on_mount(self) -> None:
@@ -103,7 +103,7 @@ class DictionaryPane(Vertical):
         return True
 
     def _filter_active(self) -> bool:
-        return bool(self.query_one("#search", Input).value.strip())
+        return bool(self.query_one("#dict-search", Input).value.strip())
 
     # --- helpers ---
 
@@ -125,7 +125,7 @@ class DictionaryPane(Vertical):
     def refresh_table(self) -> None:
         table = self.query_one(DataTable)
         table.clear()
-        q = self.query_one("#search", Input).value.strip().lower()
+        q = self.query_one("#dict-search", Input).value.strip().lower()
         for r in self._entries():
             to_text = self._to_text(r.from_text)
             if q and q not in r.from_text.lower() and q not in to_text.lower():
@@ -147,13 +147,13 @@ class DictionaryPane(Vertical):
     # --- actions ---
 
     def action_focus_search(self) -> None:
-        self.query_one("#search", Input).focus()
+        self.query_one("#dict-search", Input).focus()
 
     def action_focus_table(self) -> None:
         self.query_one(DataTable).focus()
 
     def action_focus_add(self) -> None:
-        self.query_one("#from-input", Input).focus()
+        self.query_one("#dict-add-from", Input).focus()
 
     def action_vim_n(self) -> None:
         if self._filter_active():
@@ -261,12 +261,12 @@ class DictionaryPane(Vertical):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         # Enter in either from-input or to-input triggers add.
-        if event.input.id not in ("from-input", "to-input"):
+        if event.input.id not in ("dict-add-from", "dict-add-to"):
             return
         event.stop()
-        from_input = self.query_one("#from-input", Input)
-        to_input = self.query_one("#to-input", Input)
-        cat_select = self.query_one("#category-select", Select)
+        from_input = self.query_one("#dict-add-from", Input)
+        to_input = self.query_one("#dict-add-to", Input)
+        cat_select = self.query_one("#dict-category", Select)
 
         from_text = from_input.value.strip()
         to_text = to_input.value.strip()
@@ -285,7 +285,7 @@ class DictionaryPane(Vertical):
         self.tui.refresh_dirty()
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id == "search":
+        if event.input.id == "dict-search":
             self.refresh_table()
 
     # --- external hook ---

@@ -103,7 +103,7 @@ async def test_digit_keys_do_not_switch_tabs_while_input_focused(tmp_env):
         tabs = app.query_one("#tabs")
         assert tabs.active == "vocabulary", "digit keys should not switch tabs while typing"
         from textual.widgets import Input
-        inp = app.query_one("#add", Input)
+        inp = app.query_one("#vocab-add", Input)
         assert "2" in inp.value
 
 

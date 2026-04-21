@@ -36,7 +36,7 @@ async def test_add_vocab_via_input_then_ctrl_s_persists(tmp_env):
         await pilot.press("n")
         await pilot.pause()
         assert isinstance(app.focused, Input)
-        assert app.focused.id == "add"
+        assert app.focused.id == "vocab-add"
 
         # Type and submit — input should clear and stay focused (rapid-add).
         for ch in "Claude Code":
@@ -132,7 +132,7 @@ async def test_filtered_delete_targets_underlying_phrase(tmp_env):
         await pilot.pause()
 
         # Enter a filter that matches only "Apple" and "Apricot"
-        search = app.query_one("#search", Input)
+        search = app.query_one("#vocab-search", Input)
         search.focus()
         await pilot.pause()
         for ch in "Ap":
@@ -163,7 +163,7 @@ async def test_token_counter_updates_and_warns(tmp_env):
     async with app.run_test() as pilot:
         await pilot.pause()
         pane = app.query_one(VocabularyPane)
-        tokens_widget = app.query_one("#tokens")
+        tokens_widget = app.query_one("#vocab-tokens")
 
         # Empty to start → no warn class
         assert not tokens_widget.has_class("warn")
@@ -283,14 +283,14 @@ async def test_n_context_sensitive_new_vs_next_match(tmp_env):
         await pilot.press("n")
         await pilot.pause()
         assert isinstance(app.focused, Input)
-        assert app.focused.id == "add"
+        assert app.focused.id == "vocab-add"
 
         # Exit the input without adding
         await pilot.press("escape")
         await pilot.pause()
 
         # Apply a filter, put focus on table, press n to advance matches
-        search = app.query_one("#search", Input)
+        search = app.query_one("#vocab-search", Input)
         search.focus()
         for ch in "Ap":
             await pilot.press(ch)
@@ -319,7 +319,7 @@ async def test_capital_N_goes_to_previous_match(tmp_env):
         pane.sync_from_state()
         await pilot.pause()
 
-        search = app.query_one("#search", Input)
+        search = app.query_one("#vocab-search", Input)
         search.focus()
         for ch in "A":
             await pilot.press(ch)
@@ -375,7 +375,7 @@ async def test_search_input_does_not_trigger_letter_bindings(tmp_env):
         pane.sync_from_state()
         await pilot.pause()
 
-        search = app.query_one("#search", Input)
+        search = app.query_one("#vocab-search", Input)
         search.focus()
         await pilot.pause()
         await pilot.press("d")
