@@ -7,9 +7,9 @@
 # Both edits are wrapped with a sentinel comment so uninstall-omarchy.sh can
 # find and remove them. Re-runnable safely (idempotent).
 #
-# This script assumes voxtype-tui is already on $PATH — install it first with
-# your package manager (Arch: `yay -S voxtype-tui`; other distros: `pipx
-# install voxtype-tui`).
+# This script assumes voxtype-tui is already on $PATH — install it first from
+# the AUR: `yay -S voxtype-tui`. voxtype-tui is Arch-only at the moment; it is
+# not published to PyPI.
 
 set -euo pipefail
 
@@ -31,11 +31,11 @@ if ! command -v voxtype-tui >/dev/null 2>&1; then
     cat >&2 <<EOF
 voxtype-tui not found on PATH.
 
-Install it first:
-    Arch / Omarchy:   yay -S voxtype-tui
-    Other Linux:      pipx install voxtype-tui
+Install it first from the AUR:
+    yay -S voxtype-tui
 
-Then re-run this script.
+Then re-run this script. (voxtype-tui is Arch-only at the moment; it is
+not published to PyPI, so pipx will not work.)
 EOF
     exit 1
 fi

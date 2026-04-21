@@ -108,7 +108,7 @@ Put this at `~/.config/voxtype-tui/metadata.json` (or `.toml`). On load, merge w
 
 ### Distribution
 
-**Shipped installs go through AUR (`yay -S voxtype-tui`) or pipx** (`pipx install voxtype-tui`). The PKGBUILD uses the modern `python-build` + `python-installer` flow; `.SRCINFO` lives at the repo root and must be regenerated with `makepkg --printsrcinfo > .SRCINFO` whenever PKGBUILD changes. `tests/test_pkgbuild.py` fails loudly when the committed `.SRCINFO` diverges from what PKGBUILD produces.
+**Shipped installs go through AUR** (`yay -S voxtype-tui`). voxtype-tui is Arch-only at the moment; it is not published to PyPI, so pipx is not an install path. The PKGBUILD uses the modern `python-build` + `python-installer` flow; `.SRCINFO` lives at the repo root and must be regenerated with `makepkg --printsrcinfo > .SRCINFO` whenever PKGBUILD changes. `tests/test_pkgbuild.py` fails loudly when the committed `.SRCINFO` diverges from what PKGBUILD produces.
 
 `scripts/install-omarchy.sh` assumes `voxtype-tui` is already on `$PATH` from a system-level install (AUR / pipx). It does **not** drop a conda wrapper — if the binary isn't found it exits with a message pointing at the package managers.
 

@@ -150,12 +150,13 @@ def test_install_is_idempotent(sandbox_home: Path) -> None:
 
 def test_install_bails_when_voxtype_tui_missing_from_path(sandbox_home: Path) -> None:
     """The script assumes voxtype-tui is installed system-wide — if it's
-    not on PATH, refuse with exit 1 and a message pointing at AUR/pipx."""
+    not on PATH, refuse with exit 1 and a message pointing at the AUR.
+    voxtype-tui is Arch-only; the guidance must not suggest pipx since the
+    package is not published to PyPI."""
     result = run(INSTALL, sandbox_home, include_stub=False)
     assert result.returncode == 1
     assert "voxtype-tui not found on PATH" in result.stderr
     assert "yay -S voxtype-tui" in result.stderr
-    assert "pipx install voxtype-tui" in result.stderr
 
 
 def test_install_bails_without_omarchy(tmp_path: Path) -> None:

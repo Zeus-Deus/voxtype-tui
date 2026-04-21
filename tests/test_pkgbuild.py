@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,11 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 PKGBUILD = REPO / "PKGBUILD"
 SRCINFO = REPO / ".SRCINFO"
+PYPROJECT = REPO / "pyproject.toml"
+
+
+def _pyproject_version() -> str:
+    return tomllib.loads(PYPROJECT.read_text())["project"]["version"]
 
 
 @pytest.fixture
@@ -51,7 +57,7 @@ def test_srcinfo_declares_expected_metadata(srcinfo_text: str) -> None:
     required = [
         "pkgbase = voxtype-tui",
         "pkgname = voxtype-tui",
-        "pkgver = 0.1.0",
+        f"pkgver = {_pyproject_version()}",
         "arch = any",
         "license = MIT",
         "depends = python",
