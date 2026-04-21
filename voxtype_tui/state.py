@@ -7,13 +7,16 @@ the baseline (`loaded_dump`) is captured at load time and only updated on save.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import tomlkit
 from tomlkit import TOMLDocument
 
-from . import config, sidecar
+from . import config, sidecar, sync
+
+_logger = logging.getLogger(__name__)
 
 
 def _toml_equals(a: object, b: object) -> bool:
@@ -201,10 +204,29 @@ class AppState:
 
         Sync version — runs `voxtype -c <tmp> config` on the calling thread.
         Use `save_async` from Textual / async contexts to keep the event loop
-        responsive while validation runs."""
+        responsive while validation runs.
+
+        Write order is load-bearing: config.toml + metadata.json are the
+        canonical source of truth, and both must commit before the
+        derivative sync.json bundle is touched. A failed primary save
+        propagates (existing behavior) and leaves sync.json untouched —
+        better to let the next save regenerate than to advertise state
+        that didn't commit locally, which another Syncthing peer could
+        then pull as truth.
+        """
         baseline_doc = tomlkit.parse(self.loaded_dump)
         config.safe_save(self.doc, self.config_path)
         sidecar.save_atomic(self.sc, self.sidecar_path)
+        # Both primary saves succeeded — derive and write the portable
+        # bundle. A write failure here (disk full, unwritable path, etc.)
+        # is logged but never propagated: sync.json is a convenience
+        # artifact, and reverting a successful canonical save because
+        # we couldn't also update the sync cache would be worse than
+        # leaving a stale sync.json that gets rewritten on next save.
+        try:
+            sync.write_sync_bundle(self.doc, self.sc)
+        except OSError as e:
+            _logger.warning("sync.json write failed: %s", e)
         restart_fields = config.diff_restart_sensitive(baseline_doc, self.doc)
         if restart_fields:
             self.daemon_stale = True

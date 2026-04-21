@@ -135,12 +135,111 @@ conda activate voxtype-tui
 - **tomlkit** — TOML library that **preserves comments and formatting** on round-trip. Critical for `~/.config/voxtype/config.toml` since the default file has useful inline comments we shouldn't destroy. Do NOT use the stdlib `tomllib` (read-only) or `toml` (loses comments).
 - **stdlib**: `subprocess` for shelling out to `voxtype`, `json` for the sidecar, `pathlib` for paths.
 
+## v1.1: portable bundle / sync / export / import
+
+After v1 ships, the next feature is a Syncthing-friendly JSON bundle that
+also doubles as the manual export/import format and the Vexis migration
+path. One file, three uses: **auto-sync**, **manual backup**, **migrate
+to a new machine**. None of them required — a user who never touches
+Syncthing still gets a safe, hand-editable backup format for free.
+
+Module: `voxtype_tui/sync.py` (pure functions; no I/O at this layer).
+See the module docstring for the in-code contract; everything below is
+the *why*.
+
+### Principles
+
+- **Sync is optional.** The app must start and run identically whether
+  `~/.config/voxtype-tui/sync.json` exists or not. Reads from
+  `config.toml` + `metadata.json` remain the source of truth. The bundle
+  is a *derived artifact* plus an import channel — never load-bearing.
+  If the user deletes `sync.json`, it regenerates on next save. If it's
+  unwritable, we surface a banner and keep running.
+- **Content-hash staleness compare, not mtime.** `sync.json` carries a
+  `local_sync_hash` — the sha256 of the distilled `sync` block at the
+  moment we wrote the file. On startup the reader recomputes the hash
+  from live state and compares. Equal → local hasn't changed → apply the
+  synced bundle. Different → local drifted → rewrite sync.json. No clock
+  trust; survives `touch`, backups, editor mtime-preserving writes.
+- **Dangerous paths are explicit.** Any change to an API key or any
+  `*_command` shell string is treated as an explicit user decision on
+  import, never a silent apply. Preview modal shows the exact string
+  before the user confirms. See `sync.DANGEROUS_PATHS`.
+
+### Block layout
+
+Bundles are JSON with three distinct blocks. The presence or absence of
+each is the security signal:
+
+| Block | Auto-sync write | Manual export | Purpose |
+|---|---|---|---|
+| `sync` | ✅ always | ✅ always | Vocabulary, replacements, portable settings. Safe to sync / share. |
+| `local` | ✅ always | optional scope | Hotkey, audio, VAD — per-device. Never auto-applied on sync-import; only applied when the user explicitly imports "local settings too". |
+| `secrets` | ❌ **never** | only with **Include secrets** toggle (default OFF) | API keys and `*_command` shell strings. Absence = file is safe to hand around. |
+
+The `secrets` block is separate on purpose: a glance at the top-level
+keys tells you whether the file contains sensitive material. One opt-in
+per manual export; no other knob.
+
+### Field policy
+
+See `sync.SECRET_PATHS` and `sync.DANGEROUS_PATHS` for the authoritative
+list. At a glance:
+
+- **Stripped from sync, only in `secrets` with toggle**: `whisper.remote_api_key`, `output.post_process.command`, `output.pre_output_command`, `output.post_output_command`. Each is either a credential or an RCE surface.
+- **Always-sync, but flagged on import**: `whisper.remote_endpoint`. Not a credential, but a malicious change exfils audio to an attacker's server — so any *change* on import must be confirmed.
+- **Always-sync, no special handling**: everything else portable (engine, model, language, output mode, text toggles, per-engine model keys).
+- **Always local (never sync-applied)**: hotkey (keyboard-dependent), audio.device (hardware-dependent), audio.feedback, audio.sample_rate, audio.max_duration_secs, VAD, state_file. The bundle carries them for manual export-all; the sync reader ignores the `local` block.
+
+### Hard caps (protect the importer)
+
+- Bundle size: 1 MB (`MAX_BUNDLE_BYTES`)
+- Vocab: 500 entries, 200 chars per phrase
+- Replacements: 1000 entries, 500 chars per side
+- Any single string setting: 2048 chars
+- Device label: 128 chars
+- Whisper initial_prompt token estimate warned at 224 tokens (~4 chars/token heuristic; `estimate_initial_prompt_tokens`)
+
+Schema version: integer, currently 1. Reader refuses to parse a newer
+version — graceful banner rather than a partial apply.
+
+### Vexis import
+
+The adapter supports Vexis's two separate export files, detected by
+shape (`detect_format`):
+
+- `vexis-dictionary.json` → list of `{id, trigger, replacement, category}` with `category ∈ {replacement, command, capitalization}`. We map `trigger→from`, `replacement→to`, categorize case-sensitively (`replacement`/`command` → `Replacement`; `capitalization` → `Capitalization`). The `command` → `Replacement` migration matches Vexis's own storage migration (the `Command` variant is a legacy ghost; see `vexis/src-tauri/src/dictionary/mod.rs::EntryCategory::Command`).
+- `vexis-vocabulary.json` → either a plain string list or a list of `{id, word}`. We dedupe case-insensitively to match Vexis's `UNIQUE COLLATE NOCASE` constraint.
+
+Our own format is detected via the `format: "voxtype-tui-bundle"` tag.
+
+### File location
+
+- `~/.config/voxtype-tui/sync.json` — the sync file. Atomic-rename writes, idempotent: identical sync-block hash → skip the rename (avoids Syncthing thrash on unrelated local edits).
+- Manual exports default to `~/Downloads/voxtype-tui-export-YYYY-MM-DD.json` (editable path in the export dialog).
+
+### Shipping order (after v1)
+
+1. **`sync.py` + tests** — schema, distill, hash, strip, adapters. Pure; no I/O. ✅ *done* (`voxtype_tui/sync.py`, `tests/test_sync.py`).
+2. **Writer on save** — atomic tempfile + rename, idempotent via hash, wired into `AppState.save`.
+3. **Manual export screen** — Ctrl+E. Options: scope (Sync only / Sync + Local), Include-secrets toggle (default OFF), target path.
+4. **Manual import + Vexis adapter** — Ctrl+I. File picker → `detect_format` → preview modal showing diff, including the full text of any dangerous-field changes → confirm.
+5. **Startup reader** — content-hash compare, apply sync if local unchanged, banner "Synced from {device}".
+6. **Conflict detection** — scan `sync.sync-conflict-*.json`, banner, manual-resolve screen.
+7. **Model-missing banner** — wire to the existing Models-tab download pipeline when a synced `whisper.model` / `parakeet.model_type` / etc. isn't on disk.
+
+Commit between each step. No step touches the daemon without explicit
+user action.
+
 ## Non-goals
 
 - **Do not fork Voxtype.** Use it as-is.
 - **Do not reimplement Whisper / STT.** That's Voxtype's job.
 - **Do not auto-restart the Voxtype daemon** on every tiny config change — batch changes and only restart when a field that requires it is touched (hotkey, engine, model).
 - **Do not write to `~/.config/voxtype/config.toml` destructively.** Always read → merge → write. Preserve user comments if possible (use a comment-preserving TOML library).
+- **Do not auto-sync secrets.** `whisper.remote_api_key` and all `*_command` fields are stripped from every auto-sync write and only appear in manually-exported bundles when the user explicitly toggles Include-secrets.
+- **Do not trust wall-clock timestamps** for staleness compares. `local_sync_hash` is authoritative; `generated_at` is display-only.
+- **Do not auto-download missing models on sync-import.** Surface the missing model via banner with an explicit download button.
 
 ## Useful commands & file locations
 
@@ -158,6 +257,8 @@ systemctl --user restart voxtype      # reload config
 
 # Files
 ~/.config/voxtype/config.toml                           # main config
+~/.config/voxtype-tui/metadata.json                     # sidecar (UI-only metadata)
+~/.config/voxtype-tui/sync.json                         # v1.1 portable bundle (optional, auto-generated)
 ~/.local/share/voxtype/models/                          # downloaded models
 /run/user/1000/voxtype/state                            # state file (JSON)
 /home/zeus/.local/share/omarchy/default/voxtype/        # Omarchy's default template

@@ -1,0 +1,32 @@
+[
+  {
+    "id": 1,
+    "trigger": "cloud code",
+    "replacement": "Claude Code",
+    "category": "replacement"
+  },
+  {
+    "id": 2,
+    "trigger": "vox type",
+    "replacement": "voxtype",
+    "category": "replacement"
+  },
+  {
+    "id": 3,
+    "trigger": "type script",
+    "replacement": "TypeScript",
+    "category": "capitalization"
+  },
+  {
+    "id": 4,
+    "trigger": "slash codemux release",
+    "replacement": "/codemux-release",
+    "category": "command"
+  },
+  {
+    "id": 5,
+    "trigger": "CLOUD CODE",
+    "replacement": "Claude Code (duplicate, last should win)",
+    "category": "replacement"
+  }
+]
