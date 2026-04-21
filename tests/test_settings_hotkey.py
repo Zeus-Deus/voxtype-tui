@@ -152,6 +152,31 @@ async def test_mode_change(tmp_env):
         assert app.state.dirty is True
 
 
+async def test_modifier_checkboxes_render_with_visible_labels(tmp_env):
+    """Guards against a regression where CSS forced Checkbox height to 1,
+    which cropped Textual's `border: tall` and hid both the toggle glyph
+    and the label — users saw four empty rectangles instead of labeled
+    checkboxes. A Checkbox with the default 'tall' border renders at
+    height 3; anything less means the content is being clipped."""
+    cfg, side = tmp_env
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        await _goto_settings(pilot, app)
+        await pilot.pause()
+        pane = app.query_one(SettingsPane)
+
+        for mod in HOTKEY_MODIFIERS:
+            cb = pane.query_one(f"#settings-mod-{mod.lower()}", Checkbox)
+            assert cb.region.height >= 3, (
+                f"Modifier checkbox for {mod} rendered at height "
+                f"{cb.region.height}; need >= 3 for border + content"
+            )
+            assert cb.region.width > 0, (
+                f"Modifier checkbox for {mod} has zero width"
+            )
+
+
 async def test_enabled_switch_persists_explicit_bool(tmp_env):
     """Our policy: writes explicit true/false, never 'commented-out = default'."""
     cfg, side = tmp_env

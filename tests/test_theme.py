@@ -199,3 +199,85 @@ def test_ensure_user_theme_template_creates_once(tmp_path: Path) -> None:
     original = p.read_text()
     assert theme_mod.ensure_user_theme_template(p) is False
     assert p.read_text() == original
+
+
+# ---- load_omarchy_border_style ----
+
+
+def _write_looknfeel(path: Path, *, border_size: int | None = None, rounding: int | None = None) -> None:
+    """Write a minimal Hyprland looknfeel block with only the keys we care
+    about. Hyprland accepts keys outside any `<section> { ... }` block, so
+    this works without having to simulate the full nested syntax."""
+    lines = [
+        "# test fixture",
+    ]
+    if border_size is not None:
+        lines.append(f"    border_size = {border_size}")
+    if rounding is not None:
+        lines.append(f"    rounding = {rounding}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_border_style_returns_none_when_no_cascade(tmp_path: Path) -> None:
+    """A non-Omarchy system (no looknfeel files anywhere in the cascade)
+    should return None so the caller can fall back."""
+    missing = tmp_path / "nowhere.conf"
+    assert theme_mod.load_omarchy_border_style([missing]) is None
+
+
+def test_border_style_default_solid(tmp_path: Path) -> None:
+    """Omarchy's stock config has border_size=2 and rounding=0 — that maps
+    to a solid 1-cell Textual border."""
+    conf = tmp_path / "looknfeel.conf"
+    _write_looknfeel(conf, border_size=2, rounding=0)
+    assert theme_mod.load_omarchy_border_style([conf]) == "solid"
+
+
+def test_border_style_heavy_for_big_borders(tmp_path: Path) -> None:
+    conf = tmp_path / "looknfeel.conf"
+    _write_looknfeel(conf, border_size=4, rounding=0)
+    assert theme_mod.load_omarchy_border_style([conf]) == "heavy"
+
+
+def test_border_style_blank_for_zero(tmp_path: Path) -> None:
+    conf = tmp_path / "looknfeel.conf"
+    _write_looknfeel(conf, border_size=0, rounding=0)
+    assert theme_mod.load_omarchy_border_style([conf]) == "blank"
+
+
+def test_border_style_round_wins_over_size(tmp_path: Path) -> None:
+    """If the user asked for rounded corners we honor that even when the
+    raw thickness would otherwise map to heavy."""
+    conf = tmp_path / "looknfeel.conf"
+    _write_looknfeel(conf, border_size=4, rounding=8)
+    assert theme_mod.load_omarchy_border_style([conf]) == "round"
+
+
+def test_border_style_cascade_last_wins(tmp_path: Path) -> None:
+    """Later files in the cascade override earlier ones — user override
+    should beat Omarchy's default, same as Hyprland's own resolution."""
+    base = tmp_path / "base.conf"
+    override = tmp_path / "override.conf"
+    _write_looknfeel(base, border_size=4, rounding=0)         # -> heavy
+    _write_looknfeel(override, border_size=2, rounding=0)     # -> solid
+    assert theme_mod.load_omarchy_border_style([base, override]) == "solid"
+
+
+def test_border_style_ignores_commented_lines(tmp_path: Path) -> None:
+    """Commented-out overrides must NOT win. In the user's actual looknfeel
+    cascade, `# border_size = 0` is a hint, not an active setting — it
+    should be ignored entirely so the earlier default survives."""
+    base = tmp_path / "base.conf"
+    override = tmp_path / "override.conf"
+    _write_looknfeel(base, border_size=2, rounding=0)
+    override.parent.mkdir(parents=True, exist_ok=True)
+    override.write_text("# border_size = 8\n# rounding = 12\n")
+    assert theme_mod.load_omarchy_border_style([base, override]) == "solid"
+
+
+def test_resolve_modal_border_always_returns_string(tmp_path: Path) -> None:
+    """The public entry point never returns None — it falls back to the
+    documented default when detection fails."""
+    missing = tmp_path / "absent.conf"
+    assert theme_mod.resolve_modal_border_style([missing]) == theme_mod.DEFAULT_MODAL_BORDER

@@ -18,6 +18,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Input, Label, Static, TabbedContent, TabPane
 
 from . import config, sidecar, theme as theme_mod, voxtype_cli
+from .theme import MODAL_BORDER_STYLE
 from .dictionary import DictionaryPane
 from .models import ModelsPane
 from .settings import SettingsPane
@@ -129,19 +130,19 @@ class ReconcileBanner(Horizontal):
 class RestartModal(ModalScreen[bool]):
     """Post-save prompt when restart-sensitive fields changed."""
 
-    DEFAULT_CSS = """
-    RestartModal { align: center middle; }
-    RestartModal > Vertical {
+    DEFAULT_CSS = f"""
+    RestartModal {{ align: center middle; }}
+    RestartModal > Vertical {{
         background: $panel;
-        border: thick $accent;
+        border: {MODAL_BORDER_STYLE} $accent;
         padding: 1 2;
         width: 60;
         height: auto;
-    }
-    RestartModal #title { text-style: bold; margin-bottom: 1; }
-    RestartModal #fields { color: $text-muted; margin-bottom: 1; }
-    RestartModal Horizontal { height: auto; align: center middle; }
-    RestartModal Button { margin: 0 1; }
+    }}
+    RestartModal #title {{ text-style: bold; margin-bottom: 1; }}
+    RestartModal #fields {{ color: $text-muted; margin-bottom: 1; }}
+    RestartModal Horizontal {{ height: auto; align: center middle; }}
+    RestartModal Button {{ margin: 0 1; }}
     """
 
     def __init__(self, changed_fields: list[str]) -> None:
@@ -167,18 +168,18 @@ class RestartModal(ModalScreen[bool]):
 class ConfirmQuitModal(ModalScreen[bool]):
     """Shown when the user tries to quit with unsaved changes."""
 
-    DEFAULT_CSS = """
-    ConfirmQuitModal { align: center middle; }
-    ConfirmQuitModal > Vertical {
+    DEFAULT_CSS = f"""
+    ConfirmQuitModal {{ align: center middle; }}
+    ConfirmQuitModal > Vertical {{
         background: $panel;
-        border: thick $warning;
+        border: {MODAL_BORDER_STYLE} $warning;
         padding: 1 2;
         width: 50;
         height: auto;
-    }
-    ConfirmQuitModal #title { text-style: bold; margin-bottom: 1; }
-    ConfirmQuitModal Horizontal { height: auto; align: center middle; }
-    ConfirmQuitModal Button { margin: 0 1; }
+    }}
+    ConfirmQuitModal #title {{ text-style: bold; margin-bottom: 1; }}
+    ConfirmQuitModal Horizontal {{ height: auto; align: center middle; }}
+    ConfirmQuitModal Button {{ margin: 0 1; }}
     """
 
     BINDINGS = [

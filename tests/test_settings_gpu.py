@@ -13,9 +13,7 @@ from voxtype_tui import voxtype_cli
 from voxtype_tui.app import VoxtypeTUI
 from voxtype_tui.settings import (
     SettingsPane,
-    TERMINAL_LAUNCHER,
     gpu_status_sync,
-    launch_gpu_command_in_terminal,
 )
 from .conftest import FIXTURES
 
@@ -64,42 +62,6 @@ def test_gpu_status_happy_path(monkeypatch) -> None:
     assert "RTX 3090" in text
 
 
-def test_launch_gpu_without_helper_returns_instructions(monkeypatch) -> None:
-    """When the omarchy helper isn't available, we don't crash — we return a
-    message the user can copy-paste into a terminal."""
-    monkeypatch.setattr(shutil, "which", lambda n: None if n == TERMINAL_LAUNCHER else "/usr/bin/" + n)
-    ok, msg = launch_gpu_command_in_terminal("enable")
-    assert not ok
-    assert "sudo voxtype setup gpu --enable" in msg
-
-
-def test_launch_gpu_invalid_action() -> None:
-    ok, msg = launch_gpu_command_in_terminal("delete")  # type: ignore[arg-type]
-    assert not ok
-    assert "invalid action" in msg
-
-
-def test_launch_gpu_spawns_terminal(monkeypatch) -> None:
-    """When the helper is available, we call it with the correct command."""
-    calls: list[list[str]] = []
-
-    class FakeProc:
-        def __init__(self, cmd, **kw):
-            calls.append(cmd)
-
-    monkeypatch.setattr(shutil, "which", lambda n: "/bin/" + n)  # everything present
-    monkeypatch.setattr(subprocess, "Popen", FakeProc)
-
-    ok, msg = launch_gpu_command_in_terminal("enable")
-    assert ok
-    assert calls == [[TERMINAL_LAUNCHER, "sudo voxtype setup gpu --enable"]]
-
-    calls.clear()
-    ok, msg = launch_gpu_command_in_terminal("disable")
-    assert ok
-    assert calls == [[TERMINAL_LAUNCHER, "sudo voxtype setup gpu --disable"]]
-
-
 # ---- UI tests ----
 
 async def test_gpu_section_renders(tmp_env):
@@ -125,31 +87,48 @@ class _FakeRun:
     stderr = ""
 
 
-async def test_enable_button_pops_terminal(tmp_env, monkeypatch):
-    """Clicking Enable calls the terminal launcher — not the actual sudo
-    command — and the TUI does not block."""
+async def test_enable_button_pushes_password_modal(tmp_env, monkeypatch):
+    """Clicking Enable now pushes an in-app SudoPasswordModal instead of
+    shelling out to a terminal. No subprocess runs until the user submits
+    the password."""
+    from voxtype_tui.sudo import SudoPasswordModal
+
     cfg, side = tmp_env
-    calls: list[list[str]] = []
+    popen_calls: list[list[str]] = []
+    run_calls: list[list[str]] = []
 
     class FakeProc:
         def __init__(self, cmd, **kw):
-            calls.append(cmd)
+            popen_calls.append(cmd)
+
+    def _fake_run(cmd, *a, **kw):
+        # Anything the GPU button triggers that ends up here is a bug — the
+        # only subprocess.run call should be the initial gpu --status on
+        # mount. We tag that by returning _FakeRun(); anything else gets
+        # recorded so the assertion below can flag it.
+        if cmd and isinstance(cmd, list) and "sudo" in cmd:
+            run_calls.append(cmd)
+        return _FakeRun()
 
     monkeypatch.setattr(shutil, "which", lambda n: "/bin/" + n)
     monkeypatch.setattr(subprocess, "Popen", FakeProc)
-    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _FakeRun())
+    monkeypatch.setattr(subprocess, "run", _fake_run)
 
     app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
     async with app.run_test() as pilot:
         await pilot.pause()
         await _goto_settings(pilot, app)
-        # The GPU section is below the scroll fold; post the Pressed event
-        # directly rather than trying to click an offscreen widget.
         btn = app.query_one("#settings-gpu-enable", Button)
         btn.post_message(Button.Pressed(btn))
         await pilot.pause()
 
-    assert any("--enable" in c[-1] for c in calls)
+        # A SudoPasswordModal should now be on the screen stack.
+        assert isinstance(app.screen, SudoPasswordModal), (
+            f"expected SudoPasswordModal on top of stack, got {type(app.screen).__name__}"
+        )
+        # And we did NOT pop a terminal or invoke sudo yet.
+        assert popen_calls == []
+        assert run_calls == []
 
 
 async def test_gpu_enable_does_not_dirty_state(tmp_env, monkeypatch):
@@ -169,3 +148,113 @@ async def test_gpu_enable_does_not_dirty_state(tmp_env, monkeypatch):
         btn.post_message(Button.Pressed(btn))
         await pilot.pause()
         assert app.state.config_dirty is False
+
+
+async def test_password_submit_runs_sudo_with_stdin(tmp_env, monkeypatch):
+    """Submitting a password in the modal invokes sudo -S with the password
+    on stdin — NEVER in argv — and passes the expected gpu command."""
+    from voxtype_tui import sudo as sudo_mod
+    from voxtype_tui.sudo import SudoPasswordModal, SudoResult
+
+    cfg, side = tmp_env
+    captured: dict[str, object] = {}
+
+    def _fake_run_sudo(argv, password, timeout=30.0):
+        captured["argv"] = list(argv)
+        captured["password"] = password
+        return SudoResult(ok=True, returncode=0, output="GPU enabled.", incorrect_password=False)
+
+    monkeypatch.setattr(shutil, "which", lambda n: "/bin/" + n)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _FakeRun())
+    # Patch the reference used by settings.py, not the module-level one —
+    # `from .sudo import run_sudo_command` binds a name at import time.
+    from voxtype_tui import settings as settings_mod
+    monkeypatch.setattr(settings_mod, "run_sudo_command", _fake_run_sudo)
+
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _goto_settings(pilot, app)
+        btn = app.query_one("#settings-gpu-enable", Button)
+        btn.post_message(Button.Pressed(btn))
+        await pilot.pause()
+
+        assert isinstance(app.screen, SudoPasswordModal)
+        pwd_input = app.screen.query_one("#sudo-password")
+        pwd_input.value = "hunter2"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()  # let the async sudo task run
+
+    assert captured["argv"] == ["voxtype", "setup", "gpu", "--enable"]
+    assert captured["password"] == "hunter2"
+
+
+async def test_password_cancel_does_not_run_sudo(tmp_env, monkeypatch):
+    """Escaping out of the modal dismisses it with None — no sudo invocation."""
+    from voxtype_tui.sudo import SudoPasswordModal
+
+    cfg, side = tmp_env
+    captured: dict[str, object] = {"called": False}
+
+    def _fake_run_sudo(*a, **kw):
+        captured["called"] = True
+        raise AssertionError("run_sudo_command should NOT be called on cancel")
+
+    monkeypatch.setattr(shutil, "which", lambda n: "/bin/" + n)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _FakeRun())
+    from voxtype_tui import settings as settings_mod
+    monkeypatch.setattr(settings_mod, "run_sudo_command", _fake_run_sudo)
+
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _goto_settings(pilot, app)
+        btn = app.query_one("#settings-gpu-enable", Button)
+        btn.post_message(Button.Pressed(btn))
+        await pilot.pause()
+        assert isinstance(app.screen, SudoPasswordModal)
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+    assert captured["called"] is False
+
+
+async def test_wrong_password_reprompts(tmp_env, monkeypatch):
+    """A SudoResult with incorrect_password=True should push a fresh
+    SudoPasswordModal so the user can retry without re-clicking Enable."""
+    from voxtype_tui.sudo import SudoPasswordModal, SudoResult
+
+    cfg, side = tmp_env
+    call_count = {"n": 0}
+
+    def _fake_run_sudo(argv, password, timeout=30.0):
+        call_count["n"] += 1
+        return SudoResult(
+            ok=False, returncode=1,
+            output="", incorrect_password=True,
+        )
+
+    monkeypatch.setattr(shutil, "which", lambda n: "/bin/" + n)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _FakeRun())
+    from voxtype_tui import settings as settings_mod
+    monkeypatch.setattr(settings_mod, "run_sudo_command", _fake_run_sudo)
+
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _goto_settings(pilot, app)
+        btn = app.query_one("#settings-gpu-enable", Button)
+        btn.post_message(Button.Pressed(btn))
+        await pilot.pause()
+
+        assert isinstance(app.screen, SudoPasswordModal)
+        app.screen.query_one("#sudo-password").value = "wrong"
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.pause()
+
+        # After the bad sudo run, a fresh modal should be on top for the retry.
+        assert isinstance(app.screen, SudoPasswordModal)
+        assert call_count["n"] == 1

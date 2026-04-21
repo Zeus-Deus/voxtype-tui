@@ -33,6 +33,19 @@ CONFIG_DIR = Path.home() / ".config" / "voxtype-tui"
 UI_JSON = CONFIG_DIR / "ui.json"
 USER_THEME_TOML = CONFIG_DIR / "theme.toml"
 
+# Hyprland's looknfeel cascade — later files override earlier ones. Mirrors
+# the order Hyprland itself applies sources, so the "last uncommented wins"
+# rule gives us the same value Hyprland ends up using for window borders.
+HYPRLAND_LOOKNFEEL_CASCADE: tuple[Path, ...] = (
+    Path.home() / ".local" / "share" / "omarchy" / "default" / "hypr" / "looknfeel.conf",
+    Path.home() / ".config" / "omarchy" / "current" / "theme" / "hyprland.conf",
+    Path.home() / ".config" / "hypr" / "looknfeel.conf",
+)
+
+# Fallback when the cascade doesn't exist or parsing fails — matches
+# Textual's normal non-modal look.
+DEFAULT_MODAL_BORDER: str = "solid"
+
 # Nord-flavored defaults, used when a color is missing from the source TOML.
 DEFAULT_COLORS: dict[str, str] = {
     "primary": "#BF616A",
@@ -155,6 +168,82 @@ def load_ui_prefs(path: Path = UI_JSON) -> dict:
 def save_ui_prefs(prefs: dict, path: Path = UI_JSON) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(prefs, indent=2) + "\n")
+
+
+def load_omarchy_border_style(
+    cascade: Iterable[Path] = HYPRLAND_LOOKNFEEL_CASCADE,
+) -> str | None:
+    """Read Hyprland's border_size / rounding from the looknfeel cascade and
+    map it to a Textual border style. Returns None when the user isn't on
+    Omarchy (the cascade's root file is part of the Omarchy default layout,
+    so absence of *all* files signals a non-Omarchy environment).
+
+    Mapping:
+      rounding > 0           -> "round"
+      border_size == 0       -> "blank"
+      border_size >= 3       -> "heavy"
+      otherwise (1 or 2)     -> "solid"
+
+    `rounding` wins over `border_size` — if the user asked for rounded
+    window corners in Hyprland, we prefer a rounded modal border even if
+    the underlying thickness would otherwise map to heavy/solid. This
+    matches Gazelle's behavior."""
+    rounding: int = 0
+    border_size: int = 2  # Omarchy's stock value
+    saw_any_file = False
+
+    for conf in cascade:
+        if not conf.exists():
+            continue
+        saw_any_file = True
+        try:
+            for raw in conf.read_text().splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().split("#", 1)[0].strip()  # strip trailing comments
+                if key == "rounding":
+                    try:
+                        rounding = int(val)
+                    except ValueError:
+                        pass
+                elif key == "border_size":
+                    try:
+                        border_size = int(val)
+                    except ValueError:
+                        pass
+        except OSError:
+            continue
+
+    if not saw_any_file:
+        return None
+
+    if rounding > 0:
+        return "round"
+    if border_size == 0:
+        return "blank"
+    if border_size >= 3:
+        return "heavy"
+    return "solid"
+
+
+def resolve_modal_border_style(
+    cascade: Iterable[Path] = HYPRLAND_LOOKNFEEL_CASCADE,
+) -> str:
+    """Public entry point used by modal CSS — always returns a valid Textual
+    border style. Falls back to DEFAULT_MODAL_BORDER when detection yields
+    None (e.g., non-Omarchy system or unreadable cascade)."""
+    detected = load_omarchy_border_style(cascade)
+    return detected or DEFAULT_MODAL_BORDER
+
+
+# Computed once at import time. CSS doesn't hot-reload, so the user restarts
+# voxtype-tui to pick up Hyprland changes — same tradeoff Gazelle makes.
+MODAL_BORDER_STYLE: str = resolve_modal_border_style()
 
 
 def ensure_user_theme_template(path: Path = USER_THEME_TOML) -> bool:

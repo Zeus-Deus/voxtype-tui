@@ -23,6 +23,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Checkbox, Collapsible, Input, Label, RichLog, Select, Switch
 
 from . import config
+from .sudo import SudoPasswordModal, SudoResult, run_sudo_command
 
 if TYPE_CHECKING:
     from .app import VoxtypeTUI
@@ -73,9 +74,6 @@ HOTKEY_MODES: list[str] = ["push_to_talk", "toggle"]
 
 OUTPUT_MODES: list[str] = ["type", "clipboard", "paste"]
 
-TERMINAL_LAUNCHER = "omarchy-launch-floating-terminal-with-presentation"
-
-
 def gpu_status_sync(timeout: float = 5.0) -> tuple[bool, str]:
     """Returns (ok, text). `text` is the raw output of
     `voxtype setup gpu --status` — no parsing, we just dump it into the
@@ -96,28 +94,6 @@ def gpu_status_sync(timeout: float = 5.0) -> tuple[bool, str]:
         return True, result.stdout
     return False, (result.stderr or result.stdout).strip() or "status failed"
 
-
-def launch_gpu_command_in_terminal(action: str) -> tuple[bool, str]:
-    """Pop a floating terminal that runs `sudo voxtype setup gpu --<action>`.
-    Returns (ok, message). The user sees the sudo prompt in the new TTY; the
-    TUI stays responsive and the user hits Refresh afterward to pick up the
-    new status."""
-    if action not in ("enable", "disable"):
-        return False, f"invalid action {action!r}"
-    cmd_string = f"sudo voxtype setup gpu --{action}"
-    if shutil.which(TERMINAL_LAUNCHER):
-        try:
-            subprocess.Popen(
-                [TERMINAL_LAUNCHER, cmd_string],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        except OSError as e:
-            return False, f"could not launch terminal: {e}"
-        return True, f"Launched terminal: {cmd_string}"
-    return False, (
-        f"{TERMINAL_LAUNCHER} not installed — run `{cmd_string}` in a "
-        "terminal, then hit Refresh here."
-    )
 
 CUSTOM_AUDIO_DEVICE = "__custom_audio__"
 AUDIO_FEEDBACK_THEMES: list[str] = ["default", "subtle", "mechanical"]
@@ -189,8 +165,8 @@ class SettingsPane(VerticalScroll):
     SettingsPane Input { width: 1fr; }
     SettingsPane Select { width: 1fr; }
     SettingsPane Switch { width: auto; }
-    SettingsPane .modifier-row { height: 3; padding: 0 0 0 18; }
-    SettingsPane .modifier-row Checkbox { margin-right: 2; height: 1; }
+    SettingsPane .modifier-row { height: 3; padding: 0 0 0 18; margin-bottom: 1; }
+    SettingsPane .modifier-row Checkbox { margin-right: 2; }
     SettingsPane .hidden { display: none; }
     SettingsPane #settings-gpu-actions { height: 3; padding: 0 0 0 18; }
     SettingsPane #settings-gpu-actions Button { margin-right: 1; height: 3; }
@@ -866,12 +842,78 @@ class SettingsPane(VerticalScroll):
             asyncio.create_task(self._refresh_gpu_status_async())
         elif event.button.id == "settings-gpu-enable":
             event.stop()
-            ok, msg = launch_gpu_command_in_terminal("enable")
-            self._log_action_result(ok, msg)
+            self._begin_gpu_sudo("enable")
         elif event.button.id == "settings-gpu-disable":
             event.stop()
-            ok, msg = launch_gpu_command_in_terminal("disable")
-            self._log_action_result(ok, msg)
+            self._begin_gpu_sudo("disable")
+
+    def _begin_gpu_sudo(
+        self,
+        action: str,
+        initial_error: str | None = None,
+    ) -> None:
+        """Push the password modal. On dismiss we either run sudo (got a
+        password) or bail (user cancelled)."""
+        if action not in ("enable", "disable"):
+            self._log_action_result(False, f"invalid action {action!r}")
+            return
+
+        modal = SudoPasswordModal(
+            action_label=f"Run: sudo voxtype setup gpu --{action}",
+            title=("Enable GPU acceleration" if action == "enable" else "Disable GPU acceleration"),
+            initial_error=initial_error,
+        )
+
+        def _after(pw: str | None) -> None:
+            if pw is None:
+                return  # user cancelled, silently drop
+            asyncio.create_task(self._run_gpu_sudo_async(action, pw))
+
+        self.app.push_screen(modal, _after)
+
+    async def _run_gpu_sudo_async(self, action: str, password: str) -> None:
+        log = self.query_one("#settings-gpu-log", RichLog)
+        log.write(f"$ sudo voxtype setup gpu --{action}")
+        result = await asyncio.to_thread(
+            run_sudo_command,
+            ["voxtype", "setup", "gpu", f"--{action}"],
+            password,
+        )
+        # Discard the local reference — Python can GC the string on its
+        # next pass. We never log it or pass it further.
+        del password
+
+        self._render_sudo_result(result)
+
+        if result.incorrect_password:
+            # Re-prompt so the user can retry without clicking again.
+            self._begin_gpu_sudo(action, initial_error="Incorrect password.")
+            return
+
+        if result.ok:
+            # Status may have changed — refresh the section.
+            await self._refresh_gpu_status_async()
+
+    def _render_sudo_result(self, result: SudoResult) -> None:
+        log = self.query_one("#settings-gpu-log", RichLog)
+        if result.output:
+            for line in result.output.splitlines():
+                log.write(_strip_ansi(line))
+        if result.ok:
+            self.app.notify(
+                "GPU command completed.",
+                severity="information",
+                timeout=5,
+            )
+        elif result.incorrect_password:
+            log.write("[auth failed — re-enter password]")
+        else:
+            log.write(f"[exit {result.returncode}]")
+            self.app.notify(
+                f"GPU command failed (exit {result.returncode}). See log.",
+                severity="warning",
+                timeout=8,
+            )
 
     def _log_action_result(self, ok: bool, msg: str) -> None:
         log = self.query_one("#settings-gpu-log", RichLog)

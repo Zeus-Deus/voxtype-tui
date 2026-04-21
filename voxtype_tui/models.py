@@ -37,6 +37,7 @@ from textual.widgets import (
 
 from . import config
 from .settings import MODEL_PATH_PER_ENGINE
+from .theme import MODAL_BORDER_STYLE
 from .vim_nav import VIM_NAV_ACTIONS, VIM_NAV_BINDINGS, VimTableNav
 
 if TYPE_CHECKING:
@@ -192,19 +193,19 @@ def humanize_bytes(n: int) -> str:
 
 
 class ConfirmDeleteModal(ModalScreen[bool]):
-    DEFAULT_CSS = """
-    ConfirmDeleteModal { align: center middle; }
-    ConfirmDeleteModal > Vertical {
+    DEFAULT_CSS = f"""
+    ConfirmDeleteModal {{ align: center middle; }}
+    ConfirmDeleteModal > Vertical {{
         background: $panel;
-        border: thick $error;
+        border: {MODAL_BORDER_STYLE} $error;
         padding: 1 2;
         width: 60;
         height: auto;
-    }
-    ConfirmDeleteModal #title { text-style: bold; margin-bottom: 1; }
-    ConfirmDeleteModal #body { color: $text-muted; margin-bottom: 1; }
-    ConfirmDeleteModal Horizontal { height: auto; align: center middle; }
-    ConfirmDeleteModal Button { margin: 0 1; }
+    }}
+    ConfirmDeleteModal #title {{ text-style: bold; margin-bottom: 1; }}
+    ConfirmDeleteModal #body {{ color: $text-muted; margin-bottom: 1; }}
+    ConfirmDeleteModal Horizontal {{ height: auto; align: center middle; }}
+    ConfirmDeleteModal Button {{ margin: 0 1; }}
     """
 
     BINDINGS = [
