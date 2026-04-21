@@ -17,7 +17,9 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Input, Label, Static, TabbedContent, TabPane
 
-from . import config, sidecar, theme as theme_mod, voxtype_cli
+import asyncio as _asyncio
+
+from . import config, sidecar, sync as sync_mod, theme as theme_mod, voxtype_cli
 from .theme import MODAL_BORDER_STYLE
 from .dictionary import DictionaryPane
 from .models import ModelsPane
@@ -177,9 +179,17 @@ class AppliedSyncBanner(Horizontal):
 
 
 class MissingModelBanner(Horizontal):
-    """Shown when a sync-apply references a model not present in
-    `~/.local/share/voxtype/models/`. Has a Download button wired in
-    Step 6; Dismiss hides it until next startup."""
+    """Three-stage banner for a sync-applied model that isn't on disk:
+
+      1. **missing**     — initial. "Model X not downloaded" + Download/Dismiss.
+      2. **downloading** — Download button disabled, label swapped for
+                           "Downloading…". Progress lives in the Models tab.
+      3. **downloaded**  — "✓ Downloaded X" + Set active / Dismiss.
+
+    [Set active] flips `whisper.model` in the shadow state and dirty's
+    the config. User's subsequent Ctrl+S saves + the existing
+    RestartModal fires (whisper.model ∈ RESTART_SENSITIVE_PATHS).
+    """
 
     DEFAULT_CSS = """
     MissingModelBanner {
@@ -191,16 +201,19 @@ class MissingModelBanner(Horizontal):
     }
     MissingModelBanner > #msg { width: 1fr; padding: 0 1; }
     MissingModelBanner > Button { height: 1; min-width: 10; margin-left: 1; }
+    MissingModelBanner Button.hidden { display: none; }
     """
 
     def compose(self) -> ComposeResult:
         yield Static("", id="msg")
         yield Button("Download", variant="primary", id="missing-download")
+        yield Button("Set active", variant="primary", id="missing-set-active")
         yield Button("Dismiss", id="missing-dismiss", variant="default")
 
     def on_mount(self) -> None:
         self.display = False
         self.model_name: str | None = None
+        self.query_one("#missing-set-active", Button).add_class("hidden")
 
     def set_missing(self, model_name: str) -> None:
         self.model_name = model_name
@@ -208,6 +221,34 @@ class MissingModelBanner(Horizontal):
             f"Model '{model_name}' is not downloaded locally. "
             "Transcription will fail until it's fetched."
         )
+        dl = self.query_one("#missing-download", Button)
+        dl.label = "Download"
+        dl.disabled = False
+        dl.remove_class("hidden")
+        self.query_one("#missing-set-active", Button).add_class("hidden")
+        self.display = True
+
+    def set_downloading(self, model_name: str) -> None:
+        self.model_name = model_name
+        self.query_one("#msg", Static).update(
+            f"Downloading {model_name}… watch the Models tab for progress."
+        )
+        dl = self.query_one("#missing-download", Button)
+        dl.label = "Downloading…"
+        dl.disabled = True
+        dl.remove_class("hidden")
+        self.query_one("#missing-set-active", Button).add_class("hidden")
+        self.display = True
+
+    def set_downloaded(self, model_name: str) -> None:
+        self.model_name = model_name
+        self.query_one("#msg", Static).update(
+            f"✓ Downloaded {model_name}. Click Set active to use it."
+        )
+        self.query_one("#missing-download", Button).add_class("hidden")
+        sa = self.query_one("#missing-set-active", Button)
+        sa.disabled = False
+        sa.remove_class("hidden")
         self.display = True
 
     def hide_banner(self) -> None:
@@ -215,9 +256,10 @@ class MissingModelBanner(Horizontal):
         self.model_name = None
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        # Download action is wired in Step 6 on the app class. We only
-        # handle Dismiss here; the app delegates Download to the Models
-        # tab's existing pipeline.
+        # Dismiss is the only action that fully belongs to the banner.
+        # Download + Set active require app-level state (Models tab,
+        # AppState mutation) so we let those events bubble to the app
+        # and handle them there.
         if event.button.id == "missing-dismiss":
             self.hide_banner()
             event.stop()
@@ -718,6 +760,91 @@ class VoxtypeTUI(App[None]):
             )
 
         self.push_screen(ImportBundleModal(self.state), after)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """App-level button handling for the missing-model banner.
+        The banner itself only consumes Dismiss; Download + Set active
+        bubble here because they need app state (Models tab, AppState
+        mutation) the banner shouldn't reach into directly."""
+        bid = event.button.id
+        if bid == "missing-download":
+            event.stop()
+            banner = self.query_one(MissingModelBanner)
+            if banner.model_name:
+                _asyncio.create_task(
+                    self._begin_missing_model_download(banner.model_name)
+                )
+        elif bid == "missing-set-active":
+            event.stop()
+            banner = self.query_one(MissingModelBanner)
+            if banner.model_name:
+                self._apply_missing_model_set_active(banner.model_name)
+
+    async def _begin_missing_model_download(self, name: str) -> None:
+        """Hand off to the Models tab's existing download pipeline so
+        progress lives in one place. Flipping the engine Select ensures
+        the pipeline's `engine != "whisper"` guard passes — every
+        missing model reported by the sync reader is a whisper model
+        (the reader only checks `whisper.model`)."""
+        banner = self.query_one(MissingModelBanner)
+        banner.set_downloading(name)
+
+        # Switch to Models tab so the RichLog + ProgressBar are visible
+        # to the user during the download.
+        self.action_switch_tab("models")
+        # Let the tab-switch and repaint settle before we kick off the
+        # subprocess — otherwise the first progress frames land in a
+        # still-hidden pane and feel janky.
+        await _asyncio.sleep(0)
+
+        try:
+            pane = self.query_one(ModelsPane)
+        except Exception:
+            banner.set_missing(name)
+            return
+
+        from textual.widgets import Select
+        engine_select = pane.query_one("#models-engine", Select)
+        if engine_select.value != "whisper":
+            engine_select.value = "whisper"
+            pane.refresh_table()
+            await _asyncio.sleep(0)
+
+        try:
+            await pane._run_download(name)
+        except _asyncio.CancelledError:
+            banner.set_missing(name)
+            raise
+        except Exception as e:
+            banner.set_missing(name)
+            self.notify(f"Download failed: {e}", severity="error", timeout=10)
+            return
+
+        if sync_mod._model_file_present(name, sync_mod.DEFAULT_MODELS_DIR):
+            banner.set_downloaded(name)
+        else:
+            # Download subprocess exited without producing the file
+            # (exit code != 0, cancelled, etc.). _run_download already
+            # surfaced a toast; reset the banner so the user can retry.
+            banner.set_missing(name)
+
+    def _apply_missing_model_set_active(self, name: str | None) -> None:
+        """Promote the downloaded model to active in the shadow state.
+        The user still has to Ctrl+S to persist; RestartModal then
+        fires automatically because `whisper.model` is restart-sensitive."""
+        if self.state is None or not name:
+            return
+        self.state.set_setting("whisper.model", name)
+        self.refresh_dirty()
+        # Hide the banner — the workflow is now complete; the user's
+        # next step (Ctrl+S) is independent and signposted in the toast.
+        self.query_one(MissingModelBanner).hide_banner()
+        self.notify(
+            f"'{name}' is now the active whisper model. "
+            "Press Ctrl+S to save — the restart modal will follow.",
+            title="Set active",
+            timeout=8,
+        )
 
     def action_request_quit(self) -> None:
         if self.state is None or not self.state.dirty:
