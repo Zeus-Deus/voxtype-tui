@@ -23,7 +23,7 @@ optdepends=(
     'systemd: daemon restart prompts via systemctl --user'
 )
 source=("$pkgname-$pkgver.tar.gz::https://github.com/Zeus-Deus/voxtype-tui/archive/v$pkgver.tar.gz")
-sha256sums=('ff9fb642cb9113a0c1e0e7ff43fbb4844a0631ea29df2c3c85fbe30c6a9baf07')
+sha256sums=('1539bb5597ed1b24dcb6eb66c8d8ad4e7c555dee2292484ed6b8701a500dd3c2')
 
 build() {
     cd "$pkgname-$pkgver"
