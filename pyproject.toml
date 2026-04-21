@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voxtype-tui"
+version = "0.1.0"
+description = "Textual-based TUI for managing Voxtype (Linux voice-to-text daemon)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "textual>=8.0,<9",
+    "tomlkit>=0.13",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9", "pytest-asyncio>=1"]
+
+[project.scripts]
+voxtype-tui = "voxtype_tui.app:main"
+
+[tool.setuptools.packages.find]
+include = ["voxtype_tui*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
