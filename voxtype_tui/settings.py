@@ -71,6 +71,8 @@ CUSTOM_MODEL = "__custom__"
 HOTKEY_MODIFIERS: list[str] = ["LEFTCTRL", "LEFTALT", "LEFTSHIFT", "LEFTMETA"]
 HOTKEY_MODES: list[str] = ["push_to_talk", "toggle"]
 
+OUTPUT_MODES: list[str] = ["type", "clipboard", "paste"]
+
 CUSTOM_AUDIO_DEVICE = "__custom_audio__"
 AUDIO_FEEDBACK_THEMES: list[str] = ["default", "subtle", "mechanical"]
 
@@ -259,6 +261,38 @@ class SettingsPane(VerticalScroll):
                     id="settings-audio-feedback-volume",
                 )
 
+        with Collapsible(
+            title="Output",
+            collapsed=False,
+            id="settings-output-section",
+        ):
+            with Horizontal(classes="field-row"):
+                yield Label("Mode", classes="label")
+                yield Select(
+                    options=[(m, m) for m in OUTPUT_MODES],
+                    allow_blank=False,
+                    value=OUTPUT_MODES[0],
+                    id="settings-output-mode",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Fallback clipboard", classes="label")
+                yield Switch(value=True, id="settings-output-fallback")
+            with Horizontal(classes="field-row"):
+                yield Label("Auto-submit", classes="label")
+                yield Switch(value=False, id="settings-output-auto-submit")
+            with Horizontal(classes="field-row"):
+                yield Label("Smart auto-submit", classes="label")
+                yield Switch(value=False, id="settings-text-smart-auto-submit")
+            with Horizontal(classes="field-row"):
+                yield Label("Spoken punctuation", classes="label")
+                yield Switch(value=False, id="settings-text-spoken-punctuation")
+            with Horizontal(classes="field-row"):
+                yield Label("Type delay (ms)", classes="label")
+                yield Input(
+                    placeholder="0",
+                    id="settings-output-type-delay",
+                )
+
     # --- app/state access ---
 
     @property
@@ -372,6 +406,30 @@ class SettingsPane(VerticalScroll):
             self.query_one("#settings-audio-feedback-volume", Input).value = (
                 str(vol) if vol != "" else ""
             )
+
+            output = doc.get("output") or {}
+            mode = str(output.get("mode", OUTPUT_MODES[0]))
+            if mode not in OUTPUT_MODES:
+                mode = OUTPUT_MODES[0]
+            self.query_one("#settings-output-mode", Select).value = mode
+            self.query_one("#settings-output-fallback", Switch).value = bool(
+                output.get("fallback_to_clipboard", True)
+            )
+            self.query_one("#settings-output-auto-submit", Switch).value = bool(
+                output.get("auto_submit", False)
+            )
+            delay = output.get("type_delay_ms", "")
+            self.query_one("#settings-output-type-delay", Input).value = (
+                str(delay) if delay != "" else ""
+            )
+
+            text = doc.get("text") or {}
+            self.query_one(
+                "#settings-text-smart-auto-submit", Switch
+            ).value = bool(text.get("smart_auto_submit", False))
+            self.query_one(
+                "#settings-text-spoken-punctuation", Switch
+            ).value = bool(text.get("spoken_punctuation", False))
         finally:
             self._suppress_events = False
 
@@ -479,6 +537,11 @@ class SettingsPane(VerticalScroll):
                 "audio.feedback.theme", str(event.value)
             )
             self.tui.refresh_dirty()
+        elif event.select.id == "settings-output-mode":
+            if event.value == Select.BLANK:
+                return
+            self.tui.state.set_setting("output.mode", str(event.value))
+            self.tui.refresh_dirty()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if self._suppress_events or self.tui.state is None:
@@ -528,6 +591,17 @@ class SettingsPane(VerticalScroll):
             if 0.0 <= vol <= 1.0:
                 self.tui.state.set_setting("audio.feedback.volume", vol)
                 self.tui.refresh_dirty()
+        elif event.input.id == "settings-output-type-delay":
+            value = event.value.strip()
+            if not value:
+                return
+            try:
+                ms = int(value)
+            except ValueError:
+                return
+            if ms >= 0:
+                self.tui.state.set_setting("output.type_delay_ms", ms)
+                self.tui.refresh_dirty()
 
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
         if self._suppress_events or self.tui.state is None:
@@ -556,6 +630,24 @@ class SettingsPane(VerticalScroll):
         elif event.switch.id == "settings-audio-feedback-enabled":
             self.tui.state.set_setting(
                 "audio.feedback.enabled", bool(event.value)
+            )
+            self.tui.refresh_dirty()
+        elif event.switch.id == "settings-output-fallback":
+            self.tui.state.set_setting(
+                "output.fallback_to_clipboard", bool(event.value)
+            )
+            self.tui.refresh_dirty()
+        elif event.switch.id == "settings-output-auto-submit":
+            self.tui.state.set_setting("output.auto_submit", bool(event.value))
+            self.tui.refresh_dirty()
+        elif event.switch.id == "settings-text-smart-auto-submit":
+            self.tui.state.set_setting(
+                "text.smart_auto_submit", bool(event.value)
+            )
+            self.tui.refresh_dirty()
+        elif event.switch.id == "settings-text-spoken-punctuation":
+            self.tui.state.set_setting(
+                "text.spoken_punctuation", bool(event.value)
             )
             self.tui.refresh_dirty()
 
