@@ -324,6 +324,61 @@ def test_reconcile_identical_content_is_noop(paths) -> None:
     assert result.skipped_reason == "identical"
 
 
+def test_reconcile_subset_bundle_is_silent_noop(paths) -> None:
+    """Bundle stamp is newer AND content hash differs, but the bundle's
+    entries are a subset of local state — apply_bundle_to_state merges
+    nothing new. The reader must NOT surface a "Synced from" banner
+    (there's nothing new to announce) and must NOT persist (which would
+    only bump config.toml's mtime for nothing).
+
+    Repro of the real-world single-device false positive: an older
+    sync.json with empty vocab predates the phrases the user added
+    through the UI after that sync was written."""
+    # Local has vocab entries; bundle is empty. Backdate the local files
+    # so the stale sync.json still "wins" the mtime compare.
+    cfg = paths["cfg"]
+    cfg_doc = tomlkit.parse(cfg.read_text())
+    if "whisper" not in cfg_doc:
+        cfg_doc["whisper"] = tomlkit.table()
+    cfg_doc["whisper"]["initial_prompt"] = "Alpha, Beta, Gamma"
+    cfg.write_text(tomlkit.dumps(cfg_doc))
+    paths["side"].write_text(json.dumps({
+        "version": 1,
+        "vocabulary": [
+            {"phrase": "Alpha", "added_at": "2026-04-20T00:00:00+00:00"},
+            {"phrase": "Beta", "added_at": "2026-04-20T00:00:00+00:00"},
+            {"phrase": "Gamma", "added_at": "2026-04-20T00:00:00+00:00"},
+        ],
+        "replacements": [],
+    }))
+    _force_old_mtime(cfg)
+    _force_old_mtime(paths["side"])
+
+    # Empty bundle, but fresh timestamp → "newer than local". Device
+    # label is this-machine-like to mirror the real scenario.
+    _write_sync_bundle(paths["sync"], vocab=[], device="ai-node")
+
+    doc = tomlkit.parse(cfg.read_text())
+    sc = sidecar_mod.load(paths["side"])
+    cfg_mtime_before = cfg.stat().st_mtime
+    side_mtime_before = paths["side"].stat().st_mtime
+
+    result = sync.reconcile_sync_on_startup(
+        doc, sc,
+        config_path=cfg, sidecar_path=paths["side"],
+        sync_path=paths["sync"], models_dir=paths["models"],
+    )
+
+    assert result.applied_from is None
+    assert result.skipped_reason == "noop_merge"
+    # Local state preserved — merge semantics kept our phrases.
+    assert [v.phrase for v in sc.vocabulary] == ["Alpha", "Beta", "Gamma"]
+    # No persist: mtimes unchanged so next startup makes the same
+    # decision without an extra disk churn cycle.
+    assert cfg.stat().st_mtime == cfg_mtime_before
+    assert paths["side"].stat().st_mtime == side_mtime_before
+
+
 # ---------------------------------------------------------------------------
 # Missing model
 # ---------------------------------------------------------------------------

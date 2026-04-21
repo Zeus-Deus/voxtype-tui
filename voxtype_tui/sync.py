@@ -1671,13 +1671,28 @@ def reconcile_sync_on_startup(
     # distills to the same content as current state, there's nothing
     # meaningful to apply (someone else's device happened to regenerate
     # a bundle with identical data). Skip to avoid a dirty-rewrite loop.
-    current_sync = distill_sync(doc, sc.vocabulary, sc.replacements)
-    if stable_hash(current_sync) == stable_hash(bundle.sync):
+    pre_sync_hash = stable_hash(distill_sync(doc, sc.vocabulary, sc.replacements))
+    if pre_sync_hash == stable_hash(bundle.sync):
         result.skipped_reason = "identical"
         return result
 
     warnings = apply_bundle_to_state(bundle, doc, sc, include_local=False)
     result.warnings.extend(warnings)
+
+    # apply_bundle_to_state has merge (not replace) semantics: missing
+    # phrases are appended, missing replacements are upserted, settings
+    # leaves overwrite. A bundle whose contents are a subset of local
+    # state — or an empty/stale bundle left over from an earlier session
+    # before the user added anything — produces a pure no-op merge. In
+    # that case, silently drop the result: no persist (which would just
+    # bump mtimes for nothing) and no banner (we have nothing new to
+    # tell the user). This is the common single-device false positive
+    # when sync.json predates the vocab/replacements the user later
+    # added through the UI.
+    post_sync_hash = stable_hash(distill_sync(doc, sc.vocabulary, sc.replacements))
+    if pre_sync_hash == post_sync_hash:
+        result.skipped_reason = "noop_merge"
+        return result
 
     # Persist immediately so the loaded in-memory state stays in sync
     # with disk. This avoids the next save having to re-apply and
