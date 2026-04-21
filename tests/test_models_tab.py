@@ -19,6 +19,7 @@ from voxtype_tui.models import (
     ModelsPane,
     humanize_bytes,
     parse_percent,
+    split_terminal_output,
     strip_ansi,
 )
 from .conftest import FIXTURES
@@ -79,6 +80,90 @@ def test_catalog_has_whisper_entries() -> None:
     names = [m.name for m in MODEL_CATALOG["whisper"]]
     assert "base.en" in names
     assert "large-v3-turbo" in names
+
+
+# ---- split_terminal_output (regression for the "download looks frozen" bug) ----
+
+
+def test_split_terminal_output_lf_only() -> None:
+    units, leftover = split_terminal_output(b"hello\nworld\n")
+    assert units == [("hello", True), ("world", True)]
+    assert leftover == b""
+
+
+def test_split_terminal_output_cr_only_are_progress_frames() -> None:
+    """Carriage-returns mid-stream are progress-bar overwrites and must be
+    delivered as non-newline units so the UI updates the bar live rather
+    than waiting for the eventual LF."""
+    units, leftover = split_terminal_output(b"10.0%\r50.0%\r")
+    assert units == [("10.0%", False), ("50.0%", False)]
+    assert leftover == b""
+
+
+def test_split_terminal_output_cr_lf_is_a_single_newline() -> None:
+    units, leftover = split_terminal_output(b"line\r\nnext\n")
+    assert units == [("line", True), ("next", True)]
+
+
+def test_split_terminal_output_mixed_cr_then_lf_at_end() -> None:
+    """Realistic voxtype download shape: progress frames separated by \r,
+    then a final \n when the whole progress bar completes, then a
+    subsequent 'Saved to ...' line."""
+    raw = (
+        b"######## 8.0%\r################ 24.5%\r"
+        b"######################### 48.3%\r"
+        b"######################################## 100.0%\n"
+        b"Saved to /path/to/model.bin\n"
+    )
+    units, leftover = split_terminal_output(raw)
+    texts_with_flag = [(t, nl) for t, nl in units]
+    # The first three \r-terminated frames must be progress-only
+    assert texts_with_flag[0][1] is False
+    assert "8.0%" in texts_with_flag[0][0]
+    assert texts_with_flag[1][1] is False
+    assert "24.5%" in texts_with_flag[1][0]
+    assert texts_with_flag[2][1] is False
+    # The fourth (the terminal \n after the last \r-frame) is a real line
+    assert texts_with_flag[3][1] is True
+    assert "100.0%" in texts_with_flag[3][0]
+    # And "Saved to …" is a real logged line
+    assert texts_with_flag[4][1] is True
+    assert "Saved to" in texts_with_flag[4][0]
+    assert leftover == b""
+
+
+def test_split_terminal_output_preserves_partial_trailing() -> None:
+    """Chunks can land mid-line; partial bytes should come back as leftover
+    so the next chunk can concatenate and complete the unit."""
+    units, leftover = split_terminal_output(b"complete\nparti")
+    assert units == [("complete", True)]
+    assert leftover == b"parti"
+
+    # Feeding the rest should produce the remaining line
+    more_units, more_leftover = split_terminal_output(leftover + b"al\n")
+    assert more_units == [("partial", True)]
+    assert more_leftover == b""
+
+
+def test_split_terminal_output_strips_ansi() -> None:
+    units, _ = split_terminal_output(b"\x1b[32m\xe2\x9c\x93\x1b[0m OK\n")
+    assert units == [("✓ OK", True)]
+
+
+def test_split_terminal_output_empty_input() -> None:
+    units, leftover = split_terminal_output(b"")
+    assert units == []
+    assert leftover == b""
+
+
+def test_split_terminal_output_cr_followed_by_real_line() -> None:
+    """Verifies the realistic sequence: final \r-overwrite followed by a
+    normal \n-line emits one progress unit and one logged line."""
+    raw = b"######## 100.0%\rDone\n"
+    units, _ = split_terminal_output(raw)
+    assert len(units) == 2
+    assert units[0] == ("######## 100.0%", False)
+    assert units[1] == ("Done", True)
 
 
 # ---- UI tests ----
@@ -298,6 +383,92 @@ async def test_unknown_bin_files_are_surfaced(tmp_env):
                 found = True
                 break
         assert found
+
+
+async def test_download_progress_updates_live_not_at_end(tmp_env):
+    """Regression for the 'download looks frozen, then jumps to 100%' bug.
+    Feed a realistic voxtype-style stream through _run_download: three
+    \\r-separated progress frames, then a final \\n-terminated completion
+    line. The ProgressBar.progress must advance incrementally between
+    chunks — not jump straight from 0 to 100 at the end."""
+    cfg, side, models_dir = tmp_env
+
+    # Build a fake async stdout that yields chunks like voxtype's progress
+    # emission: bar frames end with \r, final success line ends with \n.
+    chunks = [
+        b"Downloading tiny.en...\n",
+        b"######## 10.0%\r",
+        b"################## 45.0%\r",
+        b"########################## 80.0%\r",
+        b"############################ 100.0%\n",
+        b"  Saved to /tmp/ggml-tiny.en.bin\n",
+        b"  Config updated to use 'tiny.en'\n",
+    ]
+
+    class _FakeStream:
+        def __init__(self, parts):
+            self._parts = list(parts)
+
+        async def read(self, n):
+            if not self._parts:
+                return b""
+            return self._parts.pop(0)
+
+    class _FakeProc:
+        def __init__(self, parts):
+            self.stdout = _FakeStream(parts)
+
+        async def wait(self):
+            return 0
+
+    # Monkeypatch create_subprocess_exec to return our fake
+    import asyncio as _aio
+    seen_progress: list[float] = []
+
+    from voxtype_tui import models as models_mod
+
+    async def fake_create(*args, **kwargs):
+        return _FakeProc(chunks)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(_aio, "create_subprocess_exec", fake_create)
+
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    try:
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await _goto_models(pilot, app)
+            pane = app.query_one(ModelsPane)
+
+            # Intercept ProgressBar.update so we can verify it was called
+            # multiple times with increasing values — not just once at the end.
+            from textual.widgets import ProgressBar
+            progress = pane.query_one("#models-progress", ProgressBar)
+            original_update = progress.update
+
+            def recording_update(*args, **kwargs):
+                if "progress" in kwargs:
+                    seen_progress.append(float(kwargs["progress"]))
+                return original_update(*args, **kwargs)
+
+            progress.update = recording_update  # type: ignore[method-assign]
+
+            await pane._run_download("tiny.en")
+            await pilot.pause()
+    finally:
+        monkeypatch.undo()
+
+    # The bar must have been pushed through at least 10, 45, 80, and 100%
+    # separately — not jumped straight to 100.
+    non_zero = [p for p in seen_progress if p > 0]
+    assert non_zero, f"ProgressBar never got a non-zero update: {seen_progress}"
+    assert 10.0 in non_zero
+    assert 45.0 in non_zero
+    assert 80.0 in non_zero
+    assert 100.0 in non_zero
+    # At least four distinct intermediate values in order
+    ascending_order = sorted(set(non_zero))
+    assert ascending_order == [10.0, 45.0, 80.0, 100.0]
 
 
 async def test_disk_usage_reflects_file_sizes(tmp_env):

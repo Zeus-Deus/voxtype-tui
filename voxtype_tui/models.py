@@ -99,6 +99,46 @@ def parse_percent(line: str) -> float | None:
         return None
 
 
+def split_terminal_output(
+    buffer: bytes,
+) -> tuple[list[tuple[str, bool]], bytes]:
+    """Split a chunk of subprocess output on both `\r` and `\n` so curl-style
+    progress bars (which use `\r` to overwrite) are visible in real time.
+
+    Returns (units, leftover) where each unit is (text, is_newline). A unit
+    marked is_newline=False is a `\r`-terminated overwrite — it should drive
+    the progress bar but NOT be logged (otherwise the log fills with 20
+    redundant progress-bar frames per download). `\r\n` is folded into a
+    single newline terminator. The leftover bytes should be prepended to the
+    next chunk so partial units aren't lost at chunk boundaries.
+    """
+    units: list[tuple[str, bool]] = []
+    last = 0
+    i = 0
+    n = len(buffer)
+    while i < n:
+        c = buffer[i:i + 1]
+        if c == b"\n":
+            segment = buffer[last:i].rstrip(b"\r")
+            units.append((strip_ansi(segment.decode(errors="replace")), True))
+            i += 1
+            last = i
+        elif c == b"\r":
+            # \r\n → single newline
+            if i + 1 < n and buffer[i + 1:i + 2] == b"\n":
+                segment = buffer[last:i]
+                units.append((strip_ansi(segment.decode(errors="replace")), True))
+                i += 2
+            else:
+                segment = buffer[last:i]
+                units.append((strip_ansi(segment.decode(errors="replace")), False))
+                i += 1
+            last = i
+        else:
+            i += 1
+    return units, buffer[last:]
+
+
 def model_file_path(engine: str, name: str) -> Path:
     """Predict the on-disk path Voxtype uses for a given engine + model.
     Currently only whisper is supported for on-disk operations; other engines
@@ -207,8 +247,15 @@ class ModelsPane(VimTableNav, Vertical):
     ModelsPane DataTable { height: 1fr; margin-bottom: 1; }
     ModelsPane #models-buttons { height: 3; margin-bottom: 1; }
     ModelsPane #models-buttons Button { margin-right: 1; height: 3; }
-    ModelsPane ProgressBar { margin: 0 0 1 0; }
-    ModelsPane RichLog { height: 10; background: $panel; }
+    ModelsPane ProgressBar {
+        height: 1;
+        width: 100%;
+        margin: 0 0 1 0;
+    }
+    ModelsPane RichLog {
+        height: 10;
+        background: $panel;
+    }
     """
 
     BINDINGS = [
@@ -477,13 +524,30 @@ class ModelsPane(VimTableNav, Vertical):
 
         try:
             assert proc.stdout is not None
-            async for raw in proc.stdout:
-                text = strip_ansi(raw.decode(errors="replace").rstrip("\n"))
-                if text:
-                    log.write(text)
+            buffer = b""
+            while True:
+                chunk = await proc.stdout.read(256)
+                if not chunk:
+                    break
+                buffer += chunk
+                units, buffer = split_terminal_output(buffer)
+                for text, is_newline in units:
+                    pct = parse_percent(text)
+                    if pct is not None:
+                        progress.update(progress=pct)
+                    if is_newline and text.strip():
+                        log.write(text)
+                # Explicit yield so Textual can render the updated bar/log
+                # between chunks even on a tight, continuous stream.
+                await asyncio.sleep(0)
+            # Drain any trailing bytes that weren't terminator-delimited.
+            if buffer:
+                text = strip_ansi(buffer.decode(errors="replace"))
                 pct = parse_percent(text)
                 if pct is not None:
                     progress.update(progress=pct)
+                if text.strip():
+                    log.write(text)
         except asyncio.CancelledError:
             raise
         finally:
