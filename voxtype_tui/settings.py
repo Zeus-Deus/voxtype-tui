@@ -12,6 +12,9 @@ Design notes:
 """
 from __future__ import annotations
 
+import asyncio
+import shutil
+import subprocess
 from typing import TYPE_CHECKING
 
 from textual.app import ComposeResult
@@ -67,6 +70,61 @@ CUSTOM_MODEL = "__custom__"
 # who need one can hand-edit the TOML.
 HOTKEY_MODIFIERS: list[str] = ["LEFTCTRL", "LEFTALT", "LEFTSHIFT", "LEFTMETA"]
 HOTKEY_MODES: list[str] = ["push_to_talk", "toggle"]
+
+CUSTOM_AUDIO_DEVICE = "__custom_audio__"
+AUDIO_FEEDBACK_THEMES: list[str] = ["default", "subtle", "mechanical"]
+
+
+def _clean_audio_label(name: str) -> str:
+    """Cosmetic: turn a pactl source name like
+    `alsa_input.usb-SteelSeries_SteelSeries_Arctis_7-00.mono-chat` into
+    something a human can scan. Underscores → spaces; strip the
+    redundant prefixes."""
+    s = name
+    s = s.removeprefix("alsa_input.")
+    s = s.removeprefix("usb-")
+    return s.replace("_", " ")
+
+
+def enumerate_audio_devices_sync(timeout: float = 3.0) -> list[tuple[str, str]]:
+    """Shell `pactl list sources short`, filter to real alsa_input.* rows, and
+    return a list of (label, name). Always prepends `default` and appends
+    `Custom…`. Returns the minimal fallback list if pactl is missing or
+    returns no useful rows."""
+    fallback: list[tuple[str, str]] = [
+        ("default", "default"),
+        ("Custom path…", CUSTOM_AUDIO_DEVICE),
+    ]
+    if shutil.which("pactl") is None:
+        return fallback
+    try:
+        result = subprocess.run(
+            ["pactl", "list", "sources", "short"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return fallback
+    if result.returncode != 0:
+        return fallback
+
+    options: list[tuple[str, str]] = [("default", "default")]
+    seen: set[str] = {"default"}
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        name = parts[1]
+        if not name.startswith("alsa_input."):
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        options.append((_clean_audio_label(name), name))
+    if len(options) == 1:
+        # No alsa_input found — graceful degrade
+        return fallback
+    options.append(("Custom path…", CUSTOM_AUDIO_DEVICE))
+    return options
 
 
 def engine_section_restart_hint() -> str:
@@ -158,6 +216,49 @@ class SettingsPane(VerticalScroll):
                 yield Label("Built-in detect", classes="label")
                 yield Switch(value=True, id="settings-hotkey-enabled")
 
+        with Collapsible(
+            title=f"Audio{engine_section_restart_hint()}",
+            collapsed=False,
+            id="settings-audio-section",
+        ):
+            with Horizontal(classes="field-row"):
+                yield Label("Device", classes="label")
+                yield Select(
+                    options=[("default", "default")],
+                    allow_blank=False,
+                    value="default",
+                    id="settings-audio-device",
+                )
+            with Horizontal(classes="field-row hidden", id="settings-audio-custom-row"):
+                yield Label("Custom device", classes="label")
+                yield Input(
+                    placeholder="e.g. alsa_input.platform-…",
+                    id="settings-audio-custom",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Max duration", classes="label")
+                yield Input(
+                    placeholder="60",
+                    id="settings-audio-maxdur",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Feedback sounds", classes="label")
+                yield Switch(value=False, id="settings-audio-feedback-enabled")
+            with Horizontal(classes="field-row"):
+                yield Label("Feedback theme", classes="label")
+                yield Select(
+                    options=[(t, t) for t in AUDIO_FEEDBACK_THEMES],
+                    allow_blank=False,
+                    value=AUDIO_FEEDBACK_THEMES[0],
+                    id="settings-audio-feedback-theme",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Feedback volume", classes="label")
+                yield Input(
+                    placeholder="0.0 – 1.0",
+                    id="settings-audio-feedback-volume",
+                )
+
     # --- app/state access ---
 
     @property
@@ -189,6 +290,38 @@ class SettingsPane(VerticalScroll):
 
     def on_mount(self) -> None:
         self.sync_from_state()
+        # Kick off pactl enumeration asynchronously so the mount isn't
+        # blocked. Device Select starts with the fallback list; options swap
+        # in when pactl finishes.
+        asyncio.create_task(self._populate_audio_devices_async())
+
+    async def _populate_audio_devices_async(self) -> None:
+        options = await asyncio.to_thread(enumerate_audio_devices_sync)
+        try:
+            select = self.query_one("#settings-audio-device", Select)
+        except Exception:
+            return
+        self._suppress_events = True
+        try:
+            select.set_options(options)
+            if self.tui.state is None:
+                return
+            current = str(
+                self.tui.state.doc.get("audio", {}).get("device", "default")
+            )
+            known = {v for _, v in options}
+            custom_row = self.query_one("#settings-audio-custom-row", Horizontal)
+            custom_input = self.query_one("#settings-audio-custom", Input)
+            if current in known:
+                select.value = current
+                custom_row.add_class("hidden")
+                custom_input.value = ""
+            else:
+                select.value = CUSTOM_AUDIO_DEVICE
+                custom_row.remove_class("hidden")
+                custom_input.value = current
+        finally:
+            self._suppress_events = False
 
     def sync_from_state(self) -> None:
         """Populate all widgets from the current `state.doc`. Called on mount
@@ -220,6 +353,25 @@ class SettingsPane(VerticalScroll):
             self.query_one("#settings-hotkey-mode", Select).value = mode
             enabled = hotkey.get("enabled", True)
             self.query_one("#settings-hotkey-enabled", Switch).value = bool(enabled)
+
+            audio = doc.get("audio") or {}
+            # Device is populated asynchronously later — for now just seed the
+            # Input for the Custom-device row if the value isn't "default".
+            self.query_one("#settings-audio-maxdur", Input).value = str(
+                audio.get("max_duration_secs", "")
+            )
+            feedback = audio.get("feedback") or {}
+            self.query_one("#settings-audio-feedback-enabled", Switch).value = bool(
+                feedback.get("enabled", False)
+            )
+            theme = str(feedback.get("theme", AUDIO_FEEDBACK_THEMES[0]))
+            if theme not in AUDIO_FEEDBACK_THEMES:
+                theme = AUDIO_FEEDBACK_THEMES[0]
+            self.query_one("#settings-audio-feedback-theme", Select).value = theme
+            vol = feedback.get("volume", "")
+            self.query_one("#settings-audio-feedback-volume", Input).value = (
+                str(vol) if vol != "" else ""
+            )
         finally:
             self._suppress_events = False
 
@@ -306,6 +458,27 @@ class SettingsPane(VerticalScroll):
                 return
             self.tui.state.set_setting("hotkey.mode", str(event.value))
             self.tui.refresh_dirty()
+        elif event.select.id == "settings-audio-device":
+            if event.value == Select.BLANK:
+                return
+            custom_row = self.query_one("#settings-audio-custom-row", Horizontal)
+            custom_input = self.query_one("#settings-audio-custom", Input)
+            if event.value == CUSTOM_AUDIO_DEVICE:
+                custom_row.remove_class("hidden")
+                if event.select.has_focus:
+                    custom_input.focus()
+                return
+            custom_row.add_class("hidden")
+            custom_input.value = ""
+            self.tui.state.set_setting("audio.device", str(event.value))
+            self.tui.refresh_dirty()
+        elif event.select.id == "settings-audio-feedback-theme":
+            if event.value == Select.BLANK:
+                return
+            self.tui.state.set_setting(
+                "audio.feedback.theme", str(event.value)
+            )
+            self.tui.refresh_dirty()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if self._suppress_events or self.tui.state is None:
@@ -327,6 +500,33 @@ class SettingsPane(VerticalScroll):
             value = event.value.strip()
             if value:
                 self.tui.state.set_setting("hotkey.key", value)
+                self.tui.refresh_dirty()
+        elif event.input.id == "settings-audio-custom":
+            value = event.value.strip()
+            if value:
+                self.tui.state.set_setting("audio.device", value)
+                self.tui.refresh_dirty()
+        elif event.input.id == "settings-audio-maxdur":
+            value = event.value.strip()
+            if not value:
+                return
+            try:
+                secs = int(value)
+            except ValueError:
+                return
+            if secs > 0:
+                self.tui.state.set_setting("audio.max_duration_secs", secs)
+                self.tui.refresh_dirty()
+        elif event.input.id == "settings-audio-feedback-volume":
+            value = event.value.strip()
+            if not value:
+                return
+            try:
+                vol = float(value)
+            except ValueError:
+                return
+            if 0.0 <= vol <= 1.0:
+                self.tui.state.set_setting("audio.feedback.volume", vol)
                 self.tui.refresh_dirty()
 
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
@@ -352,6 +552,11 @@ class SettingsPane(VerticalScroll):
             return
         if event.switch.id == "settings-hotkey-enabled":
             self.tui.state.set_setting("hotkey.enabled", bool(event.value))
+            self.tui.refresh_dirty()
+        elif event.switch.id == "settings-audio-feedback-enabled":
+            self.tui.state.set_setting(
+                "audio.feedback.enabled", bool(event.value)
+            )
             self.tui.refresh_dirty()
 
     def _write_model(self, engine: str, model: str) -> None:
