@@ -1,0 +1,39 @@
+# Voxtype Configuration — a user who hand-edited their config outside
+# voxtype-tui. Structurally matches heavily_customized.toml but values differ
+# in ways that should trigger sidecar divergence detection.
+
+state_file = "auto"
+engine = "whisper"
+
+[hotkey]
+key = "RIGHTALT"
+modifiers = ["LEFTCTRL"]
+mode = "toggle"
+enabled = true
+
+[audio]
+device = "default"
+sample_rate = 16000
+max_duration_secs = 120
+
+[whisper]
+model = "large-v3-turbo"
+language = "en"
+translate = false
+# User hand-added "Neovim" and "Ghostty", removed "Hyprland" — sidecar
+# should detect this and rebuild from disk.
+initial_prompt = "Codemux, Claude Code, Vexis, Omarchy, Neovim, Ghostty, shadcn, OAuth, Bitwarden, Voxtype"
+
+[output]
+mode = "clipboard"
+fallback_to_clipboard = true
+auto_submit = true
+
+[text]
+spoken_punctuation = true
+
+[text.replacements]
+"vox type" = "voxtype"
+# User hand-added this one — sidecar won't know about it.
+"kyte" = "Kite"
+"shed cn" = "shadcn"

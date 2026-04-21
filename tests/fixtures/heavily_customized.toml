@@ -1,0 +1,71 @@
+# Voxtype Configuration — heavily customized user setup.
+# Used as a fixture to stress tomlkit round-trip against a fully-populated file.
+
+state_file = "auto"
+engine = "whisper"
+
+[hotkey]
+# Switched from SCROLLLOCK to RIGHTALT — some laptops don't have SL.
+key = "RIGHTALT"
+modifiers = ["LEFTCTRL"]
+mode = "toggle"
+enabled = true
+
+[audio]
+# Pinned to the USB headset so dictation doesn't land on the webcam mic.
+device = "alsa_input.usb-0d8c_USB_Headset-00.analog-mono"
+sample_rate = 16000
+max_duration_secs = 120
+
+[audio.feedback]
+enabled = true
+theme = "mechanical"
+volume = 0.5
+
+[whisper]
+# Remote whisper.cpp server running on the homelab machine.
+backend = "remote"
+model = "large-v3-turbo"
+language = "en"
+translate = false
+threads = 8
+remote_endpoint = "http://192.168.1.42:8080"
+remote_model = "whisper-1"
+remote_timeout_secs = 60
+# Vocabulary biases the model toward project-specific proper nouns.
+initial_prompt = "Codemux, Claude Code, Vexis, Omarchy, Hyprland, shadcn, OAuth, Bitwarden, Voxtype"
+
+[output]
+mode = "type"
+fallback_to_clipboard = true
+type_delay_ms = 2
+auto_submit = false
+pre_output_command = "hyprctl dispatch submap voxtype_suppress"
+post_output_command = "hyprctl dispatch submap reset"
+
+[output.post_process]
+command = "ollama run llama3.2:1b 'Clean up this dictation. Fix grammar. Output only cleaned text:'"
+timeout_ms = 30000
+
+[output.notification]
+on_recording_start = false
+on_recording_stop = false
+on_transcription = true
+
+[text]
+spoken_punctuation = true
+smart_auto_submit = true
+
+[text.replacements]
+"vox type" = "voxtype"
+"cloud code" = "Claude Code"
+"slash codemux release" = "/codemux-release"
+"shed cn" = "shadcn"
+
+[status]
+icon_theme = "nerd-font"
+
+[status.icons]
+idle = "󰍬"
+recording = "󰑊"
+transcribing = "󰦖"

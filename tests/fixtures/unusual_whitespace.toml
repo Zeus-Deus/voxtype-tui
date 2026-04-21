@@ -1,0 +1,26 @@
+# Odd whitespace fixture: tabs, extra blank lines, uneven indent.
+# Exercises tomlkit's round-trip against hand-typed formatting.
+
+
+
+[whisper]
+	model   =   "base.en"
+	language	=	"en"
+		translate  = false
+
+
+
+[hotkey]
+key   = "SCROLLLOCK"
+modifiers = [ ]
+
+ [audio]
+device = "default"
+sample_rate     = 16000
+max_duration_secs	=	60
+
+
+
+[output]
+mode = "type"
+	auto_submit	=	true

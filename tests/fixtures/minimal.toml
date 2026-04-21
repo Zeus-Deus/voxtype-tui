@@ -1,0 +1,13 @@
+[hotkey]
+key = "SCROLLLOCK"
+
+[audio]
+device = "default"
+sample_rate = 16000
+max_duration_secs = 60
+
+[whisper]
+model = "base.en"
+
+[output]
+mode = "type"
