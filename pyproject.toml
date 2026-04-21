@@ -15,7 +15,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=9", "pytest-asyncio>=1"]
+dev = [
+    "pytest>=9",
+    "pytest-asyncio>=1",
+    "pytest-xdist>=3",
+]
 
 [project.scripts]
 voxtype-tui = "voxtype_tui.app:main"

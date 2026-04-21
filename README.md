@@ -131,7 +131,8 @@ Both `#RRGGBB` and `0xRRGGBB` are accepted. The resulting `"user"` theme shows u
 ## Tests
 
 ```bash
-python -m pytest tests/
+pytest          # parallel by default via pytest-xdist; ~12s for the full suite
+pytest -n 0     # force serial — easier to read output when debugging one test
 ```
 
 Six TOML fixture configs under `tests/fixtures/` cover representative real-world shapes (stock / heavily customized / externally edited / minimal / unusual whitespace / mostly-commented). Each mutation is parametrized across fixtures and asserts no data loss, preserved comments, touched-scope bounded to intended fields, and post-save validity per `voxtype -c <file> config`. UI behavior is verified with Textual's `Pilot` against tempdir config + sidecar copies — no real writes to `~/.config/voxtype/` happen during tests. The Omarchy install/uninstall scripts have their own bash-level tests that run against a sandboxed `$HOME`.
