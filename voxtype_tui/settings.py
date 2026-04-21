@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Checkbox, Collapsible, Input, Label, Select, Switch
+from textual.widgets import Button, Checkbox, Collapsible, Input, Label, RichLog, Select, Switch
 
 from . import config
 
@@ -72,6 +72,52 @@ HOTKEY_MODIFIERS: list[str] = ["LEFTCTRL", "LEFTALT", "LEFTSHIFT", "LEFTMETA"]
 HOTKEY_MODES: list[str] = ["push_to_talk", "toggle"]
 
 OUTPUT_MODES: list[str] = ["type", "clipboard", "paste"]
+
+TERMINAL_LAUNCHER = "omarchy-launch-floating-terminal-with-presentation"
+
+
+def gpu_status_sync(timeout: float = 5.0) -> tuple[bool, str]:
+    """Returns (ok, text). `text` is the raw output of
+    `voxtype setup gpu --status` — no parsing, we just dump it into the
+    RichLog. `ok` is whether the command ran successfully; on failure `text`
+    contains an error line."""
+    if shutil.which("voxtype") is None:
+        return False, "voxtype binary not found"
+    try:
+        result = subprocess.run(
+            ["voxtype", "setup", "gpu", "--status"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "voxtype setup gpu --status timed out"
+    except OSError as e:
+        return False, f"could not invoke voxtype: {e}"
+    if result.returncode == 0:
+        return True, result.stdout
+    return False, (result.stderr or result.stdout).strip() or "status failed"
+
+
+def launch_gpu_command_in_terminal(action: str) -> tuple[bool, str]:
+    """Pop a floating terminal that runs `sudo voxtype setup gpu --<action>`.
+    Returns (ok, message). The user sees the sudo prompt in the new TTY; the
+    TUI stays responsive and the user hits Refresh afterward to pick up the
+    new status."""
+    if action not in ("enable", "disable"):
+        return False, f"invalid action {action!r}"
+    cmd_string = f"sudo voxtype setup gpu --{action}"
+    if shutil.which(TERMINAL_LAUNCHER):
+        try:
+            subprocess.Popen(
+                [TERMINAL_LAUNCHER, cmd_string],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except OSError as e:
+            return False, f"could not launch terminal: {e}"
+        return True, f"Launched terminal: {cmd_string}"
+    return False, (
+        f"{TERMINAL_LAUNCHER} not installed — run `{cmd_string}` in a "
+        "terminal, then hit Refresh here."
+    )
 
 CUSTOM_AUDIO_DEVICE = "__custom_audio__"
 AUDIO_FEEDBACK_THEMES: list[str] = ["default", "subtle", "mechanical"]
@@ -146,6 +192,9 @@ class SettingsPane(VerticalScroll):
     SettingsPane .modifier-row { height: 3; padding: 0 0 0 18; }
     SettingsPane .modifier-row Checkbox { margin-right: 2; height: 1; }
     SettingsPane .hidden { display: none; }
+    SettingsPane #settings-gpu-actions { height: 3; padding: 0 0 0 18; }
+    SettingsPane #settings-gpu-actions Button { margin-right: 1; height: 3; }
+    SettingsPane RichLog { height: 12; margin-top: 1; background: $panel; }
     """
 
     BINDINGS = [
@@ -293,6 +342,17 @@ class SettingsPane(VerticalScroll):
                     id="settings-output-type-delay",
                 )
 
+        with Collapsible(
+            title="GPU acceleration",
+            collapsed=False,
+            id="settings-gpu-section",
+        ):
+            with Horizontal(id="settings-gpu-actions"):
+                yield Button("Refresh status", id="settings-gpu-refresh")
+                yield Button("Enable (sudo)", variant="primary", id="settings-gpu-enable")
+                yield Button("Disable (sudo)", variant="warning", id="settings-gpu-disable")
+            yield RichLog(id="settings-gpu-log", markup=False, highlight=False, wrap=False)
+
     # --- app/state access ---
 
     @property
@@ -328,6 +388,18 @@ class SettingsPane(VerticalScroll):
         # blocked. Device Select starts with the fallback list; options swap
         # in when pactl finishes.
         asyncio.create_task(self._populate_audio_devices_async())
+        asyncio.create_task(self._refresh_gpu_status_async())
+
+    async def _refresh_gpu_status_async(self) -> None:
+        log = self.query_one("#settings-gpu-log", RichLog)
+        ok, text = await asyncio.to_thread(gpu_status_sync)
+        log.clear()
+        log.write("$ voxtype setup gpu --status")
+        for line in text.splitlines():
+            # RichLog renders ANSI by default; strip for cleaner display.
+            log.write(_strip_ansi(line))
+        if not ok:
+            log.write("[status command failed]")
 
     async def _populate_audio_devices_async(self) -> None:
         options = await asyncio.to_thread(enumerate_audio_devices_sync)
@@ -621,6 +693,30 @@ class SettingsPane(VerticalScroll):
         self.tui.state.set_setting("hotkey.modifiers", active)
         self.tui.refresh_dirty()
 
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if self.tui.state is None:
+            return
+        if event.button.id == "settings-gpu-refresh":
+            event.stop()
+            asyncio.create_task(self._refresh_gpu_status_async())
+        elif event.button.id == "settings-gpu-enable":
+            event.stop()
+            ok, msg = launch_gpu_command_in_terminal("enable")
+            self._log_action_result(ok, msg)
+        elif event.button.id == "settings-gpu-disable":
+            event.stop()
+            ok, msg = launch_gpu_command_in_terminal("disable")
+            self._log_action_result(ok, msg)
+
+    def _log_action_result(self, ok: bool, msg: str) -> None:
+        log = self.query_one("#settings-gpu-log", RichLog)
+        log.write(msg)
+        self.app.notify(
+            msg,
+            severity="information" if ok else "warning",
+            timeout=6 if ok else 10,
+        )
+
     def on_switch_changed(self, event: Switch.Changed) -> None:
         if self._suppress_events or self.tui.state is None:
             return
@@ -660,3 +756,14 @@ class SettingsPane(VerticalScroll):
 
     def action_blur(self) -> None:
         self.app.set_focus(None)
+
+
+_ANSI_RE = None
+
+
+def _strip_ansi(line: str) -> str:
+    global _ANSI_RE
+    if _ANSI_RE is None:
+        import re
+        _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+    return _ANSI_RE.sub("", line)
