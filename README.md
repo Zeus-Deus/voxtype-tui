@@ -157,7 +157,10 @@ Conda is used only for local development isolation. Shipped installs go through 
 - **Don't auto-restart the daemon.** You decide when.
 - **`config.toml` is source of truth.** If the TUI's sidecar view diverges, the config wins and the UI warns.
 
-See [`CLAUDE.md`](./CLAUDE.md) for deeper design notes.
+## Further reading
+
+- **Per-feature docs:** [`docs/`](./docs/) — what each tab and setting does, when to touch it, keybindings reference.
+- **Design notes:** [`CLAUDE.md`](./CLAUDE.md) — why the code is shaped the way it is.
 
 ## License
 
