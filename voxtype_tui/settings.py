@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Collapsible, Input, Label, Select
+from textual.widgets import Checkbox, Collapsible, Input, Label, Select, Switch
 
 from . import config
 
@@ -63,6 +63,11 @@ MODEL_PATH_PER_ENGINE: dict[str, str] = {
 
 CUSTOM_MODEL = "__custom__"
 
+# Modifier keys offered in the Hotkey section. Right-variants are rare; users
+# who need one can hand-edit the TOML.
+HOTKEY_MODIFIERS: list[str] = ["LEFTCTRL", "LEFTALT", "LEFTSHIFT", "LEFTMETA"]
+HOTKEY_MODES: list[str] = ["push_to_talk", "toggle"]
+
 
 def engine_section_restart_hint() -> str:
     """Title suffix used for sections that contain restart-sensitive fields."""
@@ -77,6 +82,9 @@ class SettingsPane(VerticalScroll):
     SettingsPane .label { width: 18; padding: 1 1 0 0; color: $text-muted; }
     SettingsPane Input { width: 1fr; }
     SettingsPane Select { width: 1fr; }
+    SettingsPane Switch { width: auto; }
+    SettingsPane .modifier-row { height: 3; padding: 0 0 0 18; }
+    SettingsPane .modifier-row Checkbox { margin-right: 2; height: 1; }
     SettingsPane .hidden { display: none; }
     """
 
@@ -122,6 +130,34 @@ class SettingsPane(VerticalScroll):
                     id="settings-language",
                 )
 
+        with Collapsible(
+            title=f"Hotkey & Activation{engine_section_restart_hint()}",
+            collapsed=False,
+            id="settings-hotkey-section",
+        ):
+            with Horizontal(classes="field-row"):
+                yield Label("Key", classes="label")
+                yield Input(
+                    placeholder="SCROLLLOCK, RIGHTALT, F13, …",
+                    id="settings-hotkey-key",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Modifiers", classes="label")
+            with Horizontal(classes="modifier-row"):
+                for mod in HOTKEY_MODIFIERS:
+                    yield Checkbox(mod, id=f"settings-mod-{mod.lower()}")
+            with Horizontal(classes="field-row"):
+                yield Label("Mode", classes="label")
+                yield Select(
+                    options=[(m, m) for m in HOTKEY_MODES],
+                    allow_blank=False,
+                    value=HOTKEY_MODES[0],
+                    id="settings-hotkey-mode",
+                )
+            with Horizontal(classes="field-row"):
+                yield Label("Built-in detect", classes="label")
+                yield Switch(value=True, id="settings-hotkey-enabled")
+
     # --- app/state access ---
 
     @property
@@ -161,19 +197,29 @@ class SettingsPane(VerticalScroll):
             return
         self._suppress_events = True
         try:
+            doc = self.tui.state.doc
             engine = self._current_engine()
             model = self._current_model_for(engine)
-            language = str(
-                self.tui.state.doc.get("whisper", {}).get("language", "")
-            )
+            language = str(doc.get("whisper", {}).get("language", ""))
 
-            engine_select = self.query_one("#settings-engine", Select)
-            engine_select.value = engine
-
+            self.query_one("#settings-engine", Select).value = engine
             self._refresh_model_options(engine, preferred=model)
+            self.query_one("#settings-language", Input).value = language
 
-            language_input = self.query_one("#settings-language", Input)
-            language_input.value = language
+            hotkey = doc.get("hotkey") or {}
+            self.query_one("#settings-hotkey-key", Input).value = str(
+                hotkey.get("key", "")
+            )
+            active_modifiers = {str(m) for m in (hotkey.get("modifiers") or [])}
+            for mod in HOTKEY_MODIFIERS:
+                cb = self.query_one(f"#settings-mod-{mod.lower()}", Checkbox)
+                cb.value = mod in active_modifiers
+            mode = str(hotkey.get("mode", HOTKEY_MODES[0])) or HOTKEY_MODES[0]
+            if mode not in HOTKEY_MODES:
+                mode = HOTKEY_MODES[0]
+            self.query_one("#settings-hotkey-mode", Select).value = mode
+            enabled = hotkey.get("enabled", True)
+            self.query_one("#settings-hotkey-enabled", Switch).value = bool(enabled)
         finally:
             self._suppress_events = False
 
@@ -255,6 +301,11 @@ class SettingsPane(VerticalScroll):
             custom_input.value = ""
             self._write_model(engine, str(event.value))
             self.tui.refresh_dirty()
+        elif event.select.id == "settings-hotkey-mode":
+            if event.value == Select.BLANK:
+                return
+            self.tui.state.set_setting("hotkey.mode", str(event.value))
+            self.tui.refresh_dirty()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if self._suppress_events or self.tui.state is None:
@@ -270,8 +321,37 @@ class SettingsPane(VerticalScroll):
             if value:
                 self.tui.state.set_setting("whisper.language", value)
             else:
-                # Leave existing value alone rather than writing empty string
                 return
+            self.tui.refresh_dirty()
+        elif event.input.id == "settings-hotkey-key":
+            value = event.value.strip()
+            if value:
+                self.tui.state.set_setting("hotkey.key", value)
+                self.tui.refresh_dirty()
+
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        if self._suppress_events or self.tui.state is None:
+            return
+        checkbox_id = event.checkbox.id or ""
+        if checkbox_id.startswith("settings-mod-"):
+            self._rewrite_modifiers_from_checkboxes()
+
+    def _rewrite_modifiers_from_checkboxes(self) -> None:
+        if self.tui.state is None:
+            return
+        active: list[str] = []
+        for mod in HOTKEY_MODIFIERS:
+            cb = self.query_one(f"#settings-mod-{mod.lower()}", Checkbox)
+            if cb.value:
+                active.append(mod)
+        self.tui.state.set_setting("hotkey.modifiers", active)
+        self.tui.refresh_dirty()
+
+    def on_switch_changed(self, event: Switch.Changed) -> None:
+        if self._suppress_events or self.tui.state is None:
+            return
+        if event.switch.id == "settings-hotkey-enabled":
+            self.tui.state.set_setting("hotkey.enabled", bool(event.value))
             self.tui.refresh_dirty()
 
     def _write_model(self, engine: str, model: str) -> None:
