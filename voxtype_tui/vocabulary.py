@@ -4,6 +4,7 @@ comma-joined string on save.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,9 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Input, Static
 
 from . import sidecar
+
+# Window in which a second `g` press is treated as the `gg` sequence.
+GG_SEQUENCE_WINDOW = 0.5
 
 if TYPE_CHECKING:
     from .app import VoxtypeTUI
@@ -60,16 +64,24 @@ class VocabularyPane(Vertical):
     """
 
     BINDINGS = [
-        Binding("n", "focus_add", "Add"),
+        # Primary actions
+        Binding("n", "vim_n", "Add / next match"),
+        Binding("N", "vim_prev_match", "Prev match", show=False),
         Binding("/", "focus_search", "Search"),
         Binding("d", "delete_selected", "Delete"),
         Binding("u", "undo_delete", "Undo"),
+        # Vim cursor navigation
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+        Binding("g", "vim_g", "Top (gg)", show=False),
+        Binding("G", "vim_bottom", "Bottom", show=False),
         Binding("escape", "focus_table", "Back to list", show=False),
     ]
 
     def __init__(self) -> None:
         super().__init__()
         self.undo_stack: list[UndoEntry] = []
+        self._last_g_time: float = 0.0
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="top"):
@@ -81,7 +93,8 @@ class VocabularyPane(Vertical):
         yield Input(placeholder="Search (press / to focus)", id="search")
         yield DataTable(id="table", cursor_type="row", zebra_stripes=True)
         yield Static(
-            "n add  ·  / search  ·  d delete  ·  u undo  ·  ctrl+s save",
+            "n add/next  ·  N prev  ·  / search  ·  d delete  ·  "
+            "u undo  ·  j/k gg/G nav  ·  ctrl+s save",
             id="hints",
         )
 
@@ -94,13 +107,23 @@ class VocabularyPane(Vertical):
     # ---- check_action: disable letter bindings while an Input has focus ----
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
-        if action in {"focus_add", "focus_search", "delete_selected", "undo_delete"}:
-            if isinstance(self.app.focused, Input):
-                return False
+        # Every single-letter binding must yield to Input focus — otherwise
+        # typing a phrase that contains 'n', 'j', 'g', etc. would trigger
+        # navigation instead of inserting the character.
+        navigation_actions = {
+            "focus_search", "delete_selected", "undo_delete",
+            "vim_n", "vim_prev_match", "cursor_down", "cursor_up",
+            "vim_g", "vim_bottom",
+        }
+        if action in navigation_actions and isinstance(self.app.focused, Input):
+            return False
         if action == "focus_table":
             if not isinstance(self.app.focused, Input):
                 return False
         return True
+
+    def _filter_active(self) -> bool:
+        return bool(self.query_one("#search", Input).value.strip())
 
     # ---- view refresh ----
 
@@ -145,6 +168,51 @@ class VocabularyPane(Vertical):
 
     def action_focus_table(self) -> None:
         self.query_one(DataTable).focus()
+
+    def action_vim_n(self) -> None:
+        """`n` is context-sensitive: cycle next match when a search filter is
+        active, otherwise focus the Add input."""
+        if self._filter_active():
+            self._move_cursor_wrap(+1)
+        else:
+            self.action_focus_add()
+
+    def action_vim_prev_match(self) -> None:
+        self._move_cursor_wrap(-1)
+
+    def action_cursor_down(self) -> None:
+        table = self.query_one(DataTable)
+        if table.row_count > 0:
+            table.action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        table = self.query_one(DataTable)
+        if table.row_count > 0:
+            table.action_cursor_up()
+
+    def action_vim_g(self) -> None:
+        """Track the `gg` sequence: first `g` arms, second `g` within the
+        window jumps to the top."""
+        now = time.monotonic()
+        if now - self._last_g_time < GG_SEQUENCE_WINDOW:
+            table = self.query_one(DataTable)
+            if table.row_count > 0:
+                table.move_cursor(row=0)
+            self._last_g_time = 0.0
+        else:
+            self._last_g_time = now
+
+    def action_vim_bottom(self) -> None:
+        table = self.query_one(DataTable)
+        if table.row_count > 0:
+            table.move_cursor(row=table.row_count - 1)
+
+    def _move_cursor_wrap(self, delta: int) -> None:
+        table = self.query_one(DataTable)
+        if table.row_count == 0:
+            return
+        target = (table.cursor_row + delta) % table.row_count
+        table.move_cursor(row=target)
 
     def action_delete_selected(self) -> None:
         table = self.query_one(DataTable)

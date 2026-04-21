@@ -1,6 +1,12 @@
-"""Thin wrappers around the voxtype CLI and the running daemon."""
+"""Thin wrappers around the voxtype CLI and the running daemon.
+
+Sync versions (`is_daemon_active`, `restart_daemon`) are called from scripts
+and tests. Async versions (`*_async`) wrap them via `asyncio.to_thread` so the
+Textual event loop stays responsive while systemctl is doing its thing.
+"""
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
@@ -48,3 +54,11 @@ def restart_daemon() -> tuple[bool, str]:
     if result.returncode == 0:
         return True, "voxtype restarted"
     return False, (result.stderr or result.stdout).strip() or "restart failed"
+
+
+async def is_daemon_active_async() -> bool:
+    return await asyncio.to_thread(is_daemon_active)
+
+
+async def restart_daemon_async() -> tuple[bool, str]:
+    return await asyncio.to_thread(restart_daemon)

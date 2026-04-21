@@ -27,7 +27,10 @@ def tmp_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     side = tmp_path / "metadata.json"
     shutil.copy(FIXTURES / "stock.toml", cfg)
     # Pretend the daemon is inactive → skip restart modal in save flow
+    async def _inactive():
+        return False
     monkeypatch.setattr(voxtype_cli, "is_daemon_active", lambda: False)
+    monkeypatch.setattr(voxtype_cli, "is_daemon_active_async", _inactive)
     return cfg, side
 
 
@@ -118,7 +121,10 @@ async def test_reconcile_banner_shows_for_orphaned_sidecar(tmp_path: Path, monke
              "added_at": "2026-01-01T00:00:00+00:00"}
         ],
     }))
+    async def _inactive():
+        return False
     monkeypatch.setattr(voxtype_cli, "is_daemon_active", lambda: False)
+    monkeypatch.setattr(voxtype_cli, "is_daemon_active_async", _inactive)
 
     app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
     async with app.run_test() as pilot:

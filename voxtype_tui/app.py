@@ -18,6 +18,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Input, Label, Static, TabbedContent, TabPane
 
 from . import config, sidecar, voxtype_cli
+from .dictionary import DictionaryPane
 from .state import AppState
 from .vocabulary import VocabularyPane
 
@@ -173,11 +174,6 @@ class ConfirmQuitModal(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class DictionaryPane(Vertical):
-    def compose(self) -> ComposeResult:
-        yield Static("Dictionary tab — coming soon.")
-
-
 class SettingsPane(Vertical):
     def compose(self) -> ComposeResult:
         yield Static("Settings tab — coming soon.")
@@ -260,6 +256,8 @@ class VoxtypeTUI(App[None]):
         # Give each tab a chance to resync to the freshly-loaded state.
         for pane in self.query(VocabularyPane):
             pane.sync_from_state()
+        for pane in self.query(DictionaryPane):
+            pane.sync_from_state()
 
     def refresh_dirty(self) -> None:
         widget = self.query_one("#dirty", Static)
@@ -284,27 +282,33 @@ class VoxtypeTUI(App[None]):
     def action_switch_tab(self, tab_id: str) -> None:
         tabs = self.query_one("#tabs", TabbedContent)
         # Textual reverts `active` if the focused widget still lives in the
-        # previous pane. Clear focus first, then point it inside the target
-        # pane (if there's anything focusable there).
+        # previous pane. Clear focus first, then point it at the target pane's
+        # main navigation surface. Prefer a DataTable — landing on an Input
+        # would make digit keys insert text instead of switching tabs.
         self.set_focus(None)
         tabs.active = tab_id
         try:
+            from textual.widgets import DataTable
             pane = tabs.get_pane(tab_id)
+            tables = list(pane.query(DataTable))
+            if tables:
+                self.set_focus(tables[0])
+                return
             for w in pane.query("*"):
-                if getattr(w, "can_focus", False):
+                if getattr(w, "can_focus", False) and not isinstance(w, Input):
                     self.set_focus(w)
-                    break
+                    return
         except Exception:
             pass
 
-    def action_save(self) -> None:
+    async def action_save(self) -> None:
         if self.state is None:
             return
         if not self.state.dirty:
             self.notify("Nothing to save")
             return
         try:
-            restart_fields = self.state.save()
+            restart_fields = await self.state.save_async()
         except config.ValidationError as e:
             self.notify(
                 f"Save rejected by voxtype:\n{e}",
@@ -317,11 +321,13 @@ class VoxtypeTUI(App[None]):
             self.notify(f"Save failed: {e}", severity="error", timeout=10)
             return
         self.refresh_dirty()
-        if restart_fields and voxtype_cli.is_daemon_active():
-            def after(do_restart: bool | None) -> None:
+        daemon_active = await voxtype_cli.is_daemon_active_async()
+        if restart_fields and daemon_active:
+            async def after(do_restart: bool | None) -> None:
                 if not do_restart:
                     return
-                ok, msg = voxtype_cli.restart_daemon()
+                self.notify("Restarting voxtype…", timeout=3)
+                ok, msg = await voxtype_cli.restart_daemon_async()
                 self.notify(
                     msg,
                     severity="information" if ok else "error",

@@ -6,6 +6,7 @@ source of truth — the sidecar only decorates it.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
@@ -49,6 +50,18 @@ def validate_with_voxtype(path: Path, timeout: float = 10.0) -> tuple[bool, str]
     if result.returncode == 0:
         return True, ""
     return False, (result.stderr or result.stdout).strip()
+
+
+async def safe_save_async(
+    doc: TOMLDocument,
+    path: Path = CONFIG_PATH,
+    *,
+    validate: bool = True,
+    backup: bool = True,
+) -> None:
+    """Non-blocking equivalent of safe_save. Use from Textual/async contexts.
+    The validation subprocess runs on a worker thread via asyncio.to_thread."""
+    await asyncio.to_thread(safe_save, doc, path, validate=validate, backup=backup)
 
 
 def safe_save(

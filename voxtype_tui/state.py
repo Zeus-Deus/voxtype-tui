@@ -6,6 +6,7 @@ the baseline (`loaded_dump`) is captured at load time and only updated on save.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -89,21 +90,54 @@ class AppState:
         return True
 
     def upsert_replacement(self, from_text: str, to_text: str, category: str) -> None:
+        """Insert or update a replacement. Fires `config_dirty` only if the
+        on-disk (from, to) actually changed — category-only edits leave the
+        config untouched and flip only `sidecar_dirty`."""
         if category not in sidecar.CATEGORIES:
             category = sidecar.DEFAULT_CATEGORY
         reps = config.get_replacements(self.doc)
-        reps[from_text] = to_text
-        config.set_replacements(self.doc, reps)
+        if reps.get(from_text) != to_text:
+            reps[from_text] = to_text
+            config.set_replacements(self.doc, reps)
+            self.config_dirty = True
         for r in self.sc.replacements:
             if r.from_text == from_text:
-                r.category = category
+                if r.category != category:
+                    r.category = category
+                    self.sidecar_dirty = True
                 break
         else:
             self.sc.replacements.append(
                 sidecar.ReplacementEntry(from_text=from_text, category=category)
             )
-        self.config_dirty = True
-        self.sidecar_dirty = True
+            self.sidecar_dirty = True
+
+    def set_replacement_category(self, from_text: str, category: str) -> bool:
+        """Sidecar-only category change. Returns True if category actually
+        changed, False if it was already that category or the entry doesn't
+        exist. Never touches config.toml."""
+        if category not in sidecar.CATEGORIES:
+            return False
+        for r in self.sc.replacements:
+            if r.from_text == from_text:
+                if r.category == category:
+                    return False
+                r.category = category
+                self.sidecar_dirty = True
+                return True
+        return False
+
+    def cycle_replacement_category(self, from_text: str) -> str | None:
+        """Advance a replacement's category to the next in CATEGORIES (wraps).
+        Returns the new category name, or None if the entry doesn't exist."""
+        for r in self.sc.replacements:
+            if r.from_text == from_text:
+                idx = sidecar.CATEGORIES.index(r.category) if r.category in sidecar.CATEGORIES else 0
+                new_cat = sidecar.CATEGORIES[(idx + 1) % len(sidecar.CATEGORIES)]
+                r.category = new_cat
+                self.sidecar_dirty = True
+                return new_cat
+        return None
 
     def remove_replacement(self, from_text: str) -> bool:
         reps = config.get_replacements(self.doc)
@@ -131,7 +165,11 @@ class AppState:
 
     def save(self) -> list[str]:
         """Persist both files. Returns the list of restart-sensitive paths
-        that changed since the last load/save (empty if none)."""
+        that changed since the last load/save (empty if none).
+
+        Sync version — runs `voxtype -c <tmp> config` on the calling thread.
+        Use `save_async` from Textual / async contexts to keep the event loop
+        responsive while validation runs."""
         baseline_doc = tomlkit.parse(self.loaded_dump)
         config.safe_save(self.doc, self.config_path)
         sidecar.save_atomic(self.sc, self.sidecar_path)
@@ -140,3 +178,6 @@ class AppState:
         self.config_dirty = False
         self.sidecar_dirty = False
         return restart_fields
+
+    async def save_async(self) -> list[str]:
+        return await asyncio.to_thread(self.save)

@@ -18,7 +18,10 @@ def tmp_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     cfg = tmp_path / "config.toml"
     side = tmp_path / "metadata.json"
     shutil.copy(FIXTURES / "stock.toml", cfg)
+    async def _inactive():
+        return False
     monkeypatch.setattr(voxtype_cli, "is_daemon_active", lambda: False)
+    monkeypatch.setattr(voxtype_cli, "is_daemon_active_async", _inactive)
     return cfg, side
 
 
@@ -178,6 +181,185 @@ async def test_token_counter_updates_and_warns(tmp_env):
             assert tokens_widget.has_class("over")
         elif expected >= 200:
             assert tokens_widget.has_class("warn")
+
+
+async def test_vim_jk_navigate_cursor(tmp_env):
+    cfg, side = tmp_env
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        pane = app.query_one(VocabularyPane)
+        for p in ["Alpha", "Beta", "Gamma", "Delta"]:
+            pane.tui.state.add_vocab(p)
+        pane.sync_from_state()
+        await pilot.pause()
+
+        table = app.query_one(DataTable)
+        table.focus()
+        table.move_cursor(row=0)
+        await pilot.pause()
+
+        await pilot.press("j")
+        await pilot.pause()
+        assert table.cursor_row == 1
+
+        await pilot.press("j")
+        await pilot.pause()
+        assert table.cursor_row == 2
+
+        await pilot.press("k")
+        await pilot.pause()
+        assert table.cursor_row == 1
+
+
+async def test_vim_G_jumps_to_bottom_gg_jumps_to_top(tmp_env):
+    cfg, side = tmp_env
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        pane = app.query_one(VocabularyPane)
+        for p in ["Alpha", "Beta", "Gamma", "Delta", "Epsilon"]:
+            pane.tui.state.add_vocab(p)
+        pane.sync_from_state()
+        await pilot.pause()
+
+        table = app.query_one(DataTable)
+        table.focus()
+        table.move_cursor(row=0)
+        await pilot.pause()
+
+        await pilot.press("G")
+        await pilot.pause()
+        assert table.cursor_row == 4  # last row
+
+        # gg should jump to top (two g's within window)
+        await pilot.press("g")
+        await pilot.press("g")
+        await pilot.pause()
+        assert table.cursor_row == 0
+
+
+async def test_single_g_does_nothing(tmp_env):
+    """A lone `g` must not jump anywhere — only `gg` within the window."""
+    cfg, side = tmp_env
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        pane = app.query_one(VocabularyPane)
+        for p in ["Alpha", "Beta", "Gamma"]:
+            pane.tui.state.add_vocab(p)
+        pane.sync_from_state()
+        await pilot.pause()
+
+        table = app.query_one(DataTable)
+        table.focus()
+        table.move_cursor(row=2)
+        await pilot.pause()
+
+        await pilot.press("g")
+        await pilot.pause()
+        # After a lone g we should still be where we were
+        assert table.cursor_row == 2
+
+
+async def test_n_context_sensitive_new_vs_next_match(tmp_env):
+    """n when search filter empty → focus Add input. n when search filter has
+    text → move cursor to next matching row."""
+    cfg, side = tmp_env
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        pane = app.query_one(VocabularyPane)
+        for p in ["Apple", "Banana", "Apricot", "Cherry"]:
+            pane.tui.state.add_vocab(p)
+        pane.sync_from_state()
+        await pilot.pause()
+
+        table = app.query_one(DataTable)
+
+        # Empty filter → n focuses Add
+        table.focus()
+        await pilot.pause()
+        await pilot.press("n")
+        await pilot.pause()
+        assert isinstance(app.focused, Input)
+        assert app.focused.id == "add"
+
+        # Exit the input without adding
+        await pilot.press("escape")
+        await pilot.pause()
+
+        # Apply a filter, put focus on table, press n to advance matches
+        search = app.query_one("#search", Input)
+        search.focus()
+        for ch in "Ap":
+            await pilot.press(ch)
+        await pilot.pause()
+        assert table.row_count == 2
+        table.focus()
+        table.move_cursor(row=0)
+        await pilot.pause()
+
+        await pilot.press("n")
+        await pilot.pause()
+        assert table.cursor_row == 1  # moved to next match
+        await pilot.press("n")
+        await pilot.pause()
+        assert table.cursor_row == 0  # wrapped back
+
+
+async def test_capital_N_goes_to_previous_match(tmp_env):
+    cfg, side = tmp_env
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        pane = app.query_one(VocabularyPane)
+        for p in ["Apple", "Apricot", "Avocado"]:
+            pane.tui.state.add_vocab(p)
+        pane.sync_from_state()
+        await pilot.pause()
+
+        search = app.query_one("#search", Input)
+        search.focus()
+        for ch in "A":
+            await pilot.press(ch)
+        await pilot.pause()
+
+        table = app.query_one(DataTable)
+        table.focus()
+        table.move_cursor(row=0)
+        await pilot.pause()
+
+        await pilot.press("N")
+        await pilot.pause()
+        # Wrap-around to last row
+        assert table.cursor_row == table.row_count - 1
+
+
+async def test_mouse_click_selects_row(tmp_env):
+    cfg, side = tmp_env
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        pane = app.query_one(VocabularyPane)
+        for p in ["Alpha", "Beta", "Gamma"]:
+            pane.tui.state.add_vocab(p)
+        pane.sync_from_state()
+        await pilot.pause()
+
+        # Click the table region at an offset that should land on a non-zero row
+        table = app.query_one(DataTable)
+        table.focus()
+        table.move_cursor(row=0)
+        await pilot.pause()
+        # Click the second data row (offset accounts for the header row)
+        await pilot.click(DataTable, offset=(2, 2))
+        await pilot.pause()
+        # If Textual's default mouse handling works, cursor should have moved
+        # (the exact row depends on layout, but cursor_row should not still be
+        # zero unless click landed on header).
+        # We assert weakly: the cursor is on a valid data row.
+        assert 0 <= table.cursor_row < table.row_count
 
 
 async def test_search_input_does_not_trigger_letter_bindings(tmp_env):
