@@ -4,10 +4,17 @@ Scripts assume voxtype-tui is already on PATH (AUR / pipx install), so each
 test provides a sandbox PATH containing a stub `voxtype-tui` binary. The
 "missing from PATH" test omits it to verify the exit-1 guard. `hyprctl` is
 deliberately absent so the scripts' reload branch always no-ops.
+
+PATH is deliberately NOT `/usr/bin:/bin` — a dev machine that has the AUR
+package installed would leak `/usr/bin/voxtype-tui` into the sandbox and
+the missing-from-PATH guard test would falsely pass the `command -v`
+check. Instead we build a minimal symlink farm with only the utilities
+the scripts actually need (`grep`, `cat`, `awk`, `mktemp`, `mv`).
 """
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -16,6 +23,12 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 INSTALL = REPO / "scripts" / "install-omarchy.sh"
 UNINSTALL = REPO / "scripts" / "uninstall-omarchy.sh"
+
+# Utilities the install/uninstall scripts invoke. Anything that doesn't
+# resolve via `shutil.which` at test time is skipped silently — if `awk`
+# isn't on the CI box the uninstall test will fail loudly and that's the
+# intended signal.
+_SANDBOX_TOOLS = ("grep", "cat", "awk", "mktemp", "mv", "bash", "sh")
 
 
 def _make_stub_voxtype_tui(dest: Path) -> Path:
@@ -26,6 +39,22 @@ def _make_stub_voxtype_tui(dest: Path) -> Path:
     stub.write_text("#!/usr/bin/env bash\necho stub\n")
     stub.chmod(0o755)
     return stub
+
+
+def _build_sandbox_path(home: Path) -> Path:
+    """Symlink the whitelist of utilities into $HOME/.sandbox_bin so the
+    scripts can run grep/awk/etc. without `/usr/bin` leaking a real
+    voxtype-tui from an AUR install on the dev's machine."""
+    sandbox_bin = home / ".sandbox_bin"
+    sandbox_bin.mkdir(parents=True, exist_ok=True)
+    for tool in _SANDBOX_TOOLS:
+        resolved = shutil.which(tool)
+        if resolved is None:
+            continue
+        link = sandbox_bin / tool
+        if not link.exists():
+            link.symlink_to(resolved)
+    return sandbox_bin
 
 
 @pytest.fixture
@@ -52,11 +81,12 @@ def run(
     *,
     include_stub: bool = True,
 ) -> subprocess.CompletedProcess:
-    """Run a script with HOME pointed at the sandbox. PATH is a minimal list
-    that optionally includes $HOME/.local/bin so the voxtype-tui stub is
-    discoverable. Omit the stub by passing include_stub=False to exercise the
-    missing-from-PATH guard."""
-    path_parts = ["/usr/bin", "/bin"]
+    """Run a script with HOME pointed at the sandbox. PATH is a minimal
+    symlink farm (see _build_sandbox_path) plus optionally
+    $HOME/.local/bin with the voxtype-tui stub. Omit the stub by passing
+    include_stub=False to exercise the missing-from-PATH guard."""
+    sandbox_bin = _build_sandbox_path(home)
+    path_parts = [str(sandbox_bin)]
     if include_stub:
         path_parts.insert(0, str(home / ".local" / "bin"))
     env = {
