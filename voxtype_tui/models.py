@@ -427,6 +427,11 @@ class ModelsPane(VimTableNav, Vertical):
         self.tui.state.set_setting(path, name)
         self.tui.refresh_dirty()
         self.refresh_table()
+        # Settings tab's Model dropdown is hydrated only on mount / reload, so
+        # nudge it now — otherwise it shows a stale value until ctrl+r.
+        from .settings import SettingsPane
+        for pane in self.app.query(SettingsPane):
+            pane.sync_from_state()
         self.app.notify(f"'{name}' marked active (ctrl+s to save)", timeout=3)
 
     def _action_download(self) -> None:

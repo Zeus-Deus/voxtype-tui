@@ -961,6 +961,12 @@ class SettingsPane(VerticalScroll):
         if self.tui.state is None:
             return
         self.tui.state.set_setting(MODEL_PATH_PER_ENGINE[engine], model)
+        # Models tab's ● active-mark is only re-rendered by refresh_table;
+        # without this nudge it keeps pointing at the old row until ctrl+r.
+        # Lazy import: settings ↔ models would otherwise be circular.
+        from .models import ModelsPane
+        for pane in self.app.query(ModelsPane):
+            pane.sync_from_state()
 
     # --- actions ---
 

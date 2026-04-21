@@ -471,6 +471,78 @@ async def test_download_progress_updates_live_not_at_end(tmp_env):
     assert ascending_order == [10.0, 45.0, 80.0, 100.0]
 
 
+async def test_set_active_syncs_settings_model_dropdown(tmp_env):
+    """Regression: setting a model in the Models tab must also refresh the
+    Settings tab's Model dropdown — it used to stay pinned to whatever was
+    loaded at mount, so the user saw two tabs disagreeing about the active
+    model."""
+    cfg, side, models_dir = tmp_env
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Settings mounts first so its widgets are hydrated with stock's
+        # "base.en" before we touch the Models tab.
+        await pilot.press("3")
+        await pilot.pause()
+        from voxtype_tui.settings import SettingsPane
+        settings_pane = app.query_one(SettingsPane)
+        assert settings_pane.query_one("#settings-model", Select).value == "base.en"
+
+        await _goto_models(pilot, app)
+        pane = app.query_one(ModelsPane)
+        table = pane.query_one(DataTable)
+        for r in range(table.row_count):
+            if str(table.get_row_at(r)[0]) == "large-v3-turbo":
+                table.move_cursor(row=r)
+                break
+        await pilot.pause()
+
+        btn = pane.query_one("#models-set-active", Button)
+        btn.post_message(Button.Pressed(btn))
+        await pilot.pause()
+
+        # state updated
+        assert str(app.state.doc["whisper"]["model"]) == "large-v3-turbo"
+        # Settings dropdown tracked the change without needing ctrl+r
+        assert (
+            settings_pane.query_one("#settings-model", Select).value
+            == "large-v3-turbo"
+        )
+
+
+async def test_settings_model_change_syncs_models_tab_active_mark(tmp_env):
+    """Reverse direction: editing the Model dropdown in Settings must move
+    the ● active-mark in the Models tab's table without requiring a reload."""
+    cfg, side, models_dir = tmp_env
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Prime the Models tab so its DataTable exists.
+        await _goto_models(pilot, app)
+        models_pane = app.query_one(ModelsPane)
+        table = models_pane.query_one(DataTable)
+
+        # Stock config has base.en active
+        def active_row_name() -> str | None:
+            for r in range(table.row_count):
+                row = table.get_row_at(r)
+                if "●" in str(row[3]):
+                    return str(row[0])
+            return None
+        assert active_row_name() == "base.en"
+
+        # Switch to Settings and change the Model
+        await pilot.press("3")
+        await pilot.pause()
+        from voxtype_tui.settings import SettingsPane
+        settings_pane = app.query_one(SettingsPane)
+        settings_pane.query_one("#settings-model", Select).value = "small"
+        await pilot.pause()
+
+        # ● follows without a reload
+        assert active_row_name() == "small"
+
+
 async def test_disk_usage_reflects_file_sizes(tmp_env):
     cfg, side, models_dir = tmp_env
     (models_dir / "ggml-tiny.en.bin").write_bytes(b"x" * (5 * 1024 * 1024))
