@@ -213,6 +213,43 @@ class AppState:
         self.sidecar_dirty = True
         return True
 
+    def unset_setting(self, path: str) -> bool:
+        """Remove a dotted config path from the doc.
+
+        Returns True if a key was actually removed (dirty flipped),
+        False when the key didn't exist (no-op, no dirty change).
+        Cleans up empty parent tables so a lone ``[whisper] language``
+        removal doesn't leave an empty ``[whisper]`` block.
+
+        Companion to :meth:`set_setting`. Needed because Voxtype's
+        defaults only kick in when a key is **absent** — setting a
+        field to the empty string doesn't trigger the default. So
+        "revert this field to voxtype's default" means "delete the
+        key", which the UI needs a way to do.
+        """
+        parts = path.split(".")
+        node = self.doc
+        chain: list[tuple[object, str]] = []
+        for p in parts[:-1]:
+            if p not in node:
+                return False
+            chain.append((node, p))
+            node = node[p]
+        key = parts[-1]
+        if key not in node:
+            return False
+        del node[key]
+        # Unwind empty parent tables so a removed leaf doesn't leave
+        # behind an orphan `[whisper]` header.
+        for parent, child_key in reversed(chain):
+            child = parent[child_key]
+            if hasattr(child, "__len__") and len(child) == 0:
+                del parent[child_key]
+            else:
+                break
+        self.config_dirty = True
+        return True
+
     def set_setting(self, path: str, value: object) -> None:
         """Idempotent set of any dotted config path.
 

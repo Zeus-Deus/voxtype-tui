@@ -213,7 +213,12 @@ class SettingsPane(VerticalScroll):
             with Horizontal(classes="field-row"):
                 yield Label("Language", classes="label")
                 yield Input(
-                    placeholder="en, auto, de, fr, …",
+                    # Intentionally NOT listing sample non-English codes
+                    # here — users have typed them in thinking they were
+                    # selectable options (see git blame for the fr
+                    # incident). The placeholder points at the help
+                    # instead.
+                    placeholder="leave blank for English · see voxtype --help for codes",
                     id="settings-language",
                 )
 
@@ -713,7 +718,13 @@ class SettingsPane(VerticalScroll):
             if value:
                 self.tui.state.set_setting("whisper.language", value)
             else:
-                return
+                # Empty input → remove the key entirely. Previously we
+                # returned without touching state, which meant users
+                # could never un-set a language via the TUI — a stuck
+                # `language = "fr"` was impossible to clear. With
+                # unset, clearing the field reverts to Voxtype's
+                # default ("en").
+                self.tui.state.unset_setting("whisper.language")
             self.tui.refresh_dirty()
         elif event.input.id == "settings-hotkey-key":
             value = event.value.strip()
