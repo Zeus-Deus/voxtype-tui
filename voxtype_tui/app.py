@@ -857,7 +857,46 @@ class VoxtypeTUI(App[None]):
 
 
 def main() -> None:
-    VoxtypeTUI().run()
+    import sys
+    if "--apply-migrations" in sys.argv[1:]:
+        from .cli_migrate import main as migrate_main
+        sys.exit(migrate_main(sys.argv[1:]))
+    app = VoxtypeTUI()
+    app.run()
+    _restart_daemon_on_exit_if_needed(app)
+
+
+def _restart_daemon_on_exit_if_needed(app: "VoxtypeTUI") -> None:
+    """Auto-restart the voxtype daemon after the TUI exits, if and only if
+    the user saved any config.toml change during this session.
+
+    Rationale: Voxtype caches its config into memory at daemon start
+    (``src/text/mod.rs:27-40`` + ``src/daemon.rs`` Daemon::new), so any
+    config write sits dormant until the daemon reloads. The in-TUI pill
+    + Ctrl+Shift+R path handles the immediate-feedback case; this hook
+    handles the "user tweaked five settings and closed the TUI without
+    clicking the pill" case. Sidecar-only edits (category flips, notes)
+    don't trigger — the post_process CLI re-reads metadata.json on every
+    transcription, no restart needed.
+
+    Spawns the restart synchronously but with a short timeout so the
+    shell prompt returns fast (~500ms typical). A one-line notice tells
+    the user what happened — silent auto-actions without a paper trail
+    are unfriendly. Failures print but don't propagate (user already
+    closed the UI; we don't want to crash on the way out).
+    """
+    state = getattr(app, "state", None)
+    if state is None or not state.daemon_stale:
+        return
+    if not voxtype_cli.is_daemon_active():
+        return
+    print("voxtype-tui: restarting voxtype daemon…")
+    ok, msg = voxtype_cli.restart_daemon()
+    if ok:
+        print("voxtype-tui: voxtype daemon restarted.")
+    else:
+        print(f"voxtype-tui: daemon restart failed: {msg}")
+        print("voxtype-tui: run 'systemctl --user restart voxtype' manually.")
 
 
 if __name__ == "__main__":

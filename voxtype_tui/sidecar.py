@@ -24,6 +24,14 @@ from typing import Iterable
 
 SIDECAR_PATH = Path.home() / ".config" / "voxtype-tui" / "metadata.json"
 
+# Current sidecar schema. Bumped in lockstep with any new entry in
+# `migrations.MIGRATIONS`. Files on disk tagged with a lower version
+# trigger pending migrations on load; fresh (in-memory) sidecars start
+# at this version so there's nothing to migrate for a brand-new install.
+# The "missing version field" fallback stays at 1 to catch pre-migration
+# sidecars written before this field was added.
+SCHEMA_VERSION = 2
+
 CATEGORIES: tuple[str, ...] = ("Replacement", "Capitalization")
 DEFAULT_CATEGORY = "Replacement"
 
@@ -58,16 +66,18 @@ class ReplacementEntry:
 class Sidecar:
     vocabulary: list[VocabEntry] = field(default_factory=list)
     replacements: list[ReplacementEntry] = field(default_factory=list)
-    version: int = 1
+    version: int = SCHEMA_VERSION
 
 
 def load(path: Path = SIDECAR_PATH) -> Sidecar:
     if not path.exists():
-        return Sidecar()
+        # Brand-new install — no on-disk history to migrate. Start at
+        # the current schema so migration runs short-circuit.
+        return Sidecar(version=SCHEMA_VERSION)
     try:
         data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
-        return Sidecar()
+        return Sidecar(version=SCHEMA_VERSION)
     vocab = [VocabEntry(**v) for v in data.get("vocabulary", [])]
     reps: list[ReplacementEntry] = []
     for r in data.get("replacements", []):

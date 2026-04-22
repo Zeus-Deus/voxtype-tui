@@ -22,6 +22,7 @@ optdepends=(
     'libpulse: audio device enumeration via pactl'
     'systemd: daemon restart prompts via systemctl --user'
 )
+install=voxtype-tui.install
 source=("$pkgname-$pkgver.tar.gz::https://github.com/Zeus-Deus/voxtype-tui/archive/v$pkgver.tar.gz")
 sha256sums=('1539bb5597ed1b24dcb6eb66c8d8ad4e7c555dee2292484ed6b8701a500dd3c2')
 

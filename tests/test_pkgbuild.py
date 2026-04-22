@@ -89,6 +89,30 @@ def test_pkgbuild_uses_python_build_flow() -> None:
     assert "python -m installer --destdir=" in text
 
 
+def test_pkgbuild_declares_install_hook() -> None:
+    """PKGBUILD must reference the pacman .install hook so users see the
+    post-upgrade notice telling them how updates take effect."""
+    text = PKGBUILD.read_text()
+    assert "install=voxtype-tui.install" in text
+
+
+def test_install_hook_exists_and_has_required_functions() -> None:
+    """The .install file must define post_install / post_upgrade. Without
+    them, pacman silently no-ops and users never see the upgrade notice.
+
+    Lives at repo root next to PKGBUILD — pacman's `install=` directive
+    can only reference a file in the same directory as PKGBUILD, not a
+    sub-path. AUR publish script copies it over alongside PKGBUILD."""
+    hook = REPO / "voxtype-tui.install"
+    assert hook.exists()
+    text = hook.read_text()
+    assert "post_install()" in text
+    assert "post_upgrade()" in text
+    # The notice must mention the CLI one-liner so power users have an
+    # explicit path to apply migrations without opening the TUI.
+    assert "voxtype-tui --apply-migrations" in text
+
+
 def test_desktop_file_basic_shape() -> None:
     desktop = REPO / "contrib" / "voxtype-tui.desktop"
     assert desktop.exists()

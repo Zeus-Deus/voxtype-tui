@@ -47,16 +47,19 @@ Our UI manages it as a **list of words/phrases**; on save we serialize to a comm
 
 Note: Whisper's initial prompt is capped at ~224 tokens. The UI should show a running token count and warn when the list is close to the limit.
 
-### Dictionary → Replacement / Commands / Capitalization → `[text] replacements`
+### Dictionary → Replacement / Commands / Capitalization → `[text] replacements` + `[output.post_process]`
 
-Voxtype has exactly one replacement map:
-```toml
-[text]
-replacements = { "vox type" = "voxtype", "cloud code" = "Claude Code", "slash codemux release" = "/codemux-release" }
-```
-Case-insensitive by default. All three Vexis categories collapse into this map — **we preserve the category as our own metadata** (sidecar file) and apply it as a UI-only tag. On disk, Voxtype just sees flat key→value pairs.
+Two layers run against every transcript:
 
-If the user wants smarter logic than literal replacements (e.g. contextual capitalization, regex), we can optionally generate a `post_process_command` script. Keep this simple for v1: literal replacements only.
+1. **Voxtype native** — `[text] replacements = { "vox type" = "voxtype", …}` is a flat case-insensitive `\b`-bounded map applied inside the Voxtype daemon (`src/text/mod.rs`). Fast, but limited to literal triggers with ASCII word boundaries.
+
+2. **voxtype-tui post-processor (Vexis-parity)** — when the sidecar has any rules, saves wire `[output.post_process] command = "voxtype-tui-postprocess"`. The CLI (`voxtype_tui.cli_postprocess`) re-reads the sidecar on every transcription and runs a two-stage engine (`voxtype_tui.dictionary_engine`):
+   - **Stage 1 (Fuzzy replacements)** — Whisper-aware bounded-gap regex. One trigger `"slash codemux release"` matches `slash codemux release`, `/codemux release`, `/codemuxrelease`, `/codemux-release`, `/codemuxapi-release`, etc. Command-phrase atoms (`slash` → `(?:slash|/)` etc.) match both spoken and auto-formatted forms.
+   - **Stage 2 (Exact capitalization)** — strict whole-token match with Unicode neighbor-char boundaries (handles `c++`, `.net`). Runs after replacements so proper-noun casing gets fixed post-hoc.
+
+Sidecar holds category + `to_text`. Config.toml `[text] replacements` mirrors Replacement-category rules as a native-layer fallback (if `voxtype-tui-postprocess` is missing, Voxtype's own literal pass still catches them).
+
+Vexis's Stage 2 (built-in spoken-command expansion) is intentionally skipped — Voxtype's `spoken_punctuation` already handles `slash → /`, `hash → #`, etc.
 
 ### Settings tab → direct config keys
 
@@ -231,11 +234,23 @@ Our own format is detected via the `format: "voxtype-tui-bundle"` tag.
 Commit between each step. No step touches the daemon without explicit
 user action.
 
+## Schema migrations + update propagation
+
+New releases can ship with schema changes (e.g. "enable the post-process CLI for any existing install that has rules"). Three triggers all funnel into one pure function — `migrations.run_pending(doc, sc)` — so a new feature only needs ONE place to wire an auto-activation:
+
+1. **TUI startup** — `AppState.load()` runs pending migrations after reconcile, sets `config_dirty`/`daemon_stale` so the next save + exit picks them up.
+2. **Headless CLI** — `voxtype-tui --apply-migrations` (implemented in `cli_migrate.py`, dispatched from `app.main()` before Textual boots). Loads state, runs migrations, saves, restarts the daemon. Idempotent. Intended for power users and the AUR post-install hook.
+3. **AUR pacman hook** — `voxtype-tui.install` (at repo root, referenced via `install=voxtype-tui.install` in PKGBUILD). Shown to users on install/upgrade; tells them migrations will apply on next TUI launch and offers the CLI one-liner for immediate activation. The hook does NOT invoke anything itself (it runs as root and can't touch per-user config + user systemd service reliably).
+
+**Schema version**: `sidecar.SCHEMA_VERSION` (int, currently `2`). Fresh in-memory sidecars start at SCHEMA_VERSION so they skip pending migrations; file-loaded sidecars use whatever version the file declares (default `1` for pre-migration-era sidecars). Migrations advance `sc.version` even when no individual migration had visible work — the version is the claim "every migration up to N has been considered".
+
+**Adding a migration**: append to `migrations.MIGRATIONS` with `target_version = SCHEMA_VERSION + 1`, bump `SCHEMA_VERSION`, add a test. The migration function is idempotent by contract and takes `(doc, sc)` → returns `True` when it changed anything.
+
 ## Non-goals
 
 - **Do not fork Voxtype.** Use it as-is.
 - **Do not reimplement Whisper / STT.** That's Voxtype's job.
-- **Do not auto-restart the Voxtype daemon** on every tiny config change — batch changes and only restart when a field that requires it is touched (hotkey, engine, model).
+- **Do not auto-restart the Voxtype daemon mid-session.** Voxtype reads its config into memory at daemon start (`src/daemon.rs` → `Daemon::new`, `src/text/mod.rs:27-40`), so ANY `~/.config/voxtype/config.toml` write needs a restart — not just the narrow `RESTART_SENSITIVE_PATHS` list. But rapid-fire restarts during a settings session would interrupt the hotkey listener and thrash audio capture. So: in-session we only set the `daemon_stale` pill (manual `Ctrl+Shift+R` still available); on TUI exit, `_restart_daemon_on_exit_if_needed` silently restarts via `systemctl --user restart voxtype` with a one-line terminal notice. Sidecar-only edits (category flips, notes) never trigger — the post-process CLI re-reads metadata.json on every transcription.
 - **Do not write to `~/.config/voxtype/config.toml` destructively.** Always read → merge → write. Preserve user comments if possible (use a comment-preserving TOML library).
 - **Do not auto-sync secrets.** `whisper.remote_api_key` and all `*_command` fields are stripped from every auto-sync write and only appear in manually-exported bundles when the user explicitly toggles Include-secrets.
 - **Do not trust wall-clock timestamps** for staleness compares. `local_sync_hash` is authoritative; `generated_at` is display-only.

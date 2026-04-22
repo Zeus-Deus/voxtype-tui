@@ -14,7 +14,7 @@ from pathlib import Path
 import tomlkit
 from tomlkit import TOMLDocument
 
-from . import config, sidecar, sync
+from . import config, migrations, sidecar, sync
 
 _logger = logging.getLogger(__name__)
 
@@ -49,6 +49,10 @@ class AppState:
     # restarting the TUI itself re-derives from scratch on load.
     daemon_stale: bool = False
     reconcile_warnings: list[str] = field(default_factory=list)
+    # Migrations that ran during load. Surfaced in the app's startup
+    # banner so the user knows what changed on their behalf — empty list
+    # means the session started with a clean, already-current schema.
+    migrations_applied: list[str] = field(default_factory=list)
     # Populated at load time. Banners in the app shell read this to
     # decide what to surface (conflict files, applied-from device,
     # missing model). Defaults to an empty result; same shape no matter
@@ -74,13 +78,26 @@ class AppState:
 
         sc = sidecar.Sidecar(vocabulary=vocab, replacements=reps, version=raw_sc.version)
 
+        # Apply pending schema migrations. Runs AFTER reconcile so
+        # migrations see the post-reconcile shape (e.g. new rules
+        # discovered from config.toml are eligible to trigger the
+        # enable_postprocess migration). Runs BEFORE the sync reader so
+        # the sync bundle uses the migrated config shape.
+        migration_result = migrations.run_pending(doc, sc)
+        config_dirty_from_migrations = migration_result.touches_config
+        sidecar_dirty_from_migrations = migration_result.new_version != raw_sc.version
+
         # If reconcile changed the sidecar, mark it dirty so the next save
         # persists the corrections.
         raw_cats = [(r.from_text, r.category) for r in raw_sc.replacements]
         new_cats = [(r.from_text, r.category) for r in sc.replacements]
         raw_vocab = [v.phrase for v in raw_sc.vocabulary]
         new_vocab = [v.phrase for v in sc.vocabulary]
-        sidecar_dirty = raw_cats != new_cats or raw_vocab != new_vocab
+        sidecar_dirty = (
+            raw_cats != new_cats
+            or raw_vocab != new_vocab
+            or sidecar_dirty_from_migrations
+        )
 
         # Startup sync reconcile. Mutates `doc` + `sc` in place when a
         # newer sync.json is applied (and writes them back to disk
@@ -100,8 +117,11 @@ class AppState:
             config_path=config_path,
             sidecar_path=sidecar_path,
             loaded_dump=tomlkit.dumps(doc),
+            config_dirty=config_dirty_from_migrations,
             sidecar_dirty=sidecar_dirty,
+            daemon_stale=config_dirty_from_migrations,
             reconcile_warnings=w1 + w2,
+            migrations_applied=migration_result.applied,
             sync_reconcile=sync_result,
         )
 
@@ -257,6 +277,15 @@ class AppState:
         """
         self._ensure_post_process_enabled()
         baseline_doc = tomlkit.parse(self.loaded_dump)
+        # Capture whether this save carries any config.toml mutation.
+        # Used below to gate the broad `daemon_stale` flag — any config
+        # change requires a daemon restart because Voxtype reads its
+        # config once at daemon start (confirmed via `src/daemon.rs`
+        # and `src/text/mod.rs:27-40` caching into a HashMap). The
+        # narrow `restart_fields` list below still drives the modal's
+        # "these fields changed" message; the broad gate only drives
+        # the stale pill + exit-time auto-restart.
+        config_touched = self.config_dirty
         config.safe_save(self.doc, self.config_path)
         sidecar.save_atomic(self.sc, self.sidecar_path)
         # Both primary saves succeeded — derive and write the portable
@@ -270,7 +299,7 @@ class AppState:
         except OSError as e:
             _logger.warning("sync.json write failed: %s", e)
         restart_fields = config.diff_restart_sensitive(baseline_doc, self.doc)
-        if restart_fields:
+        if restart_fields or config_touched:
             self.daemon_stale = True
         self.loaded_dump = tomlkit.dumps(self.doc)
         self.config_dirty = False
