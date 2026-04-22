@@ -195,6 +195,8 @@ async def test_table_renders_catalog_with_downloaded_marks(tmp_env):
 
 async def test_set_active_writes_model_path_and_marks_dirty(tmp_env):
     cfg, side, models_dir = tmp_env
+    # Guard: Set Active requires the model file on disk.
+    (models_dir / "ggml-large-v3-turbo.bin").write_bytes(b"x" * 1000)
     app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -477,6 +479,8 @@ async def test_set_active_syncs_settings_model_dropdown(tmp_env):
     loaded at mount, so the user saw two tabs disagreeing about the active
     model."""
     cfg, side, models_dir = tmp_env
+    # Guard: Set Active requires the model file on disk.
+    (models_dir / "ggml-large-v3-turbo.bin").write_bytes(b"x" * 1000)
     app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
     async with app.run_test() as pilot:
         await pilot.pause()

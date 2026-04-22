@@ -53,11 +53,13 @@ MODELS_PER_ENGINE: dict[str, list[str]] = {
     "omnilingual": [],
 }
 
-# Where each engine stores its model name. Voxtype uses a different key for
-# parakeet (`model_type`); everything else uses plain `model`.
+# Where each engine stores its active-model name. All engines consistently
+# use `[<engine>].model` — verified against Voxtype `src/config.rs:982`
+# (ParakeetConfig.model — NOT model_type; the latter is a separate
+# "tdt" / "ctc" enum that auto-detects from the model directory).
 MODEL_PATH_PER_ENGINE: dict[str, str] = {
     "whisper": "whisper.model",
-    "parakeet": "parakeet.model_type",
+    "parakeet": "parakeet.model",
     "moonshine": "moonshine.model",
     "sensevoice": "sensevoice.model",
     "paraformer": "paraformer.model",

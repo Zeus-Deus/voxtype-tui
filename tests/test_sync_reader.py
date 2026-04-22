@@ -266,6 +266,11 @@ def test_reconcile_sync_newer_applies_and_persists(paths) -> None:
     paths["side"].write_text('{"version":1,"vocabulary":[],"replacements":[]}')
     _force_old_mtime(paths["cfg"])
     _force_old_mtime(paths["side"])
+    # Guard: the sync-reconcile model filter requires the incoming
+    # model to be installed locally. Pre-provision it so this test
+    # verifies the happy-path apply, not the filter's skip behavior.
+    paths["models"].mkdir(exist_ok=True)
+    (paths["models"] / "ggml-tiny.bin").write_bytes(b"x" * 100)
 
     _write_sync_bundle(
         paths["sync"],
@@ -402,8 +407,18 @@ def test_reconcile_flags_missing_model(paths) -> None:
         config_path=paths["cfg"], sidecar_path=paths["side"],
         sync_path=paths["sync"], models_dir=paths["models"],
     )
-    assert result.applied_from == "other"
+    # Post-guard behavior: the filter strips whisper.model (not
+    # installed), so there's nothing left to apply → noop_merge. But
+    # the missing-model banner still fires so the user can download
+    # it. This replaces the pre-guard behavior where we applied the
+    # uninstalled name to disk and let the daemon crash on restart.
     assert result.missing_model == "large-v3-turbo"
+    assert result.skipped_reason == "noop_merge"
+    # Local whisper.model must NOT have been overwritten with the
+    # uninstalled name — the whole point of the guard.
+    assert "model" not in (doc.get("whisper") or {}) or (
+        str(doc["whisper"]["model"]) != "large-v3-turbo"
+    )
 
 
 def test_reconcile_no_missing_model_when_present(paths) -> None:

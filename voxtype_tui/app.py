@@ -831,8 +831,24 @@ class VoxtypeTUI(App[None]):
     def _apply_missing_model_set_active(self, name: str | None) -> None:
         """Promote the downloaded model to active in the shadow state.
         The user still has to Ctrl+S to persist; RestartModal then
-        fires automatically because `whisper.model` is restart-sensitive."""
+        fires automatically because `whisper.model` is restart-sensitive.
+
+        Guarded: if the download subprocess finished but the file isn't
+        actually on disk (interrupted download, wrong URL, curl exited
+        non-zero, etc.), we refuse to set it active — that would leave
+        the daemon pointing at a missing file and fail at next restart.
+        """
         if self.state is None or not name:
+            return
+        from .models import is_model_installed
+        if not is_model_installed("whisper", name):
+            self.notify(
+                f"'{name}' didn't finish downloading — refusing to "
+                f"activate. Retry the download from the Models tab.",
+                title="Download incomplete",
+                severity="warning",
+                timeout=8,
+            )
             return
         self.state.set_setting("whisper.model", name)
         self.refresh_dirty()

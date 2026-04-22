@@ -1587,6 +1587,60 @@ def _model_file_present(model_name: str, models_dir: Path) -> bool:
     return (models_dir / f"ggml-{model_name}.bin").exists()
 
 
+# Engines whose `.model` field participates in sync. Kept here rather
+# than imported from `.models` to avoid the sync <-> models cycle
+# during startup; a mismatch would be caught by the drift test.
+_SYNCED_ENGINES: tuple[str, ...] = (
+    "whisper", "parakeet", "moonshine", "sensevoice",
+    "paraformer", "dolphin", "omnilingual",
+)
+
+
+def _filter_uninstalled_models(
+    bundle_sync: dict, models_dir: Path,
+) -> tuple[dict, list[str], list[tuple[str, str]]]:
+    """Strip per-engine ``.model`` fields from ``bundle_sync.settings``
+    where the target model isn't installed locally.
+
+    Returns ``(filtered_bundle, warnings, skipped)`` where ``skipped``
+    is a list of ``(engine, model_name)`` pairs that were stripped.
+    Callers use ``skipped`` to surface the missing-model banner so the
+    user is informed AND offered a download path — stripping without
+    telling them would silently lose the sync'd preference.
+
+    This is the guard against the "sync'd peer has large-v3 installed,
+    we only have tiny.en" failure mode — applying the bundle as-is
+    would set ``whisper.model = "large-v3"`` on disk, the daemon would
+    then crash-loop looking for a file we don't have.
+
+    Preserves every other field. Never mutates the input.
+    """
+    from copy import deepcopy
+    from .models import is_model_installed
+
+    filtered = deepcopy(bundle_sync)
+    settings = filtered.get("settings")
+    if not isinstance(settings, dict):
+        return filtered, [], []
+    warnings: list[str] = []
+    skipped: list[tuple[str, str]] = []
+    for engine in _SYNCED_ENGINES:
+        engine_block = settings.get(engine)
+        if not isinstance(engine_block, dict):
+            continue
+        name = engine_block.get("model")
+        if not isinstance(name, str) or not name:
+            continue
+        if is_model_installed(engine, name, models_dir=models_dir):
+            continue
+        del engine_block["model"]
+        skipped.append((engine, name))
+        warnings.append(
+            f"Kept local {engine}.model (synced value '{name}' not installed)"
+        )
+    return filtered, warnings, skipped
+
+
 def reconcile_sync_on_startup(
     doc: Any,
     sc: Sidecar,
@@ -1676,8 +1730,27 @@ def reconcile_sync_on_startup(
         result.skipped_reason = "identical"
         return result
 
+    # Filter per-engine `.model` fields that reference models we don't
+    # have on disk. Prevents the "synced from a peer with more models
+    # than us → daemon points at a missing file → crash loop" case
+    # that bit zeus at 14:30 on 2026-04-22. Warnings propagate to the
+    # banner so the user knows the keep-local happened.
+    bundle.sync, model_skip_warnings, skipped_pairs = _filter_uninstalled_models(
+        bundle.sync, models_dir,
+    )
+    result.warnings.extend(model_skip_warnings)
+
     warnings = apply_bundle_to_state(bundle, doc, sc, include_local=False)
     result.warnings.extend(warnings)
+
+    # If the sync'd bundle wanted to set a whisper model we don't have,
+    # surface the banner so the user can trigger a download. The
+    # existing banner codepath only handles whisper today; non-whisper
+    # skips are communicated via the generic warnings list above.
+    for engine, name in skipped_pairs:
+        if engine == "whisper" and result.missing_model is None:
+            result.missing_model = name
+            break
 
     # apply_bundle_to_state has merge (not replace) semantics: missing
     # phrases are appended, missing replacements are upserted, settings

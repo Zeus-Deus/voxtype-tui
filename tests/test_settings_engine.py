@@ -131,7 +131,9 @@ async def test_engine_change_resets_model_when_invalid(tmp_env):
 
         assert app.state.doc["engine"] == "parakeet"
         default = MODELS_PER_ENGINE["parakeet"][0]
-        assert app.state.doc["parakeet"]["model_type"] == default
+        # Per Voxtype src/config.rs:982, parakeet's active-model key is
+        # `model`, not `model_type` (which is a separate tdt/ctc enum).
+        assert app.state.doc["parakeet"]["model"] == default
 
 
 async def test_model_change_is_restart_sensitive(tmp_env):

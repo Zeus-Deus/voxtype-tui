@@ -43,6 +43,11 @@ def tmp_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(sync, "SYNC_PATH", sync_p)
     monkeypatch.setattr(sync, "DEFAULT_MODELS_DIR", models)
+    # The install-check guards (Set Active, banner) use models.MODELS_DIR.
+    # Re-target it so the fixture's download stub lands in a path the
+    # guards actually check.
+    from voxtype_tui import models as models_mod
+    monkeypatch.setattr(models_mod, "MODELS_DIR", models)
 
     async def _inactive():
         return False

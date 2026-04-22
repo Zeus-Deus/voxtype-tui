@@ -53,34 +53,64 @@ class ModelInfo:
     size_mb: int
 
 
-# Per-engine model catalog. Sizes approximate (actual on-disk size shown when
-# downloaded). Sourced from Whisper.cpp docs and Voxtype's setup --help.
+# Per-engine model catalog. Mirrors Voxtype's authoritative tables in
+# `/src/setup/model.rs` (commit pinned in tests/test_model_catalog_drift.py).
+# Sizes are approximate — the real on-disk size is shown next to each row
+# once downloaded.
+#
+# Voxtype itself never exposes the full catalog via CLI (`voxtype setup
+# model --list` only enumerates INSTALLED models), so duplicating the
+# table here is the only way to offer a "pick-and-download" UX. The
+# drift test fails loudly if Voxtype's source adds/removes/renames a
+# model and we forget to update — prevents the catalog from going stale.
 MODEL_CATALOG: dict[str, list[ModelInfo]] = {
     "whisper": [
         ModelInfo("tiny", 75),
-        ModelInfo("tiny.en", 75),
-        ModelInfo("base", 140),
-        ModelInfo("base.en", 140),
-        ModelInfo("small", 460),
-        ModelInfo("small.en", 460),
+        ModelInfo("tiny.en", 39),
+        ModelInfo("base", 142),
+        ModelInfo("base.en", 142),
+        ModelInfo("small", 466),
+        ModelInfo("small.en", 466),
         ModelInfo("medium", 1500),
         ModelInfo("medium.en", 1500),
-        ModelInfo("large-v3", 2900),
-        ModelInfo("large-v3-turbo", 1500),
+        ModelInfo("large-v3", 3100),
+        ModelInfo("large-v3-turbo", 1600),
     ],
     "parakeet": [
-        ModelInfo("parakeet-tdt-0.6b-v3", 2500),
-        ModelInfo("parakeet-tdt-0.6b-v3-int8", 650),
+        ModelInfo("parakeet-tdt-0.6b-v2", 2400),
+        ModelInfo("parakeet-tdt-0.6b-v2-int8", 640),
+        ModelInfo("parakeet-tdt-0.6b-v3", 2600),
+        ModelInfo("parakeet-tdt-0.6b-v3-int8", 670),
     ],
     "moonshine": [
-        ModelInfo("tiny", 150),
-        ModelInfo("base", 300),
+        ModelInfo("base", 237),
+        ModelInfo("tiny", 100),
+        ModelInfo("base-ja", 237),
+        ModelInfo("base-zh", 237),
+        ModelInfo("tiny-ja", 100),
+        ModelInfo("tiny-zh", 100),
+        ModelInfo("tiny-ko", 100),
+        ModelInfo("tiny-ar", 100),
     ],
-    "sensevoice": [],
-    "paraformer": [],
-    "dolphin": [],
-    "omnilingual": [],
+    "sensevoice": [
+        ModelInfo("small", 239),
+        ModelInfo("small-fp32", 938),
+    ],
+    "paraformer": [
+        ModelInfo("zh", 487),
+        ModelInfo("en", 220),
+    ],
+    "dolphin": [
+        ModelInfo("base", 198),
+    ],
+    "omnilingual": [
+        ModelInfo("300m", 3900),
+    ],
 }
+
+
+# Config-key mapping lives in settings.py as MODEL_PATH_PER_ENGINE.
+# This file re-uses that — one source of truth.
 
 PCT_RE = re.compile(r"(\d+(?:\.\d+)?)%")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -140,34 +170,126 @@ def split_terminal_output(
     return units, buffer[last:]
 
 
-def model_file_path(engine: str, name: str) -> Path:
+def model_file_path(engine: str, name: str, models_dir: Path | None = None) -> Path:
     """Predict the on-disk path Voxtype uses for a given engine + model.
-    Currently only whisper is supported for on-disk operations; other engines
-    fall through and return a best-guess path."""
+
+    Whisper is the only flat-file engine — every other engine stores a
+    directory containing ONNX shards + tokenizer. Moonshine's directory
+    name is prefixed (`moonshine-<name>/`) while the other
+    directory-based engines use the model name verbatim (see Voxtype
+    `src/setup/model.rs` validators).
+
+    ``models_dir`` defaults to Voxtype's system path; tests override
+    it to point at a fixture tree.
+    """
+    base = models_dir if models_dir is not None else MODELS_DIR
     if engine == "whisper":
-        return MODELS_DIR / f"ggml-{name}.bin"
-    return MODELS_DIR / f"{name}.bin"
+        return base / f"ggml-{name}.bin"
+    if engine == "moonshine":
+        return base / f"moonshine-{name}"
+    if engine == "sensevoice":
+        return base / f"sensevoice-{name}"
+    if engine == "paraformer":
+        return base / f"paraformer-{name}"
+    if engine == "dolphin":
+        return base / f"dolphin-{name}"
+    if engine == "omnilingual":
+        return base / f"omnilingual-{name}"
+    if engine == "parakeet":
+        return base / name
+    # Unknown engine — best-guess flat file.
+    return base / f"{name}.bin"
+
+
+def _dir_size(path: Path) -> int:
+    total = 0
+    try:
+        for f in path.rglob("*"):
+            if f.is_file():
+                try:
+                    total += f.stat().st_size
+                except OSError:
+                    continue
+    except OSError:
+        return 0
+    return total
+
+
+def is_model_installed(
+    engine: str, name: str, models_dir: Path | None = None,
+) -> bool:
+    """True when the on-disk artifact for (engine, name) exists and is
+    non-empty. Used to guard [Set active] and sync-reconcile from
+    pointing the daemon at a non-existent model.
+    """
+    path = model_file_path(engine, name, models_dir=models_dir)
+    if not path.exists():
+        return False
+    if path.is_file():
+        try:
+            return path.stat().st_size > 0
+        except OSError:
+            return False
+    # Directory-based engine: non-empty dir with at least one regular file.
+    try:
+        for _ in path.rglob("*"):
+            if _.is_file():
+                return True
+    except OSError:
+        return False
+    return False
 
 
 def scan_downloaded(engine: str) -> dict[str, int]:
-    """Return {model_name: size_bytes} for models present on disk.
+    """Return {model_name: size_bytes} for models of ``engine`` present
+    on disk. Names are normalized back to the catalog form (matching
+    ``MODEL_CATALOG[engine]`` entries) so UI rows can join cleanly.
 
-    For whisper, matches `ggml-<name>.bin`. Unknown `.bin` files (not in the
-    catalog for any engine) are also included with name derived from the
-    filename — user may want to Delete them via the tab."""
+    Unknown artifacts (files or directories that don't match any known
+    engine prefix) are quietly ignored — they're either for a different
+    engine or something the user put there by hand.
+    """
     out: dict[str, int] = {}
     if not MODELS_DIR.exists():
         return out
-    for f in MODELS_DIR.glob("*.bin"):
-        try:
-            size = f.stat().st_size
-        except OSError:
+
+    if engine == "whisper":
+        for f in MODELS_DIR.glob("ggml-*.bin"):
+            try:
+                out[f.stem.removeprefix("ggml-")] = f.stat().st_size
+            except OSError:
+                continue
+        return out
+
+    prefix: str | None = None
+    if engine == "moonshine":
+        prefix = "moonshine-"
+    elif engine == "sensevoice":
+        prefix = "sensevoice-"
+    elif engine == "paraformer":
+        prefix = "paraformer-"
+    elif engine == "dolphin":
+        prefix = "dolphin-"
+    elif engine == "omnilingual":
+        prefix = "omnilingual-"
+
+    for entry in MODELS_DIR.iterdir():
+        if not entry.is_dir():
             continue
-        stem = f.stem
-        if engine == "whisper" and stem.startswith("ggml-"):
-            out[stem.removeprefix("ggml-")] = size
-        elif engine != "whisper" and not stem.startswith("ggml-"):
-            out[stem] = size
+        name = entry.name
+        if engine == "parakeet":
+            # parakeet dirs are named verbatim (parakeet-tdt-...); only
+            # include ones that start with "parakeet-" to skip unrelated
+            # engine dirs that happen to be siblings.
+            if not name.startswith("parakeet-"):
+                continue
+            key = name
+        else:
+            assert prefix is not None  # all branches above set prefix
+            if not name.startswith(prefix):
+                continue
+            key = name[len(prefix):]
+        out[key] = _dir_size(entry)
     return out
 
 
@@ -422,6 +544,22 @@ class ModelsPane(VimTableNav, Vertical):
             self.app.notify(
                 f"No model-path mapping for engine '{engine}'",
                 severity="warning",
+            )
+            return
+        # Hard guard against the "pointed the daemon at a file that
+        # doesn't exist" corruption: if this model isn't installed,
+        # refuse and point the user at Download. Voxtype's own
+        # `setup model --set <NAME>` makes the same check, but we get
+        # here via voxtype-tui's in-memory set_setting which bypasses
+        # the validator until the next `safe_save` — by which time the
+        # user has already pressed Ctrl+S and faced a confusing error.
+        if not is_model_installed(engine, name):
+            self.app.notify(
+                f"'{name}' isn't downloaded yet — press 'd' to download "
+                f"it first (or pick a row marked as installed).",
+                severity="warning",
+                title="Download required",
+                timeout=8,
             )
             return
         self.tui.state.set_setting(path, name)
