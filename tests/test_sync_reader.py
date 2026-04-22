@@ -632,6 +632,105 @@ def test_same_device_drift_keeps_local_settings(paths, monkeypatch) -> None:
     )
 
 
+def test_drift_rewrites_sync_json_immediately(paths, monkeypatch) -> None:
+    """Regression: when drift is detected and the apply is a no-op
+    merge (no new vocab/replacements), the old code returned early
+    without setting `needs_save_doc`. Result: Ctrl+S said "Nothing to
+    save" and the banner reappeared every launch because sync.json
+    still carried the stale settings.
+
+    The fix rewrites sync.json directly in `reconcile_sync_on_startup`
+    (sync.json is a derivative cache; safe to rewrite without user
+    action). After this, the next launch sees identical local + bundle
+    content and skips with `identical` — banner gone."""
+    paths["side"].write_text('{"version":1,"vocabulary":[],"replacements":[]}')
+    _force_old_mtime(paths["cfg"])
+    _force_old_mtime(paths["side"])
+    paths["models"].mkdir(exist_ok=True)
+    (paths["models"] / "ggml-base.en.bin").write_bytes(b"x" * 100)
+    (paths["models"] / "ggml-large-v3.bin").write_bytes(b"x" * 100)
+
+    cfg_doc = tomlkit.parse(paths["cfg"].read_text())
+    if "whisper" not in cfg_doc:
+        cfg_doc["whisper"] = tomlkit.table()
+    cfg_doc["whisper"]["model"] = "large-v3"
+    paths["cfg"].write_text(tomlkit.dumps(cfg_doc))
+    _force_old_mtime(paths["cfg"])
+
+    monkeypatch.setattr(sync, "get_device_label", lambda: "zeus-machine")
+    _write_sync_bundle(
+        paths["sync"],
+        settings={"whisper": {"model": "base.en"}},  # ghost value
+        device="zeus-machine",
+    )
+
+    doc = tomlkit.parse(paths["cfg"].read_text())
+    sc = sidecar_mod.load(paths["side"])
+
+    # First reconcile: drift detected, sync.json rewritten with local state.
+    result = sync.reconcile_sync_on_startup(
+        doc, sc,
+        config_path=paths["cfg"], sidecar_path=paths["side"],
+        sync_path=paths["sync"], models_dir=paths["models"],
+    )
+    assert result.suppressed_settings_changes
+    assert str(doc["whisper"]["model"]) == "large-v3"
+
+    # sync.json on disk now reflects current local — model is large-v3.
+    rewritten = json.loads(paths["sync"].read_text())
+    assert rewritten["sync"]["settings"]["whisper"]["model"] == "large-v3"
+
+    # Second reconcile (simulates next launch): no banner, no drift.
+    doc2 = tomlkit.parse(paths["cfg"].read_text())
+    sc2 = sidecar_mod.load(paths["side"])
+    result2 = sync.reconcile_sync_on_startup(
+        doc2, sc2,
+        config_path=paths["cfg"], sidecar_path=paths["side"],
+        sync_path=paths["sync"], models_dir=paths["models"],
+    )
+    assert result2.skipped_reason == "identical"
+    assert result2.suppressed_settings_changes == []
+
+
+def test_suppressed_format_uses_kept_phrasing(paths, monkeypatch) -> None:
+    """`whisper.model: 'large-v3' → 'base.en'` reads like a change is
+    happening even when it isn't. For the suppressed case the format
+    should use 'kept ... (bundle had ...)'."""
+    paths["side"].write_text('{"version":1,"vocabulary":[],"replacements":[]}')
+    _force_old_mtime(paths["cfg"])
+    _force_old_mtime(paths["side"])
+    paths["models"].mkdir(exist_ok=True)
+    (paths["models"] / "ggml-base.en.bin").write_bytes(b"x" * 100)
+    (paths["models"] / "ggml-large-v3.bin").write_bytes(b"x" * 100)
+
+    cfg_doc = tomlkit.parse(paths["cfg"].read_text())
+    if "whisper" not in cfg_doc:
+        cfg_doc["whisper"] = tomlkit.table()
+    cfg_doc["whisper"]["model"] = "large-v3"
+    paths["cfg"].write_text(tomlkit.dumps(cfg_doc))
+    _force_old_mtime(paths["cfg"])
+
+    monkeypatch.setattr(sync, "get_device_label", lambda: "zeus-machine")
+    _write_sync_bundle(
+        paths["sync"],
+        settings={"whisper": {"model": "base.en"}},
+        device="zeus-machine",
+    )
+
+    doc = tomlkit.parse(paths["cfg"].read_text())
+    sc = sidecar_mod.load(paths["side"])
+    result = sync.reconcile_sync_on_startup(
+        doc, sc,
+        config_path=paths["cfg"], sidecar_path=paths["side"],
+        sync_path=paths["sync"], models_dir=paths["models"],
+    )
+    assert len(result.suppressed_settings_changes) == 1
+    line = result.suppressed_settings_changes[0]
+    assert "kept 'large-v3'" in line
+    assert "bundle had 'base.en'" in line
+    assert "→" not in line, "suppressed line must not use the change-arrow"
+
+
 def test_cross_device_bundle_still_applies_settings(paths, monkeypatch) -> None:
     """Bundle from a DIFFERENT device (Syncthing cross-device case) must
     still apply settings — that's the whole point of sync. The drift

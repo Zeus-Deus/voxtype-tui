@@ -197,16 +197,39 @@ class AppliedSyncBanner(Horizontal):
         device_label: str,
         settings_changes: list[str] | None = None,
         suppressed_changes: list[str] | None = None,
+        applied_anything: bool = True,
     ) -> None:
-        lines = [f"✓ Synced from {device_label} — press Ctrl+S to accept"]
+        """Render the banner. Three cases drive different headlines:
+
+          * applied_anything=True, no suppressed → "Synced from X — Ctrl+S to accept"
+          * applied_anything=False, suppressed only → "Sync would have overwritten N — kept local"
+          * both → "Synced from X (kept N local — Ctrl+S to accept the rest)"
+
+        The previous "Ctrl+S to accept" was misleading in the
+        suppressed-only case because there was nothing to accept; the
+        drift fix already rewrites sync.json automatically so the
+        banner is purely informational.
+        """
+        if applied_anything and suppressed_changes:
+            headline = (
+                f"✓ Synced from {device_label} "
+                f"(kept {len(suppressed_changes)} local) — press Ctrl+S to accept the rest"
+            )
+        elif applied_anything:
+            headline = f"✓ Synced from {device_label} — press Ctrl+S to accept"
+        elif suppressed_changes:
+            headline = (
+                f"ℹ Sync would have overwritten {len(suppressed_changes)} setting"
+                f"{'s' if len(suppressed_changes) != 1 else ''} — kept your local values"
+            )
+        else:
+            headline = "✓ Synced"
+        lines = [headline]
         if settings_changes:
             lines.append(f"  Settings changed ({len(settings_changes)}):")
             for change in settings_changes:
                 lines.append(f"    • {change}")
         if suppressed_changes:
-            lines.append(
-                f"  Kept local (edited since last sync): {len(suppressed_changes)} field(s)"
-            )
             for change in suppressed_changes:
                 lines.append(f"    • {change}")
         self.query_one("#msg", Static).update("\n".join(lines))
@@ -608,6 +631,7 @@ class VoxtypeTUI(App[None]):
                 result.applied_from or "(local)",
                 settings_changes=result.applied_settings_changes,
                 suppressed_changes=result.suppressed_settings_changes,
+                applied_anything=result.applied_from is not None,
             )
         else:
             applied.hide_banner()

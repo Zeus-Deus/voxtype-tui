@@ -1774,7 +1774,7 @@ def reconcile_sync_on_startup(
     )
     if local_drifted:
         suppressed = _format_settings_changes(
-            bundle.sync.get("settings", {}), doc,
+            bundle.sync.get("settings", {}), doc, suppressed=True,
         )
         if suppressed:
             result.suppressed_settings_changes = suppressed
@@ -1823,26 +1823,45 @@ def reconcile_sync_on_startup(
     # leaves overwrite. A bundle whose contents are a subset of local
     # state — or an empty/stale bundle left over from an earlier session
     # before the user added anything — produces a pure no-op merge. In
-    # that case, silently drop the result: no persist (which would just
-    # bump mtimes for nothing) and no banner (we have nothing new to
-    # tell the user). This is the common single-device false positive
-    # when sync.json predates the vocab/replacements the user later
-    # added through the UI.
+    # that case there's nothing for the user to save; the only thing
+    # we may still need to do is rewrite the on-disk sync.json itself,
+    # handled below for the drift case.
     post_sync_hash = stable_hash(distill_sync(doc, sc.vocabulary, sc.replacements))
-    if pre_sync_hash == post_sync_hash:
+    apply_was_noop = pre_sync_hash == post_sync_hash
+
+    if not apply_was_noop:
+        # The apply mutated state (vocab/replacements merged). The user
+        # must Ctrl+S to persist — we deliberately do NOT auto-write
+        # config.toml at load time. The old `_persist_after_apply` was
+        # the root of the "model changes by itself" data loss.
+        result.needs_save_doc = True
+        result.needs_save_sidecar = True
+        result.applied_from = bundle.generated_by_device or "(unknown device)"
+        result.applied_at = bundle.generated_at
+
+    # When drift was detected, rewrite sync.json *now* with the current
+    # local state. Without this, a stale bundle (e.g. one carrying an
+    # old `whisper.model = "base.en"` ghost) keeps re-firing the drift
+    # banner on every launch — and Ctrl+S can't help because no
+    # in-doc/sidecar change is pending. sync.json is a derivative cache,
+    # safe to rewrite at startup. Best-effort: log on failure but don't
+    # crash startup over a sync-cache write.
+    if local_drifted and result.suppressed_settings_changes:
+        try:
+            write_sync_bundle(doc, sc, path=sync_path)
+        except OSError as e:
+            logger.warning(
+                "Could not rewrite sync.json after drift detection: %s. "
+                "Banner may reappear next launch.", e,
+            )
+
+    if apply_was_noop and not result.suppressed_settings_changes:
+        # Pure no-op (no merge changes, no drift) → nothing to tell the
+        # user. The common single-device false positive when sync.json
+        # predates the vocab/replacements the user later added through
+        # the UI.
         result.skipped_reason = "noop_merge"
         return result
-
-    # Do NOT persist to disk here. The old `_persist_after_apply` was
-    # the root of the "model changes by itself" data loss: it silently
-    # rewrote config.toml at load time, before the user even saw the
-    # TUI. Now the apply only mutates in-memory state, and dirty flags
-    # are set so the user's next Ctrl+S persists the synced changes.
-    # If they don't want them, Ctrl+R (reload) discards.
-    result.needs_save_doc = True
-    result.needs_save_sidecar = True
-    result.applied_from = bundle.generated_by_device or "(unknown device)"
-    result.applied_at = bundle.generated_at
 
     # --- 6. Missing-model check on the applied settings
     model_name = _get(bundle.sync, "settings", "whisper", "model")
@@ -1881,21 +1900,31 @@ def _format_settings_changes(
     doc: Any,
     *,
     prefix: str = "",
+    suppressed: bool = False,
 ) -> list[str]:
-    """Walk `bundle_settings` and return a flat list of strings like
-    ``"whisper.model: 'large-v3' → 'base.en'"`` for every leaf whose
-    bundle value differs from the current doc value.
+    """Walk `bundle_settings` and return a flat list of strings for every
+    leaf whose bundle value differs from the current doc value.
 
-    Used to populate ``SyncReconcileResult.applied_settings_changes``
-    (and its suppressed-by-drift counterpart) so the banner can tell
-    the user exactly what sync wants to alter. Nested dicts recurse;
-    missing doc keys show as ``<unset>``.
+    Format depends on `suppressed`:
+
+      * ``suppressed=False`` (apply went through): ``"whisper.model:
+        'large-v3' → 'base.en'"`` — the doc was just changed from
+        large-v3 to base.en.
+      * ``suppressed=True``  (drift detected, settings stripped):
+        ``"whisper.model: kept 'large-v3' (bundle had 'base.en')"`` —
+        nothing changed locally; the bundle wanted base.en but lost.
+
+    The arrow form was misleading for the suppressed case (looks like
+    a change is happening when it isn't). Nested dicts recurse; missing
+    doc keys show as ``<unset>``.
     """
     out: list[str] = []
     for key, new_val in bundle_settings.items():
         path = f"{prefix}.{key}" if prefix else key
         if isinstance(new_val, Mapping):
-            out.extend(_format_settings_changes(new_val, doc, prefix=path))
+            out.extend(_format_settings_changes(
+                new_val, doc, prefix=path, suppressed=suppressed,
+            ))
             continue
         # Walk doc to find the current value at this dotted path.
         node: Any = doc
@@ -1916,7 +1945,11 @@ def _format_settings_changes(
         else:
             current_repr = repr(str(current))
         new_repr = repr(str(new_val))
-        if current_repr != new_repr:
+        if current_repr == new_repr:
+            continue
+        if suppressed:
+            out.append(f"{path}: kept {current_repr} (bundle had {new_repr})")
+        else:
             out.append(f"{path}: {current_repr} → {new_repr}")
     return out
 
