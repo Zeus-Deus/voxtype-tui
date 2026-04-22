@@ -563,3 +563,35 @@ async def test_disk_usage_reflects_file_sizes(tmp_env):
         pane = app.query_one(ModelsPane)
         # The label widget exists and was updated during sync_from_state
         assert pane.query_one("#models-disk") is not None
+
+
+async def test_progress_and_log_hidden_when_no_download_in_flight(tmp_env):
+    """Regression: the ProgressBar (and the RichLog beneath it) used to
+    render a stale "0%" bar even at rest, looking like a stuck UI
+    element. They should only appear while a download is actually
+    running."""
+    cfg, side, _ = tmp_env
+    from textual.widgets import ProgressBar, RichLog
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _goto_models(pilot, app)
+        pane = app.query_one(ModelsPane)
+        progress = pane.query_one("#models-progress", ProgressBar)
+        log = pane.query_one("#models-log", RichLog)
+        assert progress.has_class("hidden"), \
+            "ProgressBar must be hidden when no download is in flight"
+        assert log.has_class("hidden"), \
+            "RichLog must be hidden when no download is in flight"
+
+        # Flipping the buttons-downloading state shows them; flipping
+        # back hides them again.
+        pane._set_buttons_downloading(True)
+        await pilot.pause()
+        assert not progress.has_class("hidden")
+        assert not log.has_class("hidden")
+
+        pane._set_buttons_downloading(False)
+        await pilot.pause()
+        assert progress.has_class("hidden")
+        assert log.has_class("hidden")

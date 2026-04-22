@@ -375,10 +375,12 @@ class ModelsPane(VimTableNav, Vertical):
         width: 100%;
         margin: 0 0 1 0;
     }
+    ModelsPane ProgressBar.hidden { display: none; }
     ModelsPane RichLog {
         height: 10;
         background: $panel;
     }
+    ModelsPane RichLog.hidden { display: none; }
     """
 
     BINDINGS = [
@@ -443,6 +445,11 @@ class ModelsPane(VimTableNav, Vertical):
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
         table.add_columns("Model", "Size", "Status", "Active")
+        # Progress bar + log are only meaningful while a download is
+        # running. Without this, the "0%" bar sits below the buttons
+        # forever, looking like a stuck/random UI element.
+        self.query_one("#models-progress", ProgressBar).add_class("hidden")
+        self.query_one("#models-log", RichLog).add_class("hidden")
         # Detect which engines voxtype was compiled with. Runs a single
         # `voxtype setup model` subprocess with stdin closed (<1s on
         # any reasonable machine). Silent on failure — fallback inside
@@ -850,6 +857,15 @@ class ModelsPane(VimTableNav, Vertical):
         self.query_one("#models-download", Button).disabled = downloading
         self.query_one("#models-delete", Button).disabled = downloading
         self.query_one("#models-cancel", Button).disabled = not downloading
+        # Show the progress bar + log only while a download is in flight.
+        progress = self.query_one("#models-progress", ProgressBar)
+        log = self.query_one("#models-log", RichLog)
+        if downloading:
+            progress.remove_class("hidden")
+            log.remove_class("hidden")
+        else:
+            progress.add_class("hidden")
+            log.add_class("hidden")
 
 
 def _fmt_size(size_bytes: int) -> str:
