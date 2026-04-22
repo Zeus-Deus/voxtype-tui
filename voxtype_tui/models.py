@@ -592,16 +592,63 @@ class ModelsPane(VimTableNav, Vertical):
             self.app.notify("No model selected", severity="warning")
             return
         engine = self._current_engine()
-        if engine != "whisper":
-            # Voxtype's setup --download currently handles whisper models;
-            # other engines use their own setup commands. Defer for v1.
+        if engine == "whisper":
+            # Whisper: Voxtype's `setup --download --model <NAME>` works
+            # non-interactively for every known whisper model, so we
+            # keep the in-app progress-bar flow.
+            asyncio.create_task(self._run_download(name))
+            return
+        # Non-whisper engines: `setup --download` only knows whisper
+        # names, so the only reliable download path is Voxtype's own
+        # interactive picker (`voxtype setup model`). We suspend the
+        # TUI, hand the terminal to Voxtype for the picker flow, then
+        # resume and refresh the table to pick up whatever landed.
+        asyncio.create_task(self._run_interactive_picker())
+
+    async def _run_interactive_picker(self) -> None:
+        """Shell out to `voxtype setup model` with the terminal fully
+        yielded. Voxtype owns the download UI during this; we refresh
+        our state when it returns so newly-downloaded models appear.
+        """
+        import shutil
+        if shutil.which("voxtype") is None:
             self.app.notify(
-                f"Download-from-TUI supports whisper only in v1; use "
-                f"`voxtype setup model` for {engine}.",
-                severity="warning", timeout=8,
+                "voxtype binary not on PATH — can't launch picker",
+                severity="error", timeout=6,
             )
             return
-        asyncio.create_task(self._run_download(name))
+        self.app.notify(
+            "Opening Voxtype's interactive downloader — TUI will "
+            "resume when you finish.", timeout=3,
+        )
+        # `app.suspend()` releases the terminal so Voxtype's picker
+        # can read stdin and draw. Must run on a worker thread so we
+        # don't block the event loop while the user reads the prompt.
+        def _run() -> int:
+            import subprocess
+            with self.app.suspend():
+                return subprocess.run(["voxtype", "setup", "model"]).returncode
+        try:
+            rc = await asyncio.to_thread(_run)
+        except Exception as e:
+            self.app.notify(f"Picker failed: {e}", severity="error", timeout=6)
+            return
+        # Voxtype may have downloaded a model AND/OR changed the
+        # active model in config.toml. Reload state so the TUI's
+        # shadow copy matches disk; otherwise the user's next save
+        # would revert whatever the picker just wrote.
+        try:
+            self.tui.load_state()
+        except Exception:
+            pass
+        self.refresh_table()
+        self._update_disk_label()
+        if rc == 0:
+            self.app.notify("Picker finished — table refreshed.", timeout=4)
+        else:
+            self.app.notify(
+                f"Picker exited with code {rc}", severity="warning", timeout=5,
+            )
 
     def _action_delete(self) -> None:
         name = self._selected_model_name()
