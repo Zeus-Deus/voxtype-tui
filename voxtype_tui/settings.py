@@ -617,11 +617,20 @@ class SettingsPane(VerticalScroll):
             custom_row.remove_class("hidden")
             custom_input.value = preferred
         elif options and options[0][1] != CUSTOM_MODEL:
+            # No preferred model but options exist. Show the first one
+            # in the dropdown for visual completeness, but mark it as
+            # "programmatic" so the model handler skips the resulting
+            # Select.Changed cascade — otherwise we'd silently write
+            # the default into config (one cause of the
+            # "model changes by itself" bug).
+            self._programmatic_model_change = options[0][1]
             model_select.value = options[0][1]
             custom_row.add_class("hidden")
             custom_input.value = ""
         else:
             model_select.value = Select.BLANK
+            custom_row.add_class("hidden")
+            custom_input.value = ""
             custom_row.remove_class("hidden")
             custom_input.value = ""
 
@@ -636,25 +645,49 @@ class SettingsPane(VerticalScroll):
             if new_engine == old_engine:
                 return
             self.tui.state.set_setting("engine", new_engine)
-            # Preserve current model if it's also valid for the new engine;
-            # otherwise pick the new engine's first known model.
+            # Preserve current model if already set. If not, carry over
+            # from the old engine IFF it's still valid — this is a
+            # convenience only. Previously the else-branch wrote the
+            # first catalog entry (e.g. "tiny" for whisper) into config,
+            # silently overwriting any model the user had set earlier
+            # in the session. Now we leave the field alone and only
+            # refresh the dropdown options — the user picks explicitly.
+            # Voxtype's own default kicks in at daemon start when the
+            # key is absent, so an unset model is safe.
             current_model = self._current_model_for(new_engine)
             if not current_model:
-                # No model set for new engine yet — carry over from old engine
-                # if that name happens to be valid here.
                 carry = self._current_model_for(old_engine)
-                if carry in MODELS_PER_ENGINE.get(new_engine, []):
+                if carry and carry in MODELS_PER_ENGINE.get(new_engine, []):
                     self._write_model(new_engine, carry)
                     current_model = carry
-                else:
-                    default = (MODELS_PER_ENGINE.get(new_engine) or [""])[0]
-                    if default:
-                        self._write_model(new_engine, default)
-                        current_model = default
-            self._refresh_model_options(new_engine, preferred=current_model)
+            # Repopulate options, but do NOT write a default. Wrap in
+            # suppress so the Select.Changed fired by `set_options` /
+            # `value = preferred` doesn't bounce through this same
+            # handler a second time.
+            self._suppress_events = True
+            try:
+                self._refresh_model_options(new_engine, preferred=current_model)
+            finally:
+                self._suppress_events = False
             self.tui.refresh_dirty()
         elif event.select.id == "settings-model":
-            if event.value == Select.BLANK:
+            # Bail on the various non-actionable Select.Changed events
+            # that fire during programmatic dropdown rebuilds (set_options,
+            # value flip to the new default, etc.). Any of these would
+            # silently write into config — was a contributing cause of
+            # the "model changes by itself" bug.
+            if event.value is None or event.value == Select.BLANK:
+                return
+            value_str = str(event.value)
+            if value_str in ("None", "Select.NULL", ""):
+                return
+            # Defuse cascading change from `_refresh_model_options` when
+            # the engine just changed and we set the dropdown to a
+            # default for visual continuity. The flag is consumed
+            # exactly once so a real subsequent user pick still writes.
+            pending = getattr(self, "_programmatic_model_change", None)
+            if pending is not None and value_str == pending:
+                self._programmatic_model_change = None
                 return
             custom_row = self.query_one("#settings-custom-model-row", Horizontal)
             custom_input = self.query_one("#settings-custom-model", Input)

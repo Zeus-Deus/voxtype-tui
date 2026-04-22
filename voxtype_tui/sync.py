@@ -1499,6 +1499,22 @@ class SyncReconcileResult:
     missing_model: str | None = None
     skipped_reason: str | None = None
     warnings: list[str] = field(default_factory=list)
+    # Set when the apply mutated `doc` or `sc` and the caller
+    # (`AppState.load`) should mark dirty flags so the user's next save
+    # persists the synced changes. Replaces the old auto-write behavior
+    # — silent persists were the root cause of the "model changes by
+    # itself" data loss. Now sync apply is always opt-in via Ctrl+S.
+    needs_save_doc: bool = False
+    needs_save_sidecar: bool = False
+    # Settings fields that the apply changed in-memory, formatted as
+    # "<dotted.path>: <old> → <new>" for the banner.
+    applied_settings_changes: list[str] = field(default_factory=list)
+    # Settings fields the apply WOULD have changed but didn't because
+    # the local state has drifted from the bundle's snapshot
+    # (current local sync hash != bundle.local_sync_hash). Local wins;
+    # the user keeps their values. Surfaced in the banner so they know
+    # the sync was intentionally partial.
+    suppressed_settings_changes: list[str] = field(default_factory=list)
 
 
 def find_sync_conflict_files(sync_path: Path | None = None) -> list[Path]:
@@ -1730,6 +1746,48 @@ def reconcile_sync_on_startup(
         result.skipped_reason = "identical"
         return result
 
+    # --- 5a. Drift check — the fix for "whisper.model changes by itself".
+    #
+    # apply_bundle_to_state uses MERGE semantics for vocab and
+    # replacements (additions are always safe) but OVERWRITE semantics
+    # for settings (sync block leaves blindly clobber doc leaves).
+    # Without this check, a same-device bundle newer than local mtime
+    # silently resets settings like `whisper.model` to whatever the
+    # bundle carried — even when the user had intentionally changed it
+    # locally since the bundle was written.
+    #
+    # `local_sync_hash` is the hash of the sync block at write time —
+    # equivalently, a snapshot of the writer's sync-relevant state.
+    # The drift check only makes sense for bundles written by THIS
+    # device (cross-device bundles almost always have a different
+    # `local_sync_hash` and are supposed to overwrite local, that's
+    # the whole point of sync). Scope the drift check to same-device
+    # by comparing `generated_by_device` to the local hostname.
+    same_device = (
+        bundle.generated_by_device
+        and bundle.generated_by_device.strip() == get_device_label().strip()
+    )
+    local_drifted = (
+        same_device
+        and bool(bundle.local_sync_hash)
+        and pre_sync_hash != bundle.local_sync_hash
+    )
+    if local_drifted:
+        suppressed = _format_settings_changes(
+            bundle.sync.get("settings", {}), doc,
+        )
+        if suppressed:
+            result.suppressed_settings_changes = suppressed
+            result.warnings.append(
+                "Local settings have been edited since the last sync — "
+                f"keeping local values for {len(suppressed)} field(s). "
+                "Vocab and replacements still merged."
+            )
+            # Strip settings from the bundle so apply_bundle_to_state
+            # leaves local settings alone. Vocab/replacements survive
+            # in the stripped bundle and still merge through.
+            bundle = _bundle_with_stripped_settings(bundle)
+
     # Filter per-engine `.model` fields that reference models we don't
     # have on disk. Prevents the "synced from a peer with more models
     # than us → daemon points at a missing file → crash loop" case
@@ -1739,6 +1797,14 @@ def reconcile_sync_on_startup(
         bundle.sync, models_dir,
     )
     result.warnings.extend(model_skip_warnings)
+
+    # Capture the set of settings changes BEFORE apply so we can show
+    # them in the banner. After apply_bundle_to_state runs, doc is
+    # mutated and we lose the old values.
+    if not local_drifted:
+        result.applied_settings_changes = _format_settings_changes(
+            bundle.sync.get("settings", {}), doc,
+        )
 
     warnings = apply_bundle_to_state(bundle, doc, sc, include_local=False)
     result.warnings.extend(warnings)
@@ -1767,11 +1833,14 @@ def reconcile_sync_on_startup(
         result.skipped_reason = "noop_merge"
         return result
 
-    # Persist immediately so the loaded in-memory state stays in sync
-    # with disk. This avoids the next save having to re-apply and
-    # prevents a partial-state window if the app crashes.
-    _persist_after_apply(doc, sc, config_path, sidecar_path)
-
+    # Do NOT persist to disk here. The old `_persist_after_apply` was
+    # the root of the "model changes by itself" data loss: it silently
+    # rewrote config.toml at load time, before the user even saw the
+    # TUI. Now the apply only mutates in-memory state, and dirty flags
+    # are set so the user's next Ctrl+S persists the synced changes.
+    # If they don't want them, Ctrl+R (reload) discards.
+    result.needs_save_doc = True
+    result.needs_save_sidecar = True
     result.applied_from = bundle.generated_by_device or "(unknown device)"
     result.applied_at = bundle.generated_at
 
@@ -1784,25 +1853,72 @@ def reconcile_sync_on_startup(
     return result
 
 
-def _persist_after_apply(
-    doc: Any,
-    sc: Sidecar,
-    config_path: Path,
-    sidecar_path: Path,
-) -> None:
-    """Atomically write doc + sc back to disk after a sync-apply.
+def _bundle_with_stripped_settings(bundle: "Bundle") -> "Bundle":
+    """Return a shallow copy of `bundle` with `sync.settings` cleared.
 
-    Uses `config.save_atomic` (NOT `config.safe_save`) to skip the
-    voxtype-binary validation — voxtype may not be installed (test
-    envs) or the sync may have introduced a config voxtype doesn't
-    recognize yet, and we don't want startup to crash because of it.
-    The next user-driven Ctrl+S goes through `safe_save` and gets
-    validated there.
+    Used when local has drifted from the bundle's snapshot: we want to
+    still merge vocab/replacements from the bundle but leave settings
+    untouched. The on-disk sync.json is NOT modified here; the next
+    user-driven save will rewrite it with live state via
+    `write_sync_bundle`.
     """
-    from . import config as _config  # avoid import cycle at module load
-    from . import sidecar as _sidecar
-    _config.save_atomic(doc, config_path)
-    _sidecar.save_atomic(sc, sidecar_path)
+    new_sync = {k: v for k, v in bundle.sync.items() if k != "settings"}
+    new_sync["settings"] = {}
+    return Bundle(
+        schema_version=bundle.schema_version,
+        format=bundle.format,
+        generated_at=bundle.generated_at,
+        generated_by_device=bundle.generated_by_device,
+        local_sync_hash=bundle.local_sync_hash,
+        sync=new_sync,
+        local=bundle.local,
+        secrets=bundle.secrets,
+    )
+
+
+def _format_settings_changes(
+    bundle_settings: Mapping[str, Any],
+    doc: Any,
+    *,
+    prefix: str = "",
+) -> list[str]:
+    """Walk `bundle_settings` and return a flat list of strings like
+    ``"whisper.model: 'large-v3' → 'base.en'"`` for every leaf whose
+    bundle value differs from the current doc value.
+
+    Used to populate ``SyncReconcileResult.applied_settings_changes``
+    (and its suppressed-by-drift counterpart) so the banner can tell
+    the user exactly what sync wants to alter. Nested dicts recurse;
+    missing doc keys show as ``<unset>``.
+    """
+    out: list[str] = []
+    for key, new_val in bundle_settings.items():
+        path = f"{prefix}.{key}" if prefix else key
+        if isinstance(new_val, Mapping):
+            out.extend(_format_settings_changes(new_val, doc, prefix=path))
+            continue
+        # Walk doc to find the current value at this dotted path.
+        node: Any = doc
+        current: Any = None
+        found = True
+        for part in path.split("."):
+            if hasattr(node, "get"):
+                node = node.get(part)
+            else:
+                found = False
+                break
+            if node is None:
+                found = False
+                break
+            current = node
+        if not found:
+            current_repr = "<unset>"
+        else:
+            current_repr = repr(str(current))
+        new_repr = repr(str(new_val))
+        if current_repr != new_repr:
+            out.append(f"{path}: {current_repr} → {new_repr}")
+    return out
 
 
 def write_export_bundle(

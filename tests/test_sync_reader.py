@@ -260,8 +260,14 @@ def test_reconcile_local_newer_is_noop(paths) -> None:
     assert not any(v.phrase == "ShouldNotApply" for v in sc.vocabulary)
 
 
-def test_reconcile_sync_newer_applies_and_persists(paths) -> None:
-    """Sync bundle stamp > local mtime → apply + write back."""
+def test_reconcile_sync_newer_applies_in_memory_only(paths) -> None:
+    """Sync bundle stamp > local mtime → apply mutates `doc`/`sc`
+    in-memory and flags the result as needing a save.
+
+    Disk is NOT touched — that was the old `_persist_after_apply`
+    behavior which silently overwrote user-edited settings on every
+    launch ("model changes by itself"). The user must now Ctrl+S to
+    persist the synced changes."""
     # Backdate config + metadata so the sync's "now" stamp wins.
     paths["side"].write_text('{"version":1,"vocabulary":[],"replacements":[]}')
     _force_old_mtime(paths["cfg"])
@@ -279,6 +285,9 @@ def test_reconcile_sync_newer_applies_and_persists(paths) -> None:
         settings={"whisper": {"model": "tiny"}},
         device="other-laptop",
     )
+    pre_cfg_bytes = paths["cfg"].read_bytes()
+    pre_side_bytes = paths["side"].read_bytes()
+
     doc = tomlkit.parse(paths["cfg"].read_text())
     sc = sidecar_mod.load(paths["side"])
 
@@ -293,11 +302,16 @@ def test_reconcile_sync_newer_applies_and_persists(paths) -> None:
     # In-memory state reflects the apply.
     assert any(v.phrase == "FromOtherDevice" for v in sc.vocabulary)
     assert str(doc["whisper"]["model"]) == "tiny"
-    # Disk reflects the apply too (persist after apply).
-    reloaded = tomlkit.parse(paths["cfg"].read_text())
-    assert str(reloaded["whisper"]["model"]) == "tiny"
-    reloaded_sc = sidecar_mod.load(paths["side"])
-    assert any(v.phrase == "FromOtherDevice" for v in reloaded_sc.vocabulary)
+    # Dirty flags tell the caller (AppState.load) to set config_dirty.
+    assert result.needs_save_doc is True
+    assert result.needs_save_sidecar is True
+    # Disk is untouched — persist is now the user's responsibility.
+    assert paths["cfg"].read_bytes() == pre_cfg_bytes
+    assert paths["side"].read_bytes() == pre_side_bytes
+    # Settings changes are surfaced for the banner.
+    assert any(
+        "whisper.model" in c for c in result.applied_settings_changes
+    )
 
 
 def test_reconcile_identical_content_is_noop(paths) -> None:
@@ -530,7 +544,11 @@ async def test_missing_model_banner_surfaces(tmp_env) -> None:
 
 async def test_reload_clears_applied_and_missing_banners(tmp_env) -> None:
     """Ctrl+R path: after a successful apply, if sync.json is gone the
-    next reload should clear the applied + missing banners."""
+    next reload should clear the applied + missing banners.
+
+    Note: the apply now sets config_dirty (see Fix #2 — persist is
+    opt-in via Ctrl+S). Ctrl+R refuses to discard unsaved changes, so
+    the test saves first."""
     _force_old_mtime(tmp_env["cfg"])
     if tmp_env["side"].exists():
         _force_old_mtime(tmp_env["side"])
@@ -543,6 +561,11 @@ async def test_reload_clears_applied_and_missing_banners(tmp_env) -> None:
         await pilot.pause()
         assert app.query_one(AppliedSyncBanner).display is True
 
+        # Save the synced changes so the next Ctrl+R isn't blocked by
+        # the unsaved-changes guard.
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+
         # Remove the sync file so the next reload has nothing to apply
         # from. Ctrl+R.
         tmp_env["sync"].unlink()
@@ -550,3 +573,92 @@ async def test_reload_clears_applied_and_missing_banners(tmp_env) -> None:
         await pilot.pause()
 
         assert app.query_one(AppliedSyncBanner).display is False
+
+
+# ---------------------------------------------------------------------------
+# Same-device drift guard — the Fix #1 contract
+# ---------------------------------------------------------------------------
+
+def test_same_device_drift_keeps_local_settings(paths, monkeypatch) -> None:
+    """Same-device sync.json with a model different from live config →
+    the drift check strips settings from the bundle so local wins.
+
+    This is the fix for "model changes by itself": user sets
+    `whisper.model = "large-v3"` in the TUI, saves, later a stale bundle
+    arrives (or was left over from an earlier session) still carrying
+    `whisper.model = "base.en"`. Under the old mtime-only compare the
+    bundle's settings would blindly overwrite local. Now the drift
+    check detects "I wrote this bundle, but local no longer hashes to
+    what the bundle carries" and protects the model field."""
+    paths["side"].write_text('{"version":1,"vocabulary":[],"replacements":[]}')
+    _force_old_mtime(paths["cfg"])
+    _force_old_mtime(paths["side"])
+    paths["models"].mkdir(exist_ok=True)
+    (paths["models"] / "ggml-base.en.bin").write_bytes(b"x" * 100)
+    (paths["models"] / "ggml-large-v3.bin").write_bytes(b"x" * 100)
+
+    # Set local to large-v3 explicitly.
+    cfg_doc = tomlkit.parse(paths["cfg"].read_text())
+    if "whisper" not in cfg_doc:
+        cfg_doc["whisper"] = tomlkit.table()
+    cfg_doc["whisper"]["model"] = "large-v3"
+    paths["cfg"].write_text(tomlkit.dumps(cfg_doc))
+    _force_old_mtime(paths["cfg"])
+
+    # Stale bundle written by THIS device with the old `base.en` value.
+    monkeypatch.setattr(sync, "get_device_label", lambda: "zeus-machine")
+    _write_sync_bundle(
+        paths["sync"],
+        vocab=["SharedVocab"],
+        settings={"whisper": {"model": "base.en"}},
+        device="zeus-machine",  # same device → drift check engages
+    )
+
+    doc = tomlkit.parse(paths["cfg"].read_text())
+    sc = sidecar_mod.load(paths["side"])
+    result = sync.reconcile_sync_on_startup(
+        doc, sc,
+        config_path=paths["cfg"], sidecar_path=paths["side"],
+        sync_path=paths["sync"], models_dir=paths["models"],
+    )
+
+    # Local model survived — settings were stripped before apply.
+    assert str(doc["whisper"]["model"]) == "large-v3"
+    # Vocab still merged (additive, always safe).
+    assert any(v.phrase == "SharedVocab" for v in sc.vocabulary)
+    # Result surfaces the suppressed change for the banner.
+    assert any(
+        "whisper.model" in c for c in result.suppressed_settings_changes
+    )
+
+
+def test_cross_device_bundle_still_applies_settings(paths, monkeypatch) -> None:
+    """Bundle from a DIFFERENT device (Syncthing cross-device case) must
+    still apply settings — that's the whole point of sync. The drift
+    check is scoped to same-device via `generated_by_device` vs local
+    hostname."""
+    paths["side"].write_text('{"version":1,"vocabulary":[],"replacements":[]}')
+    _force_old_mtime(paths["cfg"])
+    _force_old_mtime(paths["side"])
+    paths["models"].mkdir(exist_ok=True)
+    (paths["models"] / "ggml-tiny.bin").write_bytes(b"x" * 100)
+
+    monkeypatch.setattr(sync, "get_device_label", lambda: "this-machine")
+    _write_sync_bundle(
+        paths["sync"],
+        settings={"whisper": {"model": "tiny"}},
+        device="other-laptop",  # different device → drift check skipped
+    )
+
+    doc = tomlkit.parse(paths["cfg"].read_text())
+    sc = sidecar_mod.load(paths["side"])
+    result = sync.reconcile_sync_on_startup(
+        doc, sc,
+        config_path=paths["cfg"], sidecar_path=paths["side"],
+        sync_path=paths["sync"], models_dir=paths["models"],
+    )
+    assert str(doc["whisper"]["model"]) == "tiny"
+    assert result.suppressed_settings_changes == []
+    assert any(
+        "whisper.model" in c for c in result.applied_settings_changes
+    )

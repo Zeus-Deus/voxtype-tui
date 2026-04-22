@@ -60,6 +60,31 @@ class StalePill(Static):
         self.app.action_restart_daemon()
 
 
+class RestartingPill(Static):
+    """Persistent in-progress indicator while a daemon restart is mid-flight.
+
+    Distinct from StalePill: stale = "you should restart", restarting =
+    "we're already doing it, hold tight". Different colors so the user can
+    tell at a glance.
+
+    The two pills are mutually exclusive — refresh_stale_pill hides the
+    stale pill while restart_in_progress is True so we don't show
+    contradictory signals."""
+
+    DEFAULT_CSS = """
+    RestartingPill {
+        width: auto;
+        height: 1;
+        padding: 0 1;
+        background: $accent;
+        color: $background;
+        text-style: bold;
+        display: none;
+    }
+    RestartingPill.visible { display: block; }
+    """
+
+
 class HeaderBar(Horizontal):
     DEFAULT_CSS = """
     HeaderBar {
@@ -84,6 +109,10 @@ class HeaderBar(Horizontal):
         yield StalePill(
             "⚠ Daemon restart needed (Ctrl+Shift+R)",
             id="daemon-stale",
+        )
+        yield RestartingPill(
+            "⟳ Restarting daemon — loading model…",
+            id="daemon-restarting",
         )
         yield Static("ctrl+s save · ctrl+r reload", id="hint")
 
@@ -163,10 +192,24 @@ class AppliedSyncBanner(Horizontal):
     def on_mount(self) -> None:
         self.display = False
 
-    def set_applied(self, device_label: str) -> None:
-        self.query_one("#msg", Static).update(
-            f"✓ Synced from {device_label}"
-        )
+    def set_applied(
+        self,
+        device_label: str,
+        settings_changes: list[str] | None = None,
+        suppressed_changes: list[str] | None = None,
+    ) -> None:
+        lines = [f"✓ Synced from {device_label} — press Ctrl+S to accept"]
+        if settings_changes:
+            lines.append(f"  Settings changed ({len(settings_changes)}):")
+            for change in settings_changes:
+                lines.append(f"    • {change}")
+        if suppressed_changes:
+            lines.append(
+                f"  Kept local (edited since last sync): {len(suppressed_changes)} field(s)"
+            )
+            for change in suppressed_changes:
+                lines.append(f"    • {change}")
+        self.query_one("#msg", Static).update("\n".join(lines))
         self.display = True
 
     def hide_banner(self) -> None:
@@ -408,6 +451,11 @@ class VoxtypeTUI(App[None]):
     ]
 
     daemon_state: reactive[str] = reactive("?")
+    # True from the moment _do_restart begins until the daemon's state
+    # file reports a ready state (or the readiness wait times out). Used
+    # to drive the RestartingPill, the "starting" status label, and the
+    # quit / re-entry guards.
+    restart_in_progress: reactive[bool] = reactive(False)
 
     def __init__(
         self,
@@ -555,8 +603,12 @@ class VoxtypeTUI(App[None]):
             return
 
         conflict.set_conflicts(result.conflict_files)
-        if result.applied_from:
-            applied.set_applied(result.applied_from)
+        if result.applied_from or result.suppressed_settings_changes:
+            applied.set_applied(
+                result.applied_from or "(local)",
+                settings_changes=result.applied_settings_changes,
+                suppressed_changes=result.suppressed_settings_changes,
+            )
         else:
             applied.hide_banner()
         if result.missing_model:
@@ -567,12 +619,29 @@ class VoxtypeTUI(App[None]):
     def refresh_stale_pill(self) -> None:
         """Toggle the header's daemon-stale pill based on state.daemon_stale.
         Safe to call before the header has mounted (e.g. during early
-        on_mount sequencing) — missing widget is a no-op."""
+        on_mount sequencing) — missing widget is a no-op.
+
+        Hidden while restart_in_progress so the user doesn't see both
+        "restart needed" and "restarting…" at the same time."""
         try:
             pill = self.query_one("#daemon-stale", StalePill)
         except Exception:
             return
-        if self.state and self.state.daemon_stale:
+        show = bool(self.state and self.state.daemon_stale) and not self.restart_in_progress
+        if show:
+            pill.add_class("visible")
+        else:
+            pill.remove_class("visible")
+
+    def refresh_restart_pill(self) -> None:
+        """Toggle the header's in-progress pill based on restart_in_progress.
+        Safe to call before the header has mounted — missing widget is a
+        no-op."""
+        try:
+            pill = self.query_one("#daemon-restarting", RestartingPill)
+        except Exception:
+            return
+        if self.restart_in_progress:
             pill.add_class("visible")
         else:
             pill.remove_class("visible")
@@ -581,9 +650,29 @@ class VoxtypeTUI(App[None]):
         self.daemon_state = voxtype_cli.read_state() or "no-daemon"
 
     def watch_daemon_state(self, state: str) -> None:
+        self._render_status()
+
+    def watch_restart_in_progress(self, in_progress: bool) -> None:
+        """When the in-flight flag flips, refresh the three things it
+        drives: the in-progress pill, the stale pill (which hides while
+        in-flight), and the status label (which says 'starting' instead
+        of 'no-daemon' until the daemon writes its state file)."""
+        self.refresh_restart_pill()
+        self.refresh_stale_pill()
+        self._render_status()
+
+    def _render_status(self) -> None:
+        """Render the header status label. While a restart is in flight
+        and the daemon hasn't written its state file yet, show 'starting'
+        instead of 'no-daemon' so the user understands the daemon is
+        coming back up rather than thinking it died."""
         try:
             widget = self.query_one("#status", Static)
         except Exception:
+            return
+        state = self.daemon_state
+        if self.restart_in_progress and state in ("?", "no-daemon"):
+            widget.update("⟳ starting")
             return
         icon = STATUS_ICONS.get(state, "?")
         widget.update(f"{icon} {state}")
@@ -685,6 +774,12 @@ class VoxtypeTUI(App[None]):
         the binding)."""
         if self.state is None:
             return
+        if self.restart_in_progress:
+            # Clearer than the old "already up to date" message which
+            # would fire here because _do_restart cleared daemon_stale
+            # before the readiness wait completed.
+            self.notify("Daemon restart already in progress…", timeout=2)
+            return
         if not self.state.daemon_stale:
             self.notify("Daemon is already up to date", timeout=2)
             return
@@ -700,16 +795,58 @@ class VoxtypeTUI(App[None]):
         await self._do_restart()
 
     async def _do_restart(self) -> None:
-        self.notify("Restarting voxtype daemon…", timeout=3)
-        ok, msg = await voxtype_cli.restart_daemon_async()
-        if ok and self.state is not None:
-            self.state.daemon_stale = False
-            self.refresh_stale_pill()
-        self.notify(
-            msg,
-            severity="information" if ok else "error",
-            timeout=5 if ok else 10,
-        )
+        """Drive the full restart cycle, from systemctl through model load.
+
+        Two-phase: (1) systemctl restart returns ~instantly with the unit
+        marked active, (2) wait for the daemon to write a ready state
+        (idle/recording/transcribing) to its state file. The pill +
+        "starting" status label cover the gap so the user sees what's
+        happening instead of staring at a frozen-looking "no-daemon".
+
+        Re-entry guarded — clicking the pill again mid-restart is a no-op
+        with a toast, not a parallel restart."""
+        if self.restart_in_progress:
+            return
+        self.restart_in_progress = True
+        try:
+            self.notify("Restarting voxtype daemon…", timeout=2)
+            ok, msg = await voxtype_cli.restart_daemon_async()
+            if not ok:
+                self.notify(
+                    msg or "restart failed",
+                    severity="error",
+                    timeout=10,
+                )
+                return
+            # systemctl reports active; the daemon is alive but not
+            # necessarily serving yet. Clear the stale flag now (we DID
+            # restart) but keep the in-progress pill up until the state
+            # file flips to a ready state. Explicit refresh — the
+            # watcher on restart_in_progress also calls this in finally,
+            # but doing it here too means the stale pill disappears the
+            # moment systemctl confirms the restart kicked off, not
+            # 5–15s later when the model finishes loading.
+            if self.state is not None:
+                self.state.daemon_stale = False
+                self.refresh_stale_pill()
+            ready = await voxtype_cli.wait_for_daemon_ready_async()
+            # Refresh the polled state immediately so the header status
+            # catches up without waiting for the next 0.5s tick.
+            self.poll_daemon_state()
+            if ready:
+                self.notify("Voxtype daemon ready", timeout=3)
+            else:
+                self.notify(
+                    "Daemon restarted but didn't report ready within 20s — "
+                    "check `systemctl --user status voxtype`",
+                    severity="warning",
+                    timeout=10,
+                )
+        finally:
+            # Always release the in-flight flag, even if the readiness
+            # poll raised. Otherwise a stuck flag would block all future
+            # restarts and quits.
+            self.restart_in_progress = False
 
     def action_export_bundle(self) -> None:
         """Open the manual-export modal. Dismissal callback surfaces the
@@ -863,6 +1000,18 @@ class VoxtypeTUI(App[None]):
         )
 
     def action_request_quit(self) -> None:
+        if self.restart_in_progress:
+            # self.exit() during an in-flight to_thread doesn't take effect
+            # until the task drains, so the old behavior was that Q sat
+            # silently for 5–15s and then the app vanished. Refusing
+            # explicitly is much less confusing.
+            self.notify(
+                "Restart in progress — wait for the daemon to be ready, "
+                "then press Q again",
+                severity="warning",
+                timeout=4,
+            )
+            return
         if self.state is None or not self.state.dirty:
             self.exit()
             return
@@ -877,6 +1026,22 @@ def main() -> None:
     if "--apply-migrations" in sys.argv[1:]:
         from .cli_migrate import main as migrate_main
         sys.exit(migrate_main(sys.argv[1:]))
+    # Refuse to launch when another voxtype-tui is already running.
+    # Two concurrent TUIs against the same `~/.config/voxtype/config.toml`
+    # silently lose updates (no fcntl lock around save). Most realistic
+    # repro: the AUR install + a conda dev env open simultaneously.
+    from . import single_instance
+    lock = single_instance.acquire()
+    if not lock.acquired:
+        holder = (
+            f"PID {lock.holder_pid}" if lock.holder_pid else "another instance"
+        )
+        print(
+            f"voxtype-tui: another instance is already running ({holder}). "
+            f"Refusing to launch — concurrent TUIs lose updates silently.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     app = VoxtypeTUI()
     app.run()
     _restart_daemon_on_exit_if_needed(app)

@@ -10,9 +10,17 @@ import asyncio
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 STATE_FILE = Path(f"/run/user/{os.getuid()}/voxtype/state")
+
+# States the daemon writes to its state file once initialization is done.
+# `systemctl restart voxtype` returns the moment the unit is `active`, but
+# voxtype still has to load the model into memory (and init GPU) before it
+# can serve. The state file appearing with one of these values is the
+# honest signal that the daemon is actually ready.
+DAEMON_READY_STATES: tuple[str, ...] = ("idle", "recording", "transcribing")
 
 
 def read_state() -> str | None:
@@ -62,6 +70,29 @@ async def is_daemon_active_async() -> bool:
 
 async def restart_daemon_async() -> tuple[bool, str]:
     return await asyncio.to_thread(restart_daemon)
+
+
+async def wait_for_daemon_ready_async(
+    timeout: float = 20.0,
+    poll_interval: float = 0.15,
+) -> bool:
+    """Poll the daemon state file until it reports a ready state, or give
+    up after `timeout` seconds. Returns True on ready, False on timeout.
+
+    `restart_daemon` is the systemctl-level signal — it goes True the moment
+    the unit is `active`. That's well before the daemon has finished
+    loading the Whisper model on a typical config, so a UI that flips to
+    "Ready" on systemctl's word is lying to the user. This helper closes
+    the gap by waiting for the state file the daemon itself writes once
+    the model is loaded.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if read_state() in DAEMON_READY_STATES:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(poll_interval)
 
 
 # Engines Voxtype knows about. The subset that's actually compiled into

@@ -458,14 +458,44 @@ class ModelsPane(VimTableNav, Vertical):
         select.set_options([
             (self._engine_label(e), e) for e in MODEL_CATALOG.keys()
         ])
-        select.value = "whisper"
+        # Hydrate from state if available; fall back to whisper. Without
+        # this, the Select stays at "whisper" even when state.doc says
+        # the live engine is something else — and `_action_set_active`
+        # would then write to `whisper.model` instead of the live
+        # engine's model field, silently corrupting config.
+        select.value = self._engine_from_state() or "whisper"
         self.refresh_table()
         self._update_disk_label()
         self._refresh_button_availability()
 
     def sync_from_state(self) -> None:
+        # Re-sync the engine Select from state.doc on every reload so
+        # the Models tab reflects the live engine. The Select fires
+        # Select.Changed when its value changes, which would normally
+        # trip the on_select_changed handler — guard with the existing
+        # _suppress_events flag (set elsewhere in this class) by simply
+        # re-using a temporary suppression here.
+        select = self.query_one("#models-engine", Select)
+        target = self._engine_from_state() or "whisper"
+        if str(select.value) != target:
+            # Use the widget's built-in `set_value` semantics by
+            # assigning directly. Other panes (Settings) are nudged
+            # only by explicit cross-tab sync calls, so no event
+            # suppression is needed here — Models doesn't have an
+            # on_select_changed for the engine select.
+            select.value = target
         self.refresh_table()
         self._update_disk_label()
+
+    def _engine_from_state(self) -> str:
+        """Read the live engine from state.doc, lowercased.
+        Returns "" when state isn't loaded yet."""
+        if self.tui.state is None:
+            return ""
+        engine = self.tui.state.doc.get("engine")
+        if engine is None:
+            return ""
+        return str(engine).strip().lower()
 
     # ---- selectors ----
 
@@ -569,6 +599,25 @@ class ModelsPane(VimTableNav, Vertical):
         if not name:
             return
         engine = self._current_engine()
+        # Defensive: refuse to write a model field for an engine that
+        # isn't the live engine in state.doc. Without this, a stale
+        # Models tab Select (e.g. left at "whisper" while the Settings
+        # tab switched the live engine to "parakeet") would write
+        # `whisper.model = X` under the parakeet engine — silently
+        # corrupting the wrong engine's slot. sync_from_state now
+        # prevents this from happening, but the guard makes the
+        # invariant explicit.
+        live_engine = self._engine_from_state() or "whisper"
+        if engine != live_engine:
+            self.app.notify(
+                f"Models tab shows '{engine}' but the live engine is "
+                f"'{live_engine}'. Switch the engine selector first, "
+                "then pick a model.",
+                severity="warning",
+                title="Engine mismatch",
+                timeout=8,
+            )
+            return
         path = MODEL_PATH_PER_ENGINE.get(engine)
         if not path:
             self.app.notify(

@@ -100,11 +100,16 @@ class AppState:
         )
 
         # Startup sync reconcile. Mutates `doc` + `sc` in place when a
-        # newer sync.json is applied (and writes them back to disk
-        # atomically so loaded state matches disk). The `loaded_dump`
-        # snapshot below therefore captures post-apply doc, which is
-        # correct — dirty flags stay at their current derived values
-        # because apply + immediate persist leaves nothing pending.
+        # newer sync.json is applied. Previously it ALSO wrote the
+        # mutated state back to disk automatically, which silently
+        # overwrote user-edited settings on every launch — the "model
+        # changes by itself" bug. The reconciler now sets
+        # `needs_save_doc` / `needs_save_sidecar` on the result and
+        # leaves persistence to the user's next Ctrl+S. The
+        # `loaded_dump` snapshot is taken BEFORE the post-apply state
+        # so config_dirty correctly reflects pending sync changes —
+        # the user must explicitly save to persist them.
+        pre_sync_dump = tomlkit.dumps(doc)
         sync_result = sync.reconcile_sync_on_startup(
             doc, sc,
             config_path=config_path,
@@ -116,9 +121,15 @@ class AppState:
             sc=sc,
             config_path=config_path,
             sidecar_path=sidecar_path,
-            loaded_dump=tomlkit.dumps(doc),
-            config_dirty=config_dirty_from_migrations,
-            sidecar_dirty=sidecar_dirty,
+            loaded_dump=pre_sync_dump,
+            config_dirty=(
+                config_dirty_from_migrations
+                or sync_result.needs_save_doc
+            ),
+            sidecar_dirty=(
+                sidecar_dirty
+                or sync_result.needs_save_sidecar
+            ),
             daemon_stale=config_dirty_from_migrations,
             reconcile_warnings=w1 + w2,
             migrations_applied=migration_result.applied,

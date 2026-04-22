@@ -67,6 +67,8 @@ class ImportBundleModal(ModalScreen[bool]):
     }}
     ImportBundleModal #include-local-row {{ height: auto; margin-bottom: 1; }}
     ImportBundleModal #include-local-row.hidden {{ display: none; }}
+    ImportBundleModal #include-settings-row {{ height: auto; margin-bottom: 1; }}
+    ImportBundleModal #include-settings-row.hidden {{ display: none; }}
     ImportBundleModal #actions {{ height: auto; align: center middle; }}
     ImportBundleModal Button {{ margin: 0 1; }}
     """
@@ -94,6 +96,15 @@ class ImportBundleModal(ModalScreen[bool]):
 
             with Horizontal(id="import-load-row"):
                 yield Button("Load", variant="primary", id="do-load")
+
+            with Horizontal(id="include-settings-row", classes="hidden"):
+                yield Checkbox(
+                    "Import portable settings (whisper.model, engine, "
+                    "language, output mode, etc.) — off by default to "
+                    "protect your local model selection",
+                    value=False,
+                    id="include-settings",
+                )
 
             with Horizontal(id="include-local-row", classes="hidden"):
                 yield Checkbox(
@@ -129,9 +140,12 @@ class ImportBundleModal(ModalScreen[bool]):
             self._do_apply()
 
     def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
-        # Recompute preview when the include-local toggle flips so the
+        # Recompute preview when either include-* toggle flips so the
         # diff honestly reflects what Apply will do.
-        if event.checkbox.id == "include-local" and self._loaded_bundle is not None:
+        if (
+            event.checkbox.id in ("include-local", "include-settings")
+            and self._loaded_bundle is not None
+        ):
             self._refresh_preview()
 
     # --- load stage ---
@@ -164,6 +178,16 @@ class ImportBundleModal(ModalScreen[bool]):
         else:
             self.query_one("#include-local-row").add_class("hidden")
 
+        # Show the settings toggle only when the bundle has portable
+        # settings worth importing. Default OFF so the import doesn't
+        # silently overwrite the user's local model selection — the
+        # exact failure mode that produced the "model changes by
+        # itself" bug.
+        if bundle.sync.get("settings"):
+            self.query_one("#include-settings-row").remove_class("hidden")
+        else:
+            self.query_one("#include-settings-row").add_class("hidden")
+
         self._refresh_preview()
         self.query_one("#do-apply", Button).disabled = False
 
@@ -174,13 +198,35 @@ class ImportBundleModal(ModalScreen[bool]):
             self.query_one("#include-local", Checkbox).value
             if self._loaded_bundle.local else False
         )
+        bundle_to_preview = self._effective_bundle()
         preview = sync.diff_bundle_against_state(
-            self._loaded_bundle, self.state.doc, self.state.sc,
+            bundle_to_preview, self.state.doc, self.state.sc,
             include_local=include_local,
         )
         body = self.query_one("#preview-body", Static)
         body.update(_render_preview(preview, self._load_warnings))
         self.query_one("#preview-scroll").remove_class("hidden")
+
+    def _effective_bundle(self) -> sync.Bundle:
+        """Return the bundle as it will actually be applied — settings
+        stripped when the user hasn't ticked Include settings.
+
+        Default-off Include settings is the contract that protects
+        users from silent overwrites of `whisper.model` when they
+        import an old bundle to restore vocab/replacements."""
+        assert self._loaded_bundle is not None
+        bundle = self._loaded_bundle
+        if not bundle.sync.get("settings"):
+            return bundle
+        try:
+            include_settings = bool(
+                self.query_one("#include-settings", Checkbox).value
+            )
+        except Exception:
+            include_settings = False
+        if include_settings:
+            return bundle
+        return sync._bundle_with_stripped_settings(bundle)
 
     # --- apply stage ---
 
@@ -192,8 +238,9 @@ class ImportBundleModal(ModalScreen[bool]):
             self.query_one("#include-local", Checkbox).value
             if self._loaded_bundle.local else False
         )
+        bundle_to_apply = self._effective_bundle()
         warnings = sync.apply_bundle_to_state(
-            self._loaded_bundle, self.state.doc, self.state.sc,
+            bundle_to_apply, self.state.doc, self.state.sc,
             include_local=include_local,
         )
         # Import writes to the in-memory shadow only. Flip dirty flags

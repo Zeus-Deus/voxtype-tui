@@ -113,9 +113,14 @@ async def test_engine_change_preserves_model_when_valid(tmp_env):
         assert pane.query_one("#settings-model", Select).value == "base"
 
 
-async def test_engine_change_resets_model_when_invalid(tmp_env):
-    """whisper has 'large-v3-turbo' but parakeet doesn't. Flipping engine
-    should swap the model to parakeet's first known value."""
+async def test_engine_change_does_not_write_default_model(tmp_env):
+    """Flipping engine must NOT silently write a fallback model into the
+    new engine's config slot — the previous behavior clobbered any model
+    the user might already have set, and was one of the contributing
+    causes of the "model changes by itself" bug. The dropdown options
+    refresh; the model field stays unset until the user picks
+    explicitly. Voxtype's own default kicks in at daemon start when the
+    key is absent, so an unset model is safe."""
     cfg, side = tmp_env
     app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
     async with app.run_test() as pilot:
@@ -130,10 +135,14 @@ async def test_engine_change_resets_model_when_invalid(tmp_env):
         await pilot.pause()
 
         assert app.state.doc["engine"] == "parakeet"
-        default = MODELS_PER_ENGINE["parakeet"][0]
-        # Per Voxtype src/config.rs:982, parakeet's active-model key is
-        # `model`, not `model_type` (which is a separate tdt/ctc enum).
-        assert app.state.doc["parakeet"]["model"] == default
+        # Engine flipped, but no parakeet.model was written. The user
+        # picks in the now-repopulated dropdown.
+        parakeet_section = app.state.doc.get("parakeet")
+        if parakeet_section is not None:
+            assert "model" not in parakeet_section, (
+                "engine flip must not auto-write parakeet.model — that was "
+                "the silent-overwrite bug"
+            )
 
 
 async def test_model_change_is_restart_sensitive(tmp_env):
