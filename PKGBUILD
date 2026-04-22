@@ -1,6 +1,6 @@
 # Maintainer: Zeus-Deus <github.commits@widow.cc>
 pkgname=voxtype-tui
-pkgver=0.1.4
+pkgver=0.1.5
 pkgrel=1
 pkgdesc="Textual-based TUI for managing Voxtype (Linux voice-to-text daemon)"
 arch=('any')
