@@ -62,3 +62,91 @@ async def is_daemon_active_async() -> bool:
 
 async def restart_daemon_async() -> tuple[bool, str]:
     return await asyncio.to_thread(restart_daemon)
+
+
+# Engines Voxtype knows about. The subset that's actually compiled into
+# the installed binary is detected at runtime by `compiled_engines()`
+# below — upstream AUR builds (`voxtype-bin`) ship whisper-only; custom
+# `cargo build --features X,Y,Z` unlocks others.
+_KNOWN_ENGINES: tuple[str, ...] = (
+    "whisper", "parakeet", "moonshine", "sensevoice",
+    "paraformer", "dolphin", "omnilingual",
+)
+
+
+# Strings we match against the output of `voxtype setup model`. Regex-free
+# substring checks — the output is plain ASCII with ANSI colors, and
+# a .startswith() match on the header line is sufficient to identify
+# each engine's section.
+_ENGINE_HEADERS: dict[str, str] = {
+    "whisper": "--- Whisper",
+    "parakeet": "--- Parakeet",
+    "moonshine": "--- Moonshine",
+    "sensevoice": "--- SenseVoice",
+    "paraformer": "--- Paraformer",
+    "dolphin": "--- Dolphin",
+    "omnilingual": "--- Omnilingual",
+}
+
+
+def compiled_engines(timeout: float = 5.0) -> set[str]:
+    """Return the set of engine names compiled into the installed
+    Voxtype binary.
+
+    Works by running ``voxtype setup model`` with stdin closed and
+    scanning the output for ``(not available - rebuild with
+    --features X)`` markers. Engines whose section *lacks* that marker
+    are considered compiled-in.
+
+    Fallback: on any error (binary missing, subprocess timeout,
+    unparseable output), return ``{"whisper"}`` — the most common
+    shape on AUR/precompiled installs. Preserving the download button
+    for whisper matters more than being strictly accurate on error.
+    """
+    if shutil.which("voxtype") is None:
+        return {"whisper"}
+    try:
+        result = subprocess.run(
+            ["voxtype", "setup", "model"],
+            capture_output=True, text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return {"whisper"}
+
+    # Strip ANSI color codes for matching — the "(not available ...)"
+    # marker is wrapped in grey.
+    import re
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+    lines = plain.splitlines()
+
+    compiled: set[str] = set()
+    current_engine: str | None = None
+    for line in lines:
+        stripped = line.strip()
+        matched_engine: str | None = None
+        for engine, header in _ENGINE_HEADERS.items():
+            if stripped.startswith(header):
+                matched_engine = engine
+                break
+        if matched_engine is not None:
+            # New section header — the previous engine either reported
+            # "(not available ...)" inside or stayed compiled.
+            if current_engine is not None:
+                compiled.add(current_engine)
+            current_engine = matched_engine
+            continue
+        if current_engine is not None and "(not available" in stripped:
+            # This engine's section declared itself uncompiled.
+            current_engine = None
+    if current_engine is not None:
+        compiled.add(current_engine)
+
+    # Defensive: if parsing yielded nothing (output format changed),
+    # fall back to whisper-only rather than greying everything out.
+    return compiled or {"whisper"}
+
+
+async def compiled_engines_async(timeout: float = 5.0) -> set[str]:
+    return await asyncio.to_thread(compiled_engines, timeout)

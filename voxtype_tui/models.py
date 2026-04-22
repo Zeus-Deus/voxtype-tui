@@ -391,6 +391,18 @@ class ModelsPane(VimTableNav, Vertical):
         super().__init__()
         self._active_proc: asyncio.subprocess.Process | None = None
         self._active_model: str | None = None
+        # Engines actually compiled into the user's voxtype binary.
+        # Populated by on_mount via a cheap subprocess probe; defaults
+        # to the full catalog so tests without voxtype see every row.
+        self._compiled_engines: set[str] = set(MODEL_CATALOG.keys())
+
+    def _engine_label(self, engine: str) -> str:
+        """Render an engine name for the Select dropdown, tagging
+        engines that aren't compiled into the user's voxtype binary
+        so the choice is honest about what works."""
+        if engine in self._compiled_engines:
+            return engine
+        return f"{engine} (not compiled)"
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="models-top"):
@@ -431,8 +443,25 @@ class ModelsPane(VimTableNav, Vertical):
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
         table.add_columns("Model", "Size", "Status", "Active")
+        # Detect which engines voxtype was compiled with. Runs a single
+        # `voxtype setup model` subprocess with stdin closed (<1s on
+        # any reasonable machine). Silent on failure — fallback inside
+        # `compiled_engines()` keeps whisper unlocked.
+        try:
+            from . import voxtype_cli
+            self._compiled_engines = voxtype_cli.compiled_engines()
+        except Exception:
+            self._compiled_engines = {"whisper"}
+        # Re-label the engine Select so "(not compiled)" suffixes
+        # appear on engines the user's binary can't use.
+        select = self.query_one("#models-engine", Select)
+        select.set_options([
+            (self._engine_label(e), e) for e in MODEL_CATALOG.keys()
+        ])
+        select.value = "whisper"
         self.refresh_table()
         self._update_disk_label()
+        self._refresh_button_availability()
 
     def sync_from_state(self) -> None:
         self.refresh_table()
@@ -503,6 +532,7 @@ class ModelsPane(VimTableNav, Vertical):
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "models-engine":
             self.refresh_table()
+            self._refresh_button_availability()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id
@@ -592,63 +622,33 @@ class ModelsPane(VimTableNav, Vertical):
             self.app.notify("No model selected", severity="warning")
             return
         engine = self._current_engine()
-        if engine == "whisper":
-            # Whisper: Voxtype's `setup --download --model <NAME>` works
-            # non-interactively for every known whisper model, so we
-            # keep the in-app progress-bar flow.
-            asyncio.create_task(self._run_download(name))
+        if engine not in self._compiled_engines:
+            # The user's voxtype binary wasn't built with support for
+            # this engine — downloading a model for it wouldn't help,
+            # the daemon couldn't transcribe with it even if the file
+            # was on disk.
+            self.app.notify(
+                f"Voxtype wasn't compiled with --features {engine}. "
+                f"Rebuild voxtype (or switch engine) to download "
+                f"{engine} models.",
+                severity="warning", timeout=8,
+                title=f"{engine} not compiled",
+            )
             return
-        # Non-whisper engines: `setup --download` only knows whisper
-        # names, so the only reliable download path is Voxtype's own
-        # interactive picker (`voxtype setup model`). We suspend the
-        # TUI, hand the terminal to Voxtype for the picker flow, then
-        # resume and refresh the table to pick up whatever landed.
-        asyncio.create_task(self._run_interactive_picker())
+        asyncio.create_task(self._run_download(name))
 
-    async def _run_interactive_picker(self) -> None:
-        """Shell out to `voxtype setup model` with the terminal fully
-        yielded. Voxtype owns the download UI during this; we refresh
-        our state when it returns so newly-downloaded models appear.
-        """
-        import shutil
-        if shutil.which("voxtype") is None:
-            self.app.notify(
-                "voxtype binary not on PATH — can't launch picker",
-                severity="error", timeout=6,
-            )
-            return
-        self.app.notify(
-            "Opening Voxtype's interactive downloader — TUI will "
-            "resume when you finish.", timeout=3,
-        )
-        # `app.suspend()` releases the terminal so Voxtype's picker
-        # can read stdin and draw. Must run on a worker thread so we
-        # don't block the event loop while the user reads the prompt.
-        def _run() -> int:
-            import subprocess
-            with self.app.suspend():
-                return subprocess.run(["voxtype", "setup", "model"]).returncode
+    def _refresh_button_availability(self) -> None:
+        """Disable the Download button when the selected engine isn't
+        compiled into the user's voxtype binary — the button would
+        fire a subprocess that can't succeed. `Set active` stays
+        enabled because the user may still want to mark a pre-existing
+        model file active (e.g. after rebuilding voxtype)."""
+        engine = self._current_engine()
         try:
-            rc = await asyncio.to_thread(_run)
-        except Exception as e:
-            self.app.notify(f"Picker failed: {e}", severity="error", timeout=6)
-            return
-        # Voxtype may have downloaded a model AND/OR changed the
-        # active model in config.toml. Reload state so the TUI's
-        # shadow copy matches disk; otherwise the user's next save
-        # would revert whatever the picker just wrote.
-        try:
-            self.tui.load_state()
+            btn = self.query_one("#models-download", Button)
         except Exception:
-            pass
-        self.refresh_table()
-        self._update_disk_label()
-        if rc == 0:
-            self.app.notify("Picker finished — table refreshed.", timeout=4)
-        else:
-            self.app.notify(
-                f"Picker exited with code {rc}", severity="warning", timeout=5,
-            )
+            return
+        btn.disabled = engine not in self._compiled_engines
 
     def _action_delete(self) -> None:
         name = self._selected_model_name()

@@ -234,6 +234,17 @@ Our own format is detected via the `format: "voxtype-tui-bundle"` tag.
 Commit between each step. No step touches the daemon without explicit
 user action.
 
+## Engine availability + Models tab
+
+Voxtype supports 7 engines (whisper, parakeet, moonshine, sensevoice, paraformer, dolphin, omnilingual) but most are gated behind Cargo features. The upstream AUR `voxtype-bin` package ships **whisper-only**; the others need a custom `cargo build --features moonshine,parakeet,…` to unlock.
+
+voxtype-tui detects compiled engines at Models-tab mount via `voxtype_cli.compiled_engines()`, which runs `voxtype setup model` with stdin closed and scans for `(not available - rebuild with --features X)` markers. The detected set drives two pieces of UI:
+
+- Uncompiled engines show `<name> (not compiled)` in the engine Select dropdown — users see why Download is unavailable.
+- The Download button is disabled when the selected engine is uncompiled. It would otherwise fire a subprocess guaranteed to fail with a rebuild-instruction error.
+
+Whisper + every compiled non-whisper engine goes through the same in-app subprocess flow (`voxtype setup --download --model <NAME>`), same progress bar, same refresh semantics. On probe failure (missing binary, timeout, unparseable output) the fallback is whisper-only so basic dictation stays functional. See `voxtype_cli.py` for the parser and `models.py` for the wiring.
+
 ## Schema migrations + update propagation
 
 New releases can ship with schema changes (e.g. "enable the post-process CLI for any existing install that has rules"). Three triggers all funnel into one pure function — `migrations.run_pending(doc, sc)` — so a new feature only needs ONE place to wire an auto-activation:

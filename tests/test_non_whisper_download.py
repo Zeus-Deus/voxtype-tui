@@ -1,15 +1,16 @@
-"""Tests for the Download button on non-whisper engines.
+"""Tests for the per-engine Download button visibility + behavior.
 
-Non-whisper download uses `app.suspend()` + spawning Voxtype's own
-interactive picker (`voxtype setup model`) because `setup --download
---model <NAME>` only knows whisper names. We cannot unit-test the
-interactive flow end-to-end — no real terminal in pytest — so we test
-the wiring: dispatch routes correctly, the subprocess call is made,
-failures are surfaced, state is reloaded on success.
+The Models tab probes the user's voxtype binary at mount time to learn
+which engines are compiled in. Engines that aren't compiled get a
+disabled Download button (pressing it would fire a subprocess that
+fails with a "rebuild with --features X" error), and a "(not
+compiled)" label in the engine Select so users see why.
+
+Whisper is always assumed compiled (fallback on probe failure). Custom
+voxtype builds with every feature enabled get the full set.
 """
 from __future__ import annotations
 
-import asyncio
 import shutil
 from pathlib import Path
 
@@ -50,117 +51,187 @@ async def _switch_to_engine(pilot, app, engine: str) -> None:
 
 # ---------------------------------------------------------------------------
 
-async def test_non_whisper_dispatch_routes_to_picker(tmp_env, monkeypatch):
-    """Pressing Download on a moonshine row must call the interactive-picker
-    path, NOT the whisper-specific `_run_download`."""
+async def test_whisper_download_button_enabled(tmp_env, monkeypatch):
+    """Whisper is always compiled → button enabled → pressing it fires
+    the existing `_run_download` subprocess flow."""
     cfg, side, _ = tmp_env
+    monkeypatch.setattr(voxtype_cli, "compiled_engines", lambda timeout=5.0: {"whisper"})
     app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
 
-    picker_calls: list[str] = []
     download_calls: list[str] = []
-
-    async def fake_picker(self):
-        picker_calls.append("called")
 
     async def fake_download(self, name):
         download_calls.append(name)
 
-    monkeypatch.setattr(ModelsPane, "_run_interactive_picker", fake_picker)
     monkeypatch.setattr(ModelsPane, "_run_download", fake_download)
 
     async with app.run_test() as pilot:
         await pilot.pause()
-        await _switch_to_engine(pilot, app, "moonshine")
-        pane = app.query_one(ModelsPane)
-        pane._selected_model_name = lambda: "base"
-        pane._action_download()
-        # Let the scheduled task tick.
-        for _ in range(5):
-            await pilot.pause()
-
-    assert picker_calls == ["called"]
-    assert download_calls == []
-
-
-async def test_whisper_dispatch_still_uses_direct_download(tmp_env, monkeypatch):
-    """The whisper path must NOT regress to the interactive picker —
-    users depend on the in-app progress bar for whisper downloads."""
-    cfg, side, _ = tmp_env
-    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
-
-    picker_calls: list[str] = []
-    download_calls: list[str] = []
-
-    async def fake_picker(self):
-        picker_calls.append("called")
-
-    async def fake_download(self, name):
-        download_calls.append(name)
-
-    monkeypatch.setattr(ModelsPane, "_run_interactive_picker", fake_picker)
-    monkeypatch.setattr(ModelsPane, "_run_download", fake_download)
-
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        await pilot.press("4")  # Models tab — defaults to whisper
+        await pilot.press("4")
         await pilot.pause()
         pane = app.query_one(ModelsPane)
+        from textual.widgets import Button
+        btn = pane.query_one("#models-download", Button)
+        assert btn.disabled is False
         pane._selected_model_name = lambda: "tiny.en"
         pane._action_download()
         for _ in range(5):
             await pilot.pause()
-
     assert download_calls == ["tiny.en"]
-    assert picker_calls == []
 
 
-async def test_picker_reloads_state_after_success(tmp_env, monkeypatch):
-    """When the picker exits cleanly, we reload AppState from disk so
-    any active-model change Voxtype made gets picked up. Without this
-    the TUI's in-memory state would clobber the picker's change on
-    the user's next save."""
+async def test_uncompiled_engine_download_button_disabled(tmp_env, monkeypatch):
+    """Switching the Select to an uncompiled engine must disable the
+    Download button. The user can't reach a misleading failure path."""
     cfg, side, _ = tmp_env
-
-    async def fake_to_thread(fn, *a, **k):
-        # Simulate successful subprocess invocation.
-        return 0
-
-    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
-    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/voxtype")
-
+    monkeypatch.setattr(voxtype_cli, "compiled_engines", lambda timeout=5.0: {"whisper"})
     app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
-    reload_calls: list[int] = []
-    orig_load = VoxtypeTUI.load_state
-    def counted_load(self):
-        reload_calls.append(1)
-        return orig_load(self)
-    monkeypatch.setattr(VoxtypeTUI, "load_state", counted_load)
-
     async with app.run_test() as pilot:
         await pilot.pause()
-        before = len(reload_calls)
+        await _switch_to_engine(pilot, app, "moonshine")
         pane = app.query_one(ModelsPane)
-        await pane._run_interactive_picker()
-        await pilot.pause()
-        # load_state must have been called by the picker-return path.
-        assert len(reload_calls) > before
+        from textual.widgets import Button
+        btn = pane.query_one("#models-download", Button)
+        assert btn.disabled is True
 
 
-async def test_picker_handles_missing_voxtype_binary(tmp_env, monkeypatch):
-    """If `voxtype` isn't on PATH the picker path must bail with a
-    clear error instead of raising."""
+async def test_compiled_non_whisper_engine_unlocks_download(tmp_env, monkeypatch):
+    """On a custom voxtype build with moonshine compiled in, switching
+    to moonshine must enable the Download button and route through the
+    same subprocess flow whisper uses."""
     cfg, side, _ = tmp_env
-    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(
+        voxtype_cli, "compiled_engines",
+        lambda timeout=5.0: {"whisper", "moonshine"},
+    )
+    download_calls: list[str] = []
+    async def fake_download(self, name):
+        download_calls.append(name)
+    monkeypatch.setattr(ModelsPane, "_run_download", fake_download)
+
     app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
-    notified: list[str] = []
     async with app.run_test() as pilot:
         await pilot.pause()
+        await _switch_to_engine(pilot, app, "moonshine")
         pane = app.query_one(ModelsPane)
-        orig_notify = pane.app.notify
-        def capture(msg, *a, **k):
-            notified.append(msg)
-            return orig_notify(msg, *a, **k)
-        monkeypatch.setattr(pane.app, "notify", capture)
-        await pane._run_interactive_picker()
+        from textual.widgets import Button
+        assert pane.query_one("#models-download", Button).disabled is False
+        pane._selected_model_name = lambda: "base"
+        pane._action_download()
+        for _ in range(5):
+            await pilot.pause()
+    assert download_calls == ["base"]
+
+
+async def test_uncompiled_engine_label_marked_in_select(tmp_env, monkeypatch):
+    """The engine Select's visible labels must flag uncompiled engines
+    so the user understands why Download is unavailable."""
+    cfg, side, _ = tmp_env
+    monkeypatch.setattr(
+        voxtype_cli, "compiled_engines",
+        lambda timeout=5.0: {"whisper", "parakeet"},
+    )
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
         await pilot.pause()
-    assert any("voxtype binary not on PATH" in m for m in notified)
+        await pilot.press("4")
+        await pilot.pause()
+        pane = app.query_one(ModelsPane)
+        from textual.widgets import Select
+        sel = pane.query_one("#models-engine", Select)
+        labels = {str(label): value for label, value in sel._options}
+        # Whisper + parakeet compiled: plain labels.
+        assert any(k == "whisper" for k in labels)
+        assert any(k == "parakeet" for k in labels)
+        # Moonshine etc uncompiled: label has "(not compiled)" suffix.
+        assert any(k == "moonshine (not compiled)" for k in labels)
+
+
+async def test_probe_fallback_keeps_whisper_unlocked(tmp_env, monkeypatch):
+    """If the `voxtype setup model` probe fails (binary missing,
+    timeout, parse error), fallback guarantees whisper stays working."""
+    cfg, side, _ = tmp_env
+    def boom(timeout=5.0):
+        raise RuntimeError("probe exploded")
+    monkeypatch.setattr(voxtype_cli, "compiled_engines", boom)
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("4")
+        await pilot.pause()
+        pane = app.query_one(ModelsPane)
+        from textual.widgets import Button
+        assert pane.query_one("#models-download", Button).disabled is False
+
+
+# ---------------------------------------------------------------------------
+# compiled_engines parser unit tests
+# ---------------------------------------------------------------------------
+
+def test_compiled_engines_parses_mixed_output(monkeypatch):
+    """Feed the parser a realistic voxtype output and verify only the
+    engines whose section lacks the "(not available ...)" marker get
+    reported as compiled."""
+    fake_output = (
+        "Voxtype Model Selection\n"
+        "\n"
+        "--- Whisper (OpenAI) ---\n"
+        "  [ 1] tiny (75 MB)\n"
+        "  [ 2] base (142 MB)\n"
+        "\n"
+        "--- Parakeet (NVIDIA) ---\n"
+        "  (not available - rebuild with --features parakeet)\n"
+        "\n"
+        "--- Moonshine (MoonshineAI) ---\n"
+        "  [ 3] base (237 MB)\n"
+        "\n"
+        "--- SenseVoice ---\n"
+        "  (not available - rebuild with --features sensevoice)\n"
+        "\n"
+        "--- Paraformer ---\n"
+        "  (not available - rebuild with --features paraformer)\n"
+    )
+    class FakeResult:
+        stdout = fake_output
+        returncode = 0
+    import subprocess as _s
+    monkeypatch.setattr(voxtype_cli, "shutil",
+                        type("X", (), {"which": staticmethod(lambda n: "/usr/bin/voxtype")}))
+    monkeypatch.setattr(_s, "run", lambda *a, **kw: FakeResult())
+    monkeypatch.setattr(voxtype_cli, "subprocess", _s)
+    got = voxtype_cli.compiled_engines(timeout=1.0)
+    assert got == {"whisper", "moonshine"}
+
+
+def test_compiled_engines_binary_missing(monkeypatch):
+    """No voxtype on PATH → return whisper-only fallback."""
+    monkeypatch.setattr(voxtype_cli, "shutil",
+                        type("X", (), {"which": staticmethod(lambda n: None)}))
+    assert voxtype_cli.compiled_engines() == {"whisper"}
+
+
+def test_compiled_engines_timeout_fallback(monkeypatch):
+    """Subprocess timeout → return whisper-only fallback."""
+    import subprocess as _s
+    monkeypatch.setattr(voxtype_cli, "shutil",
+                        type("X", (), {"which": staticmethod(lambda n: "/usr/bin/voxtype")}))
+    def raise_timeout(*a, **kw):
+        raise _s.TimeoutExpired(cmd="voxtype", timeout=1)
+    monkeypatch.setattr(_s, "run", raise_timeout)
+    monkeypatch.setattr(voxtype_cli, "subprocess", _s)
+    assert voxtype_cli.compiled_engines(timeout=1.0) == {"whisper"}
+
+
+def test_compiled_engines_unparseable_output_fallback(monkeypatch):
+    """If the output doesn't contain any known engine headers (e.g.
+    Voxtype changed the format), fallback to whisper-only rather than
+    greying everything."""
+    class FakeResult:
+        stdout = "Something totally different"
+        returncode = 0
+    import subprocess as _s
+    monkeypatch.setattr(voxtype_cli, "shutil",
+                        type("X", (), {"which": staticmethod(lambda n: "/usr/bin/voxtype")}))
+    monkeypatch.setattr(_s, "run", lambda *a, **kw: FakeResult())
+    monkeypatch.setattr(voxtype_cli, "subprocess", _s)
+    assert voxtype_cli.compiled_engines(timeout=1.0) == {"whisper"}
