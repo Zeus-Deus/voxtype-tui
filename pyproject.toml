@@ -23,6 +23,7 @@ dev = [
 
 [project.scripts]
 voxtype-tui = "voxtype_tui.app:main"
+voxtype-tui-postprocess = "voxtype_tui.cli_postprocess:main"
 
 [tool.setuptools.packages.find]
 include = ["voxtype_tui*"]

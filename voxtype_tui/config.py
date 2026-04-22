@@ -252,6 +252,51 @@ def remove_replacement(doc: TOMLDocument, from_text: str) -> None:
     set_replacements(doc, reps)
 
 
+# Our post-process CLI. When `[output.post_process].command` equals this
+# value, voxtype-tui owns the post-process layer: Vexis-style fuzzy
+# replacement + exact capitalization applied to every transcript.
+POSTPROCESS_COMMAND = "voxtype-tui-postprocess"
+POSTPROCESS_TIMEOUT_MS = 5000
+
+
+def get_post_process(doc: TOMLDocument) -> dict[str, Any]:
+    output = doc.get("output")
+    if output is None:
+        return {}
+    pp = output.get("post_process")
+    if pp is None:
+        return {}
+    return {str(k): v for k, v in pp.items()}
+
+
+def set_post_process(
+    doc: TOMLDocument,
+    command: str | None,
+    timeout_ms: int = POSTPROCESS_TIMEOUT_MS,
+) -> None:
+    """Configure `[output.post_process]`. Pass command=None to remove it."""
+    output = doc.get("output")
+    if command is None:
+        if output is not None and "post_process" in output:
+            del output["post_process"]
+        return
+    if "output" not in doc:
+        doc["output"] = tomlkit.table()
+        output = doc["output"]
+    if "post_process" not in output:
+        output["post_process"] = tomlkit.table()
+    pp = output["post_process"]
+    pp["command"] = command
+    pp["timeout_ms"] = timeout_ms
+
+
+def is_our_post_process(doc: TOMLDocument) -> bool:
+    """True when `[output.post_process].command` is our CLI (so we own
+    the post-process layer and can safely assume our rule schema)."""
+    pp = get_post_process(doc)
+    return pp.get("command") == POSTPROCESS_COMMAND
+
+
 def _get_in(node: Any, path: str) -> Any:
     cur = node
     for part in path.split("."):

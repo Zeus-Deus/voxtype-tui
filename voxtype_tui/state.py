@@ -212,6 +212,27 @@ class AppState:
         node[key] = value
         self.config_dirty = True
 
+    def _ensure_post_process_enabled(self) -> None:
+        """Opt the config into our Vexis-style post-processor on save.
+
+        Only wires up `[output.post_process]` when the user has no command
+        of their own — if they've set a custom post-process script (e.g.
+        one of the LLM-cleanup examples shipped with Voxtype), we leave
+        it alone. Idempotent: if our command is already set, nothing
+        changes and `config_dirty` stays put.
+        """
+        if not self.sc.replacements:
+            return
+        pp = config.get_post_process(self.doc)
+        existing = pp.get("command")
+        if existing and existing != config.POSTPROCESS_COMMAND:
+            return
+        want_timeout = config.POSTPROCESS_TIMEOUT_MS
+        if existing == config.POSTPROCESS_COMMAND and pp.get("timeout_ms") == want_timeout:
+            return
+        config.set_post_process(self.doc, config.POSTPROCESS_COMMAND, want_timeout)
+        self.config_dirty = True
+
     # --- save ---
 
     def save(self) -> list[str]:
@@ -234,6 +255,7 @@ class AppState:
         that didn't commit locally, which another Syncthing peer could
         then pull as truth.
         """
+        self._ensure_post_process_enabled()
         baseline_doc = tomlkit.parse(self.loaded_dump)
         config.safe_save(self.doc, self.config_path)
         sidecar.save_atomic(self.sc, self.sidecar_path)
