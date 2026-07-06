@@ -29,6 +29,21 @@ def tmp_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     side = tmp_path / "metadata.json"
     shutil.copy(FIXTURES / "stock.toml", cfg)
 
+    # Model picks in Settings only go through when the model is installed
+    # (the not-downloaded guard). Point MODELS_DIR at a temp tree with the
+    # models these tests pick, so assertions don't depend on what the
+    # developer machine happens to have downloaded.
+    models_dir = tmp_path / "voxtype-models"
+    models_dir.mkdir()
+    for name in ("base", "base.en", "tiny.en", "large-v3-turbo"):
+        (models_dir / f"ggml-{name}.bin").write_bytes(b"x" * 1000)
+    # Directory-based engine artifact for the moonshine carry-over test.
+    moonshine = models_dir / "moonshine-base"
+    moonshine.mkdir()
+    (moonshine / "model.onnx").write_bytes(b"x" * 1000)
+    from voxtype_tui import models as models_mod
+    monkeypatch.setattr(models_mod, "MODELS_DIR", models_dir)
+
     async def _inactive():
         return False
     monkeypatch.setattr(voxtype_cli, "is_daemon_active", lambda: False)

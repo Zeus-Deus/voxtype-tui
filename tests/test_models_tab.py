@@ -518,6 +518,9 @@ async def test_settings_model_change_syncs_models_tab_active_mark(tmp_env):
     """Reverse direction: editing the Model dropdown in Settings must move
     the ● active-mark in the Models tab's table without requiring a reload."""
     cfg, side, models_dir = tmp_env
+    # The Settings dropdown refuses uninstalled models; the pick below
+    # needs the file on disk to go through.
+    (models_dir / "ggml-small.bin").write_bytes(b"x" * 1000)
     app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
     async with app.run_test() as pilot:
         await pilot.pause()

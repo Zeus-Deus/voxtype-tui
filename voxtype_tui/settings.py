@@ -429,9 +429,43 @@ class SettingsPane(VerticalScroll):
 
     def _model_options(self, engine: str) -> list[tuple[str, str]]:
         known = MODELS_PER_ENGINE.get(engine, [])
-        options = [(m, m) for m in known]
+        options = [
+            (
+                m if self._model_installed(engine, m)
+                else f"{m} (not downloaded)",
+                m,
+            )
+            for m in known
+        ]
         options.append(("Custom path…", CUSTOM_MODEL))
         return options
+
+    def _model_installed(self, engine: str, name: str) -> bool:
+        # Lazy import: settings ↔ models would otherwise be circular.
+        from .models import is_model_installed
+        return is_model_installed(engine, name)
+
+    def _revert_model_select(self, engine: str) -> None:
+        """Snap the Model Select back to the state's current value after a
+        rejected pick, without writing anything. `_programmatic_model_change`
+        absorbs the Select.Changed cascade from the programmatic assignment
+        (same pattern as `_refresh_model_options`)."""
+        select = self.query_one("#settings-model", Select)
+        current = self._current_model_for(engine)
+        known = {v for _, v in self._model_options(engine)}
+        self._suppress_events = True
+        try:
+            if current in known:
+                self._programmatic_model_change = current
+                select.value = current
+            elif current:
+                # Custom path in state — the Custom row is still intact
+                # because the guard fires before it gets hidden.
+                select.value = CUSTOM_MODEL
+            else:
+                select.value = Select.BLANK
+        finally:
+            self._suppress_events = False
 
     # --- lifecycle ---
 
@@ -657,7 +691,14 @@ class SettingsPane(VerticalScroll):
             current_model = self._current_model_for(new_engine)
             if not current_model:
                 carry = self._current_model_for(old_engine)
-                if carry and carry in MODELS_PER_ENGINE.get(new_engine, []):
+                # Carry-over must pass the same installed check as an
+                # explicit pick — a catalog-valid but not-downloaded
+                # model would crash-loop the daemon after save.
+                if (
+                    carry
+                    and carry in MODELS_PER_ENGINE.get(new_engine, [])
+                    and self._model_installed(new_engine, carry)
+                ):
                     self._write_model(new_engine, carry)
                     current_model = carry
             # Repopulate options, but do NOT write a default. Wrap in
@@ -700,6 +741,20 @@ class SettingsPane(VerticalScroll):
                 if event.select.has_focus:
                     custom_input.focus()
                 # Don't write to config yet — wait for the Input to be filled.
+                return
+            # Same hard guard as the Models tab's [Set active]
+            # (models.py): writing an uninstalled model means the
+            # daemon crash-loops on a missing file at the post-save
+            # restart. The dropdown was the one unguarded path.
+            if not self._model_installed(engine, value_str):
+                self.app.notify(
+                    f"'{value_str}' isn't downloaded yet — download it "
+                    f"from the Models tab first (press 4, then d).",
+                    severity="warning",
+                    title="Download required",
+                    timeout=8,
+                )
+                self._revert_model_select(engine)
                 return
             custom_row.add_class("hidden")
             custom_input.value = ""
