@@ -77,6 +77,7 @@ Vexis's Stage 2 (built-in spoken-command expansion) is intentionally skipped —
 | Spoken punctuation | `[text] spoken_punctuation` |
 | Smart auto-submit ("say submit") | `[text] smart_auto_submit` |
 | GPU acceleration | run `voxtype setup gpu` as a subcommand |
+| GPU device (multi-GPU) | systemd user drop-in `~/.config/systemd/user/voxtype.service.d/gpu.conf` (`Environment=VOXTYPE_VULKAN_DEVICE`), managed by `voxtype_tui/gpu.py` — not in config.toml, never synced |
 | Post-process LLM hook | `[output.post_process] command` + `timeout_ms` |
 | Remote backend | `[whisper] remote_endpoint`, `remote_model`, `remote_api_key` |
 

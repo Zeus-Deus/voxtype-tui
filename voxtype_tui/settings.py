@@ -22,7 +22,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Checkbox, Collapsible, Input, Label, RichLog, Select, Switch
 
-from . import config
+from . import config, gpu
 from .sudo import SudoPasswordModal, SudoResult, run_sudo_command
 
 if TYPE_CHECKING:
@@ -75,6 +75,18 @@ HOTKEY_MODIFIERS: list[str] = ["LEFTCTRL", "LEFTALT", "LEFTSHIFT", "LEFTMETA"]
 HOTKEY_MODES: list[str] = ["push_to_talk", "toggle"]
 
 OUTPUT_MODES: list[str] = ["type", "clipboard", "paste"]
+
+# GPU-device Select fallback, used before/when hardware detection yields
+# nothing. "auto" == Voxtype's default (first available GPU); the three
+# vendors mirror VOXTYPE_VULKAN_DEVICE's accepted values.
+GPU_AUTO_OPTION: tuple[str, str] = ("Auto (first available)", "auto")
+GPU_DEVICE_STATIC_OPTIONS: list[tuple[str, str]] = [
+    GPU_AUTO_OPTION,
+    ("NVIDIA", "nvidia"),
+    ("AMD", "amd"),
+    ("Intel", "intel"),
+]
+
 
 def gpu_status_sync(timeout: float = 5.0) -> tuple[bool, str]:
     """Returns (ok, text). `text` is the raw output of
@@ -183,6 +195,21 @@ class SettingsPane(VerticalScroll):
     # (e.g. after the engine changes, we reset the Model Select), Textual
     # still fires Changed events. This flag lets the handler skip those.
     _suppress_events: bool = False
+
+    # The GPU-device value we last committed to the systemd drop-in (or that
+    # the drop-in already held on mount). Kept in lockstep with every
+    # programmatic mutation of the GPU-device Select. The Select.Changed
+    # cascade fired during hydration (sync_from_state + the async status
+    # probe's set_options/value churn) is delivered by Textual's message pump
+    # AFTER `_suppress_events` is reset, so the boolean flag can't stop it —
+    # but every one of those echoes leaves the Select *settled* at
+    # `_gpu_committed`, so the handler compares equal and ignores them. Only a
+    # genuine user pick moves the settled value away from this. "auto"
+    # mirrors the Select's constructor value so the initial-mount Changed is a
+    # no-op too. (This is why _apply_gpu_device carries no `read_gpu_device`
+    # re-check: hydration never reaches it, and comparing against a
+    # not-yet-persisted mock would be self-defeating.)
+    _gpu_committed: str = "auto"
 
     def compose(self) -> ComposeResult:
         with Collapsible(
@@ -400,6 +427,14 @@ class SettingsPane(VerticalScroll):
             collapsed=False,
             id="settings-gpu-section",
         ):
+            with Horizontal(classes="field-row"):
+                yield Label("GPU device", classes="label")
+                yield Select(
+                    options=list(GPU_DEVICE_STATIC_OPTIONS),
+                    allow_blank=False,
+                    value="auto",
+                    id="settings-gpu-device",
+                )
             with Horizontal(id="settings-gpu-actions"):
                 yield Button("Refresh status", id="settings-gpu-refresh")
                 yield Button("Enable (sudo)", variant="primary", id="settings-gpu-enable")
@@ -487,6 +522,43 @@ class SettingsPane(VerticalScroll):
             log.write(_strip_ansi(line))
         if not ok:
             log.write("[status command failed]")
+        if ok:
+            # Swap the device dropdown to the actually-detected GPUs.
+            self._update_gpu_device_options(gpu.parse_detected_gpus(text))
+
+    def _update_gpu_device_options(
+        self, detected: list[tuple[str, str]]
+    ) -> None:
+        """Rebuild the GPU-device Select from a detected-hardware list.
+        Empty detection → keep the full static fallback. The configured
+        vendor is read from the drop-in (source of truth); if it isn't in
+        the option set, a plain entry is appended so the Select still shows
+        the true value. Programmatic set_options/value goes under the
+        `_suppress_events` guard so the resulting Select.Changed doesn't
+        write anything (same idiom as `_populate_audio_devices_async`)."""
+        try:
+            select = self.query_one("#settings-gpu-device", Select)
+        except Exception:
+            return
+        if detected:
+            options: list[tuple[str, str]] = [GPU_AUTO_OPTION, *detected]
+        else:
+            options = list(GPU_DEVICE_STATIC_OPTIONS)
+        configured = gpu.read_gpu_device(gpu.DROPIN_PATH.expanduser())
+        current = configured or "auto"
+        if current not in {v for _, v in options}:
+            options.append((current.upper(), current))
+        # Commit the value we're about to display BEFORE the mutations, so the
+        # whole set_options→value cascade (which transiently resets the value
+        # to the first option and re-selects `current`) is recognised as our
+        # own echo and skipped by the Changed handler.
+        self._gpu_committed = current
+        self._suppress_events = True
+        try:
+            select.set_options(options)
+            select.value = current
+        finally:
+            self._suppress_events = False
 
     async def _populate_audio_devices_async(self) -> None:
         options = await asyncio.to_thread(enumerate_audio_devices_sync)
@@ -625,6 +697,18 @@ class SettingsPane(VerticalScroll):
             self.query_one("#settings-remote-timeout", Input).value = (
                 str(remote_to) if remote_to != "" else ""
             )
+
+            # GPU device lives in a systemd drop-in, NOT config.toml — read
+            # it straight off disk. Only snap to a static option here; the
+            # async status probe (below) swaps in detected hardware and
+            # handles any non-static configured vendor.
+            configured = gpu.read_gpu_device(gpu.DROPIN_PATH.expanduser())
+            gpu_target = configured or "auto"
+            if gpu_target in {v for _, v in GPU_DEVICE_STATIC_OPTIONS}:
+                self.query_one("#settings-gpu-device", Select).value = gpu_target
+                # Track what we just pushed so the resulting (async) Changed
+                # echo is recognised as ours and skipped, not written back.
+                self._gpu_committed = gpu_target
         finally:
             self._suppress_events = False
 
@@ -791,6 +875,72 @@ class SettingsPane(VerticalScroll):
                 return
             self.tui.state.set_setting("output.mode", str(event.value))
             self.tui.refresh_dirty()
+        elif event.select.id == "settings-gpu-device":
+            if event.value == Select.BLANK:
+                return
+            # Compare the *settled* Select value against the value we last
+            # committed to the drop-in. Programmatic hydration (sync_from_state
+            # and the async status probe) drives the Select through several
+            # values and fires Select.Changed asynchronously — after
+            # `_suppress_events` is already back to False — so the boolean guard
+            # can't catch them. Every such echo leaves the Select settled at
+            # `_gpu_committed`, so it compares equal and is ignored here; only a
+            # genuine user pick moves the settled value away. Without this,
+            # merely opening Settings (or hitting Refresh status) with a vendor
+            # already pinned would rewrite the drop-in, daemon-reload, and mark
+            # the daemon stale — a spurious restart-on-exit with zero user
+            # action.
+            settled = str(event.select.value)
+            if settled == self._gpu_committed:
+                return
+            vendor = None if settled == "auto" else settled
+            self._apply_gpu_device(vendor)
+
+    def _gpu_committed_value(self, vendor: str | None) -> str:
+        return "auto" if vendor is None else vendor
+
+    def _apply_gpu_device(self, vendor: str | None) -> None:
+        """Persist the GPU-device choice to the systemd drop-in (never
+        config.toml / sidecar / sync), daemon-reload, and mark the daemon
+        stale. Does NOT restart the unit — that stays on the normal
+        Ctrl+Shift+R / restart-on-exit path (CLAUDE.md non-goal)."""
+        log = self.query_one("#settings-gpu-log", RichLog)
+        path = gpu.DROPIN_PATH.expanduser()
+        try:
+            gpu.write_gpu_device(path, vendor)
+        except OSError as e:
+            log.write(f"[gpu.conf write failed: {e}]")
+            self.tui.notify(
+                f"Failed to write gpu.conf: {e}",
+                severity="warning",
+                timeout=8,
+            )
+            return
+
+        # Record what's now on disk so any follow-up hydration echo skips.
+        self._gpu_committed = self._gpu_committed_value(vendor)
+
+        if vendor is None:
+            log.write(f"cleared VOXTYPE_VULKAN_DEVICE from {path}")
+        else:
+            log.write(f"wrote {path} (VOXTYPE_VULKAN_DEVICE={vendor})")
+
+        # Drop-in change needs a daemon restart to take effect — mark stale
+        # so Ctrl+Shift+R / restart-on-exit pick it up.
+        if self.tui.state is not None:
+            self.tui.state.daemon_stale = True
+        self.tui.refresh_stale_pill()
+
+        self.tui.notify(
+            f"GPU device: {vendor or 'auto'} — daemon restart needed",
+            timeout=6,
+        )
+        asyncio.create_task(self._gpu_daemon_reload_async())
+
+    async def _gpu_daemon_reload_async(self) -> None:
+        ran, msg = await asyncio.to_thread(gpu.daemon_reload)
+        log = self.query_one("#settings-gpu-log", RichLog)
+        log.write(f"systemctl --user daemon-reload: {msg}")
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if self._suppress_events or self.tui.state is None:

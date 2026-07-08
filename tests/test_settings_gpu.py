@@ -7,8 +7,9 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from textual.widgets import Button, RichLog
+from textual.widgets import Button, RichLog, Select
 
+from voxtype_tui import gpu as gpu_mod
 from voxtype_tui import voxtype_cli
 from voxtype_tui.app import VoxtypeTUI
 from voxtype_tui.settings import (
@@ -258,3 +259,216 @@ async def test_wrong_password_reprompts(tmp_env, monkeypatch):
         # After the bad sudo run, a fresh modal should be on top for the retry.
         assert isinstance(app.screen, SudoPasswordModal)
         assert call_count["n"] == 1
+
+
+# ---- GPU device selector (systemd drop-in) ----
+
+async def test_gpu_device_select_writes_dropin(tmp_env, tmp_path, monkeypatch):
+    """Changing the GPU device Select writes the systemd drop-in via
+    gpu.write_gpu_device, marks the daemon stale, runs a daemon-reload
+    (NOT a restart), and never touches config.toml. Hydration on mount must
+    not fire a spurious write (the _suppress_events guard)."""
+    cfg, side = tmp_env
+    dropin = tmp_path / "gpu.conf"
+    write_calls: list[tuple[Path, str | None]] = []
+    reload_calls: list[int] = []
+    restart_calls: list[int] = []
+
+    monkeypatch.setattr(gpu_mod, "DROPIN_PATH", dropin)
+    monkeypatch.setattr(
+        gpu_mod, "write_gpu_device",
+        lambda path, vendor: write_calls.append((path, vendor)),
+    )
+
+    def _fake_reload(*a, **kw):
+        reload_calls.append(1)
+        return (True, "ok")
+    monkeypatch.setattr(gpu_mod, "daemon_reload", _fake_reload)
+
+    # Guard: the GPU device feature must NEVER restart the daemon unit.
+    monkeypatch.setattr(
+        voxtype_cli, "restart_daemon",
+        lambda: restart_calls.append(1) or (True, "voxtype restarted"),
+    )
+
+    # Initial `gpu --status` probe on mount: pretend voxtype exists, return
+    # empty output so parse yields no hardware and the static list stays.
+    monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/" + n)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _FakeRun())
+
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _goto_settings(pilot, app)
+        await pilot.pause()
+
+        # Weak hydration check (drop-in absent → configured vendor is already
+        # "auto", so no value transition happens). The meaningful hydration
+        # regression — a *pre-pinned* vendor whose value differs from "auto" —
+        # is covered by test_gpu_device_hydration_pinned_no_spurious_write.
+        assert write_calls == []
+
+        pane = app.query_one(SettingsPane)
+        select = pane.query_one("#settings-gpu-device", Select)
+        assert select.value == "auto"
+
+        select.value = "nvidia"
+        await pilot.pause()
+        await pilot.pause()  # let the daemon-reload task run
+
+    assert write_calls == [(dropin, "nvidia")]
+    assert app.state.daemon_stale is True
+    assert reload_calls == [1]      # daemon-reload ran
+    assert restart_calls == []      # unit was never restarted
+    # config.toml side of state must be untouched by a drop-in change.
+    assert app.state.config_dirty is False
+
+
+async def test_gpu_device_auto_clears_dropin(tmp_env, tmp_path, monkeypatch):
+    """Selecting 'Auto (first available)' calls write_gpu_device with None
+    (clear the drop-in)."""
+    cfg, side = tmp_env
+    dropin = tmp_path / "gpu.conf"
+    write_calls: list[tuple[Path, str | None]] = []
+
+    monkeypatch.setattr(gpu_mod, "DROPIN_PATH", dropin)
+    monkeypatch.setattr(
+        gpu_mod, "write_gpu_device",
+        lambda path, vendor: write_calls.append((path, vendor)),
+    )
+    monkeypatch.setattr(gpu_mod, "daemon_reload", lambda *a, **kw: (True, "ok"))
+    monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/" + n)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _FakeRun())
+
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _goto_settings(pilot, app)
+        await pilot.pause()
+
+        pane = app.query_one(SettingsPane)
+        select = pane.query_one("#settings-gpu-device", Select)
+        select.value = "intel"
+        await pilot.pause()
+        await pilot.pause()
+        select.value = "auto"
+        await pilot.pause()
+        await pilot.pause()
+
+    assert write_calls == [(dropin, "intel"), (dropin, None)]
+
+
+async def test_gpu_device_options_swap_to_detected(tmp_env, tmp_path, monkeypatch):
+    """A successful status probe swaps the Select options to the detected
+    GPUs (Auto + hardware)."""
+    cfg, side = tmp_env
+    dropin = tmp_path / "gpu.conf"  # non-existent → configured vendor is auto
+
+    class _StatusRun:
+        returncode = 0
+        stdout = (
+            "GPUs detected:\n"
+            "  1. [Intel] Intel Corporation Raptor Lake-S UHD Graphics (rev 04)\n"
+            "  2. [NVIDIA] NVIDIA Corporation AD107M [GeForce RTX 4060] (rev a1)\n"
+            "\nGPU selection: auto (first available)\n"
+        )
+        stderr = ""
+
+    monkeypatch.setattr(gpu_mod, "DROPIN_PATH", dropin)
+    monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/" + n)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _StatusRun())
+
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _goto_settings(pilot, app)
+        await pilot.pause()
+        await pilot.pause()
+
+        pane = app.query_one(SettingsPane)
+        select = pane.query_one("#settings-gpu-device", Select)
+        values = [v for _, v in select._options]  # (prompt, value) pairs
+        assert "auto" in values
+        assert "intel" in values
+        assert "nvidia" in values
+        assert "amd" not in values  # amd not detected → dropped from list
+
+
+async def test_gpu_device_hydration_pinned_no_spurious_write(
+    tmp_env, tmp_path, monkeypatch
+):
+    """Opening Settings while a GPU vendor is already pinned in gpu.conf must
+    NOT rewrite the drop-in, daemon-reload, mark the daemon stale, or restart
+    the unit — the multi-GPU case this feature exists for.
+
+    Hydration drives the GPU-device Select through several values
+    (sync_from_state seeds "nvidia", then the async status probe's
+    set_options() transiently resets it to the first option and re-selects
+    "nvidia"). Textual delivers the resulting Select.Changed messages *after*
+    the `_suppress_events` guard is reset, so without the `_gpu_committed`
+    idempotency check they'd reach _apply_gpu_device and fire real
+    writes ([nvidia, None, nvidia]) plus reloads on mere mount, culminating in
+    an unwanted restart-on-exit with zero user action.
+    """
+    cfg, side = tmp_env
+    dropin = tmp_path / "gpu.conf"
+    # Pre-pin NVIDIA — the exact state a multi-GPU user leaves behind.
+    dropin.write_text('[Service]\nEnvironment="VOXTYPE_VULKAN_DEVICE=nvidia"\n')
+
+    write_calls: list[tuple[Path, str | None]] = []
+    reload_calls: list[int] = []
+    restart_calls: list[int] = []
+
+    monkeypatch.setattr(gpu_mod, "DROPIN_PATH", dropin)
+    monkeypatch.setattr(
+        gpu_mod, "write_gpu_device",
+        lambda path, vendor: write_calls.append((path, vendor)),
+    )
+    monkeypatch.setattr(
+        gpu_mod, "daemon_reload",
+        lambda *a, **kw: reload_calls.append(1) or (True, "ok"),
+    )
+    monkeypatch.setattr(
+        voxtype_cli, "restart_daemon",
+        lambda: restart_calls.append(1) or (True, "voxtype restarted"),
+    )
+
+    class _StatusRun:
+        returncode = 0
+        stdout = (
+            "GPUs detected:\n"
+            "  1. [Intel] Intel Corporation Raptor Lake-S UHD Graphics (rev 04)\n"
+            "  2. [NVIDIA] NVIDIA Corporation AD107M [GeForce RTX 4060] (rev a1)\n"
+            "\nGPU selection: auto (first available)\n"
+        )
+        stderr = ""
+
+    monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/" + n)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _StatusRun())
+
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await _goto_settings(pilot, app)
+        await pilot.pause()
+        await pilot.pause()  # let the async status probe + any tasks settle
+
+        pane = app.query_one(SettingsPane)
+        select = pane.query_one("#settings-gpu-device", Select)
+        # The Select reflects the true pinned vendor…
+        assert select.value == "nvidia"
+        # …but hydration touched NOTHING on the daemon side.
+        assert write_calls == []
+        assert reload_calls == []
+        assert restart_calls == []
+        assert app.state.daemon_stale is False
+
+        # And a genuine user pick afterwards still writes normally.
+        select.value = "intel"
+        await pilot.pause()
+        await pilot.pause()
+
+    assert write_calls == [(dropin, "intel")]
+    assert reload_calls == [1]
+    assert restart_calls == []
+    assert app.state.daemon_stale is True
