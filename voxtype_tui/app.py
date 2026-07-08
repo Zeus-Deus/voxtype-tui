@@ -8,6 +8,8 @@ swapped in later.
 """
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
 from textual.app import App, ComposeResult
@@ -19,7 +21,7 @@ from textual.widgets import Button, Footer, Input, Label, Static, TabbedContent,
 
 import asyncio as _asyncio
 
-from . import config, sidecar, sync as sync_mod, theme as theme_mod, voxtype_cli
+from . import config, gpu, sidecar, sync as sync_mod, theme as theme_mod, voxtype_cli
 from .theme import MODAL_BORDER_STYLE
 from .dictionary import DictionaryPane
 from .models import ModelsPane
@@ -520,6 +522,48 @@ class VoxtypeTUI(App[None]):
             self.set_focus(pane.query_one(DataTable))
         except Exception:
             pass
+        _asyncio.create_task(self._heal_gpu_dropin())
+
+    async def _heal_gpu_dropin(self) -> None:
+        """One-time self-heal for pre-existing (v0.1.7-era) GPU drop-ins.
+
+        Those only set `VOXTYPE_VULKAN_DEVICE`, which upstream voxtype
+        applies too late in daemon mode — the Vulkan loader has already
+        enumerated every GPU during model preload by the time voxtype's
+        own code runs. `VK_LOADER_DRIVERS_SELECT` is read by the loader
+        itself, before any voxtype code runs, so it's the piece that
+        actually pins the device. Runs at every startup regardless of
+        which tab is open (unlike the Settings-pane GPU refresh, which
+        only fires on mount of that pane) so existing installs get fixed
+        without the user re-toggling the Select. Strict no-op — zero
+        calls, zero notifications — when there's no drop-in or it's
+        already canonical.
+        """
+        path = gpu.DROPIN_PATH.expanduser()
+        vendor = gpu.dropin_needs_heal(path)
+        if vendor is None:
+            return
+        try:
+            gpu.write_gpu_device(path, vendor)
+        except OSError as e:
+            self.notify(
+                f"Failed to update gpu.conf: {e}",
+                severity="warning",
+                timeout=8,
+            )
+            return
+        if shutil.which("systemctl") is not None:
+            try:
+                await _asyncio.to_thread(gpu.daemon_reload)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if self.state is not None:
+            self.state.daemon_stale = True
+        self.refresh_stale_pill()
+        self.notify(
+            f"GPU device config updated ({vendor}) — daemon restart needed",
+            timeout=6,
+        )
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         # Don't steal digit keys while an Input widget has focus — otherwise

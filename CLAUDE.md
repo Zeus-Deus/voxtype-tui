@@ -77,7 +77,7 @@ Vexis's Stage 2 (built-in spoken-command expansion) is intentionally skipped —
 | Spoken punctuation | `[text] spoken_punctuation` |
 | Smart auto-submit ("say submit") | `[text] smart_auto_submit` |
 | GPU acceleration | run `voxtype setup gpu` as a subcommand |
-| GPU device (multi-GPU) | systemd user drop-in `~/.config/systemd/user/voxtype.service.d/gpu.conf` (`Environment=VOXTYPE_VULKAN_DEVICE`), managed by `voxtype_tui/gpu.py` — not in config.toml, never synced |
+| GPU device (multi-GPU) | systemd user drop-in `~/.config/systemd/user/voxtype.service.d/gpu.conf`, managed by `voxtype_tui/gpu.py` — not in config.toml, never synced. Writes **two** `Environment=` lines: `VOXTYPE_VULKAN_DEVICE` (voxtype's own knob) and `VK_LOADER_DRIVERS_SELECT` (a glob pattern over `/usr/share/vulkan/icd.d/*.json`, e.g. `nvidia*`). Both are needed because in daemon mode voxtype applies its own var too late — the Vulkan loader has already enumerated every GPU during model preload — while `VK_LOADER_DRIVERS_SELECT` is read by the loader itself at `vkCreateInstance`, before any voxtype code runs, so it actually pins the device. `gpu.dropin_needs_heal` detects pre-existing single-line (v0.1.7) drop-ins and `VoxtypeTUI._heal_gpu_dropin` upgrades them in place on TUI startup, no user action required. |
 | Post-process LLM hook | `[output.post_process] command` + `timeout_ms` |
 | Remote backend | `[whisper] remote_endpoint`, `remote_model`, `remote_api_key` |
 

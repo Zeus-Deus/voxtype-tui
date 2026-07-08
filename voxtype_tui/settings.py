@@ -921,9 +921,23 @@ class SettingsPane(VerticalScroll):
         self._gpu_committed = self._gpu_committed_value(vendor)
 
         if vendor is None:
-            log.write(f"cleared VOXTYPE_VULKAN_DEVICE from {path}")
+            log.write(
+                f"cleared VOXTYPE_VULKAN_DEVICE and {gpu.LOADER_ENV_VAR} "
+                f"from {path}"
+            )
         else:
-            log.write(f"wrote {path} (VOXTYPE_VULKAN_DEVICE={vendor})")
+            pattern = gpu.VENDOR_LOADER_PATTERNS.get(vendor)
+            if pattern is not None:
+                log.write(
+                    f"wrote {path} (VOXTYPE_VULKAN_DEVICE={vendor}, "
+                    f"{gpu.LOADER_ENV_VAR}={pattern})"
+                )
+            else:
+                log.write(
+                    f"wrote {path} (VOXTYPE_VULKAN_DEVICE={vendor}) — "
+                    f"no known {gpu.LOADER_ENV_VAR} pattern for this "
+                    f"vendor, loader var left unset"
+                )
 
         # Drop-in change needs a daemon restart to take effect — mark stale
         # so Ctrl+Shift+R / restart-on-exit pick it up.

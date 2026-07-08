@@ -398,8 +398,9 @@ async def test_gpu_device_hydration_pinned_no_spurious_write(
     tmp_env, tmp_path, monkeypatch
 ):
     """Opening Settings while a GPU vendor is already pinned in gpu.conf must
-    NOT rewrite the drop-in, daemon-reload, mark the daemon stale, or restart
-    the unit — the multi-GPU case this feature exists for.
+    NOT rewrite the drop-in, daemon-reload, or restart the unit *beyond* the
+    one legitimate app-startup self-heal — the multi-GPU case this feature
+    exists for.
 
     Hydration drives the GPU-device Select through several values
     (sync_from_state seeds "nvidia", then the async status probe's
@@ -409,10 +410,17 @@ async def test_gpu_device_hydration_pinned_no_spurious_write(
     idempotency check they'd reach _apply_gpu_device and fire real
     writes ([nvidia, None, nvidia]) plus reloads on mere mount, culminating in
     an unwanted restart-on-exit with zero user action.
+
+    The fixture's gpu.conf is deliberately old-format (v0.1.7: only
+    VOXTYPE_VULKAN_DEVICE, no VK_LOADER_DRIVERS_SELECT), so the app-level
+    self-heal (`_heal_gpu_dropin`) legitimately fires exactly once at
+    startup — this test asserts the Select-hydration cascade doesn't add
+    to that, not that nothing happens at all.
     """
     cfg, side = tmp_env
     dropin = tmp_path / "gpu.conf"
-    # Pre-pin NVIDIA — the exact state a multi-GPU user leaves behind.
+    # Pre-pin NVIDIA in the OLD (v0.1.7) format — the exact state a
+    # pre-upgrade multi-GPU user leaves behind, and what triggers heal.
     dropin.write_text('[Service]\nEnvironment="VOXTYPE_VULKAN_DEVICE=nvidia"\n')
 
     write_calls: list[tuple[Path, str | None]] = []
@@ -457,18 +465,19 @@ async def test_gpu_device_hydration_pinned_no_spurious_write(
         select = pane.query_one("#settings-gpu-device", Select)
         # The Select reflects the true pinned vendor…
         assert select.value == "nvidia"
-        # …but hydration touched NOTHING on the daemon side.
-        assert write_calls == []
-        assert reload_calls == []
+        # …and exactly the ONE legitimate self-heal write/reload happened —
+        # hydration itself added nothing on top of it.
+        assert write_calls == [(dropin, "nvidia")]
+        assert reload_calls == [1]
         assert restart_calls == []
-        assert app.state.daemon_stale is False
+        assert app.state.daemon_stale is True
 
         # And a genuine user pick afterwards still writes normally.
         select.value = "intel"
         await pilot.pause()
         await pilot.pause()
 
-    assert write_calls == [(dropin, "intel")]
-    assert reload_calls == [1]
+    assert write_calls == [(dropin, "nvidia"), (dropin, "intel")]
+    assert reload_calls == [1, 1]
     assert restart_calls == []
     assert app.state.daemon_stale is True
