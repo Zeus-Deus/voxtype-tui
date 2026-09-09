@@ -10,7 +10,7 @@
 | `4` | Switch to Models |
 | `ctrl+s` | Save — validates via voxtype, writes atomically, prompts for daemon restart if needed |
 | `ctrl+r` | Reload config from disk (refuses if unsaved changes exist; save first) |
-| `ctrl+shift+r` | Restart the voxtype daemon — clears the "daemon stale" pill. No-op when the daemon isn't actually stale. |
+| `ctrl+shift+r` | Restart the voxtype daemon (`systemctl --user restart voxtype`) — always restarts, whether or not the config changed; verifies the PID actually changed and clears the "daemon stale" pill on success. |
 | `ctrl+p` | Command palette (includes the theme picker) |
 | `ctrl+q` | Quit (confirms if unsaved changes exist) |
 

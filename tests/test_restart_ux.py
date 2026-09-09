@@ -269,10 +269,9 @@ async def test_quit_blocked_while_restart_in_progress(tmp_env, monkeypatch):
 # ---------------------------------------------------------------------------
 
 async def test_double_restart_only_runs_once(tmp_env, monkeypatch):
-    """Hammering ctrl+shift+r mid-restart used to trigger 'Daemon is
-    already up to date' (because daemon_stale was already cleared) — now
-    it shows the in-progress message AND, more importantly, doesn't fire
-    a second systemctl restart in parallel."""
+    """Hammering ctrl+shift+r mid-restart must show the in-progress
+    message AND, more importantly, must not fire a second systemctl
+    restart in parallel."""
     cfg, side = tmp_env
     counter = _patch_restart(monkeypatch)
     _patch_ready(monkeypatch, ready=True, delay=0.2)
@@ -299,6 +298,83 @@ async def test_double_restart_only_runs_once(tmp_env, monkeypatch):
 
         assert counter["n"] == 1, \
             f"only one systemctl restart should fire, got {counter['n']}"
+
+
+# ---------------------------------------------------------------------------
+# Explicit restart ignores the stale gate
+# ---------------------------------------------------------------------------
+
+async def test_explicit_restart_fires_when_daemon_not_stale(tmp_env, monkeypatch):
+    """Regression: with an unchanged config (`daemon_stale is False`) the
+    footer 'Restart daemon' / ctrl+shift+r used to short-circuit with a
+    neutral 'Daemon is already up to date' toast and never call systemctl.
+    The toast read like success, so users pressing the button to recover
+    from an audio-stack hiccup believed the daemon had cycled when it
+    hadn't. An explicit user request must always restart."""
+    cfg, side = tmp_env
+    counter = _patch_restart(monkeypatch)
+    _patch_ready(monkeypatch, ready=True, delay=0.01)
+
+    notifications: list[str] = []
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app.state.daemon_stale is False, "precondition: fresh config"
+
+        orig_notify = app.notify
+
+        def track_notify(message, *args, **kwargs):
+            notifications.append(str(message))
+            return orig_notify(message, *args, **kwargs)
+
+        app.notify = track_notify  # type: ignore[method-assign]
+
+        await app.action_restart_daemon()
+        await pilot.pause()
+
+        assert counter["n"] == 1, \
+            f"explicit restart must call systemctl even when not stale, got {counter['n']}"
+        assert not any("already up to date" in n for n in notifications), \
+            f"must not claim up-to-date instead of restarting: {notifications}"
+        assert any("Restarting voxtype daemon" in n for n in notifications)
+        assert any("daemon ready" in n for n in notifications)
+
+
+async def test_explicit_restart_surfaces_no_op_as_error(tmp_env, monkeypatch):
+    """When restart_daemon reports that systemctl returned 0 but the PID
+    never changed, the UI must show that as an error and keep the stale
+    flag intact — not clear it and say 'ready'."""
+    cfg, side = tmp_env
+    _patch_restart(
+        monkeypatch, ok=False,
+        msg="systemctl reported success but voxtype (PID 2027) was not restarted",
+    )
+    _patch_ready(monkeypatch, ready=True, delay=0.01)
+
+    notifications: list[tuple[str, str]] = []
+    app = VoxtypeTUI(config_path=cfg, sidecar_path=side)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.state.daemon_stale = True
+        app.refresh_stale_pill()
+        await pilot.pause()
+
+        orig_notify = app.notify
+
+        def track_notify(message, *args, severity="information", **kwargs):
+            notifications.append((severity, str(message)))
+            return orig_notify(message, *args, severity=severity, **kwargs)
+
+        app.notify = track_notify  # type: ignore[method-assign]
+
+        await app.action_restart_daemon()
+        await pilot.pause()
+
+        errors = [m for s, m in notifications if s == "error"]
+        assert any("was not restarted" in e for e in errors), notifications
+        assert app.state.daemon_stale is True, \
+            "a failed restart must not clear the stale flag"
+        assert app.query_one("#daemon-stale", StalePill).has_class("visible")
 
 
 async def test_restart_warns_on_readiness_timeout(tmp_env, monkeypatch):

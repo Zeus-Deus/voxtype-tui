@@ -46,10 +46,49 @@ def is_daemon_active() -> bool:
     return result.stdout.strip() == "active"
 
 
+def daemon_identity() -> tuple[str, str] | None:
+    """(MainPID, ExecMainStartTimestampMonotonic) of the voxtype unit, or
+    None when systemctl is unavailable / the query fails.
+
+    Together these two values change on every real restart: a fresh
+    process gets a new PID, and even in the (theoretical) case of PID
+    reuse the monotonic start stamp moves. Used by `restart_daemon` to
+    prove the restart happened rather than trusting systemctl's exit
+    code, which is 0 for a no-op as much as for a real cycle."""
+    if shutil.which("systemctl") is None:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "systemctl", "--user", "show", "voxtype",
+                "-p", "MainPID", "-p", "ExecMainStartTimestampMonotonic",
+                "--value",
+            ],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    lines = [ln.strip() for ln in result.stdout.splitlines()]
+    if len(lines) < 2:
+        return None
+    return lines[0], lines[1]
+
+
 def restart_daemon() -> tuple[bool, str]:
-    """Returns (ok, message)."""
+    """Returns (ok, message).
+
+    Success requires two things: `systemctl --user restart voxtype`
+    exits 0 AND the unit's (MainPID, start timestamp) differ from what
+    they were before the call. A restart that leaves the same process
+    running is reported as a failure so the UI never shows a green
+    "restarted" toast over a daemon that never cycled. If the identity
+    can't be read at all (systemctl show failing) we fall back to exit
+    code only rather than blocking the restart."""
     if shutil.which("systemctl") is None:
         return False, "systemctl not available"
+    before = daemon_identity()
     try:
         result = subprocess.run(
             ["systemctl", "--user", "restart", "voxtype"],
@@ -59,9 +98,15 @@ def restart_daemon() -> tuple[bool, str]:
         return False, "restart timed out"
     except OSError as e:
         return False, str(e)
-    if result.returncode == 0:
-        return True, "voxtype restarted"
-    return False, (result.stderr or result.stdout).strip() or "restart failed"
+    if result.returncode != 0:
+        return False, (result.stderr or result.stdout).strip() or "restart failed"
+    after = daemon_identity()
+    if before is not None and after is not None and before == after:
+        return False, (
+            f"systemctl reported success but voxtype (PID {after[0]}) "
+            "was not restarted — check `systemctl --user status voxtype`"
+        )
+    return True, "voxtype restarted"
 
 
 async def is_daemon_active_async() -> bool:
