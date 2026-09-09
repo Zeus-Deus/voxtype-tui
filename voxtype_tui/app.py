@@ -837,9 +837,19 @@ class VoxtypeTUI(App[None]):
         self.notify(f"Added TestWord{count} (not saved)")
 
     async def action_restart_daemon(self) -> None:
-        """Manually triggered by ctrl+shift+r or a click on the stale pill.
-        No-op when the daemon isn't stale (no damage if the user just hammers
-        the binding)."""
+        """Manually triggered by ctrl+shift+r, the footer binding, or a
+        click on the stale pill.
+
+        An explicit user request ALWAYS restarts, stale or not. The old
+        `daemon_stale` gate short-circuited with a neutral "Daemon is
+        already up to date" toast whenever the config hadn't changed —
+        which read like a success message while systemctl was never
+        called. Users reach for this button precisely when the daemon is
+        misbehaving for reasons unrelated to config (audio stack hiccup,
+        stuck model, …), so config-freshness is not a reason to refuse.
+        The stale gate lives only in the exit-time auto-restart
+        (`_restart_daemon_on_exit_if_needed`), where a restart the user
+        didn't ask for must be justified by a config change."""
         if self.state is None:
             return
         if self.restart_in_progress:
@@ -847,9 +857,6 @@ class VoxtypeTUI(App[None]):
             # would fire here because _do_restart cleared daemon_stale
             # before the readiness wait completed.
             self.notify("Daemon restart already in progress…", timeout=2)
-            return
-        if not self.state.daemon_stale:
-            self.notify("Daemon is already up to date", timeout=2)
             return
         if not await voxtype_cli.is_daemon_active_async():
             self.notify(
