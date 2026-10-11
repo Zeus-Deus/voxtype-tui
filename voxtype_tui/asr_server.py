@@ -731,8 +731,9 @@ def status(doc: Any, sc: Any, *, probe: bool = True) -> dict[str, Any]:
     ``{"engine", "engine_label", "model", "qwen3": {...}}`` where ``qwen3``
     is ``{"active": False}`` or ``{"active": True, "model", "port",
     "endpoint", "variant", "unit": unit_status(), "healthy", "detail"}``.
-    ``detail`` explains an unhealthy server (not running / port taken by
-    another process / loading)."""
+    ``detail`` is a short, human reason for an unhealthy server ("not
+    running", "still starting", "port taken by another program", "not
+    responding"); ``reason`` keeps the technical detail for logs."""
     engine, model = active_engine_model(doc, sc)
     out: dict[str, Any] = {"engine": engine, "engine_label": xm.engine_label(engine),
                            "model": model}
@@ -745,16 +746,25 @@ def status(doc: Any, sc: Any, *, probe: bool = True) -> dict[str, Any]:
                          "endpoint": endpoint_for(port), "variant": block.get("variant")}
     if probe:
         unit = unit_status()
-        healthy, detail = probe_health(port)
+        healthy, reason = probe_health(port)
+        detail = "ok" if healthy else "not responding"
         if not healthy:
-            if unit.get("available") and unit.get("active_state") not in ("active", "activating"):
-                detail = (f"server not running ({unit.get('active_state')}"
-                          f"{', ' + str(unit.get('result')) if unit.get('result') not in (None, 'success') else ''})")
-                if not port_is_free(port):
-                    detail += (f"; port {port} is in use (another process, or the "
-                               "server is still shutting down)")
-            elif unit.get("active_state") == "active":
-                detail = f"server starting or unresponsive ({detail})"
+            state = unit.get("active_state")
+            if unit.get("available") and state in ("activating", "reloading"):
+                detail = "still starting"
+            elif unit.get("available") and state not in ("active", "activating"):
+                result = unit.get("result")
+                reason = f"unit {state}" + (f", {result}" if result not in (None, "success") else "")
+                # Only blame the port when the server is fully stopped: a
+                # stopping server or sockets in TIME-WAIT are not "another program".
+                if state in ("inactive", "failed") and not port_is_free(port):
+                    detail = "port taken by another program"
+                    reason += f"; port {port} in use"
+                else:
+                    detail = "not running"
+            elif state == "active":
+                detail = "still starting"
+        q.update(unit=unit, healthy=healthy, detail=detail, reason=reason)
         q.update(unit=unit, healthy=healthy, detail=detail)
     out["qwen3"] = q
     return out

@@ -543,5 +543,25 @@ def test_status_reports_dead_server(qenv, monkeypatch) -> None:
     s = asr_server.status(st.doc, st.sc)
     assert s["engine_label"] == "Qwen3-ASR"
     assert s["qwen3"]["healthy"] is False
-    assert "not running (failed, exit-code)" in s["qwen3"]["detail"]
+    assert s["qwen3"]["detail"] == "not running"
+    assert "failed, exit-code" in s["qwen3"]["reason"]
     assert asr_server.status(st.doc, st.sc, probe=False)["qwen3"].get("healthy") is None
+
+
+def test_status_detail_is_short_and_blames_port_only_when_taken(qenv, monkeypatch) -> None:
+    import socket
+    st, md = qenv
+    port = asr_server.pick_free_port()
+    asr_server.activate_qwen3(st, "0.6b-q4_k", models_dir=md, accel=CPU512, port=port)
+    monkeypatch.setattr(asr_server, "unit_status", lambda: {"available": True, "active_state": "inactive"})
+    monkeypatch.setattr(asr_server, "probe_health", lambda p: (False, "connection refused"))
+    assert asr_server.status(st.doc, st.sc)["qwen3"]["detail"] == "not running"
+    with socket.socket() as other:  # another program holds the port
+        other.bind(("127.0.0.1", port)); other.listen()
+        assert asr_server.status(st.doc, st.sc)["qwen3"]["detail"] == "port taken by another program"
+    monkeypatch.setattr(asr_server, "unit_status", lambda: {"available": True, "active_state": "deactivating"})
+    assert asr_server.status(st.doc, st.sc)["qwen3"]["detail"] == "not running"
+    monkeypatch.setattr(asr_server, "unit_status", lambda: {"available": True, "active_state": "activating"})
+    assert asr_server.status(st.doc, st.sc)["qwen3"]["detail"] == "still starting"
+    for v in ("not running", "still starting", "port taken by another program", "not responding"):
+        assert len(v) < 40
