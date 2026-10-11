@@ -90,6 +90,24 @@ def test_spans_never_cross_punctuation() -> None:
     assert fix("code mux. Then") == "Codemux. Then"
 
 
+@pytest.mark.parametrize("words", [WORDS, None], ids=["wordlist", "no-wordlist"])
+@pytest.mark.parametrize("src", [
+    "edit code/mux",
+    r"edit code\mux",
+    "code — mux",
+    "code – mux",
+    "code - mux",
+    "code (mux)",
+    'code "mux"',
+    "code_mux",
+    "code + mux",
+    "code@mux",
+])
+def test_spans_only_join_whitespace_separated_tokens(monkeypatch, words, src: str) -> None:
+    monkeypatch.setattr(vc, "_words", words)
+    assert fix(src, ["Codemux"]) == src
+
+
 def test_urls_paths_and_file_names_left_alone() -> None:
     for src in (
         "visit app.codemux.org today",
@@ -99,6 +117,13 @@ def test_urls_paths_and_file_names_left_alone() -> None:
         "the file codemux_test.py",
     ):
         assert fix(src) == src, src
+
+
+@pytest.mark.parametrize("words", [WORDS, None], ids=["wordlist", "no-wordlist"])
+@pytest.mark.parametrize("src", [r"edit codemux\config", r"edit claude code\config"])
+def test_backslash_path_suffix_is_left_alone(monkeypatch, words, src: str) -> None:
+    monkeypatch.setattr(vc, "_words", words)
+    assert fix(src, ["Codemux", "Claude Code"]) == src
 
 
 def test_plural_kept() -> None:
@@ -210,6 +235,52 @@ def test_terms_none_returns_input() -> None:
 def test_oversized_input_returned_unchanged() -> None:
     big = "code mux " * (vc.MAX_TEXT_CHARS // 9 + 1)
     assert fix(big) == big
+
+
+@pytest.mark.parametrize("words", [WORDS, None], ids=["wordlist", "no-wordlist"])
+@pytest.mark.parametrize("src,terms,expected", [
+    ("Überall", ["Überall"], "Überall"),
+    ("überall", ["Überall"], "überall"),
+    ("naive", ["naïve"], "naive"),
+    ("use code mux", ["Codemux", "ÜCodemux"], "use Codemux"),
+])
+def test_non_ascii_vocabulary_is_skipped(monkeypatch, words, src, terms, expected) -> None:
+    monkeypatch.setattr(vc, "_words", words)
+    assert fix(src, terms) == expected
+
+
+@pytest.mark.parametrize("words", [WORDS, None], ids=["wordlist", "no-wordlist"])
+@pytest.mark.parametrize("neighbor", ["é", "中", "١", "\u0301", "\u0903", "\u20dd"])
+@pytest.mark.parametrize("side", ["before", "after"])
+@pytest.mark.parametrize("phrase", ["codemux", "code mux"])
+def test_unicode_word_neighbors_block_partial_matches(monkeypatch, words, neighbor, side, phrase) -> None:
+    monkeypatch.setattr(vc, "_words", words)
+    src = neighbor + phrase if side == "before" else phrase + neighbor
+    assert fix(src, ["Codemux"]) == src
+
+
+@pytest.mark.parametrize("words", [WORDS, None], ids=["wordlist", "no-wordlist"])
+@pytest.mark.parametrize("src,expected", [
+    ("code mux", "Codemux"),
+    ("code\tmux", "Codemux"),
+    ("code\u00a0mux", "Codemux"),
+    ("(code mux)!", "(Codemux)!"),
+    ("code mux, then", "Codemux, then"),
+    ("code-mux", "Codemux"),
+    ("OMARCHY-VM", "omarchy-vm"),
+    ("omarchy-vn", "omarchy-vn"),
+])
+def test_spacing_and_exact_identifier_behavior_is_preserved(monkeypatch, words, src, expected) -> None:
+    monkeypatch.setattr(vc, "_words", words)
+    assert fix(src, ["Codemux", "omarchy-vm"]) == expected
+
+
+@pytest.mark.parametrize("words", [WORDS, None], ids=["wordlist", "no-wordlist"])
+@pytest.mark.parametrize("separator", [".", ",", "!", "?", ";", ":"])
+def test_sentence_punctuation_blocks_token_joining(monkeypatch, words, separator) -> None:
+    monkeypatch.setattr(vc, "_words", words)
+    src = f"code{separator} mux"
+    assert fix(src, ["Codemux"]) == src
 
 
 def test_unicode_text_is_safe() -> None:

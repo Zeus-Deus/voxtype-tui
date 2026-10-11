@@ -13,6 +13,8 @@ rewrites the span to the canonical spelling. It is conservative on
 purpose:
 
 - spans never cross punctuation;
+- non-ASCII vocabulary and spans touching Unicode letters, digits or
+  combining marks are left alone (the matcher uses ASCII tokens);
 - URLs, paths and file names are left alone (``app.codemux.org``,
   ``.codex``, ``claude.md``);
 - plural forms of a term are kept as the user said them;
@@ -37,6 +39,7 @@ import re
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Iterable
+from unicodedata import category
 
 WORDLIST_PATHS: tuple[Path, ...] = (
     Path("/usr/share/cracklib/cracklib-small"),
@@ -53,7 +56,6 @@ MAX_TEXT_CHARS = 50_000
 MAX_TERMS = 1000
 
 TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9'\-]*")
-_PUNCT = re.compile(r"[.,!?;:]")
 _NON_ALNUM = re.compile(r"[^a-z0-9]")
 
 # A span may not start or end on a function word: that is how neighbours
@@ -157,6 +159,8 @@ def _fix(text: str, terms: list[str], words: frozenset[str] | None) -> str:
     # single-word terms: 1-2 tokens ("code mux").
     specs = []
     for term in terms:
+        if not term.isascii():
+            continue  # ASCII tokenization cannot safely match Unicode terms
         tq = squash(term)
         if len(tq) < 4:
             continue  # too short to fuzz safely (MCP)
@@ -178,10 +182,18 @@ def _fix(text: str, terms: list[str], words: frozenset[str] | None) -> str:
         if not (w > 1 and (lowered[0] in STOP or lowered[-1] in STOP)):
             a, b = toks[i].start(), toks[i + w - 1].end()
             span = text[a:b]
-            url_like = (a > 0 and text[a - 1] in "./\\_") or (
-                b < n_text - 1 and text[b] in "./_" and text[b + 1].isalnum()
+            neighbors = text[max(0, a - 1):a] + text[b:b + 1]
+            word_neighbor = any(
+                c.isalnum() or category(c).startswith("M") for c in neighbors
             )
-            if not _PUNCT.search(span) and not url_like:
+            url_like = (a > 0 and text[a - 1] in "./\\_") or (
+                b < n_text - 1 and text[b] in "./\\_" and text[b + 1].isalnum()
+            )
+            whitespace_gaps = all(
+                text[toks[j].end():toks[j + 1].start()].isspace()
+                for j in range(i, i + w - 1)
+            )
+            if whitespace_gaps and not url_like and not word_neighbor:
                 plain = bool(words) and all(x.strip("'") in words for x in lowered)
                 info = (a, b, span, squash(span), plain)
         span_cache[key] = info
