@@ -45,6 +45,8 @@ initial_prompt = "Codemux, Claude Code, Vexis, Omarchy, waybar, Arch Linux, omar
 ```
 Our UI manages it as a **list of words/phrases**; on save we serialize to a comma-separated string. On load we parse it back into a list. Keep user-facing metadata (per-word notes, dates added, categories) in our own sidecar file — see "Sidecar" section below.
 
+**Vocabulary corrector (always on, no setting).** Engines still mishear vocabulary ("clawed code", "code mux", "hyperland"), and non-whisper engines never see the prompt at all. So `voxtype-tui-postprocess` also runs `voxtype_tui.vocab_corrector` on every transcript, after the dictionary engine: spans of 1..n+1 words that look or sound like a vocabulary term are rewritten to the canonical spelling. Guards (keep them; they are why it is safe on real dictations): spans never cross punctuation; URLs/paths/file names are skipped; plurals are kept; hyphenated identifiers only match exactly; terms of ≤3 letters (`MCP`) are never touched; an all-English span is never fuzzed into a single-word term (wordlist: `/usr/share/cracklib/cracklib-small`, then `/usr/share/dict/words`; with neither, only same-letters fixes like "code mux" → Codemux run). The wordlist loads lazily once per process (~6 ms); `correct()` never raises and returns the input on any error. Typical cost ~1–4 ms per dictation.
+
 Note: Whisper's initial prompt is capped at ~224 tokens. The UI should show a running token count and warn when the list is close to the limit.
 
 ### Dictionary → Replacement / Commands / Capitalization → `[text] replacements` + `[output.post_process]`
@@ -53,9 +55,10 @@ Two layers run against every transcript:
 
 1. **Voxtype native** — `[text] replacements = { "vox type" = "voxtype", …}` is a flat case-insensitive `\b`-bounded map applied inside the Voxtype daemon (`src/text/mod.rs`). Fast, but limited to literal triggers with ASCII word boundaries.
 
-2. **voxtype-tui post-processor (Vexis-parity)** — when the sidecar has any rules, saves wire `[output.post_process] command = "voxtype-tui-postprocess"`. The CLI (`voxtype_tui.cli_postprocess`) re-reads the sidecar on every transcription and runs a two-stage engine (`voxtype_tui.dictionary_engine`):
+2. **voxtype-tui post-processor (Vexis-parity)** — when the sidecar has any rules or any vocabulary, saves wire `[output.post_process] command = "voxtype-tui-postprocess"`. The CLI (`voxtype_tui.cli_postprocess`) re-reads the sidecar on every transcription and runs a two-stage engine (`voxtype_tui.dictionary_engine`):
    - **Stage 1 (Fuzzy replacements)** — Whisper-aware bounded-gap regex. One trigger `"slash codemux release"` matches `slash codemux release`, `/codemux release`, `/codemuxrelease`, `/codemux-release`, `/codemuxapi-release`, etc. Command-phrase atoms (`slash` → `(?:slash|/)` etc.) match both spoken and auto-formatted forms.
    - **Stage 2 (Exact capitalization)** — strict whole-token match with Unicode neighbor-char boundaries (handles `c++`, `.net`). Runs after replacements so proper-noun casing gets fixed post-hoc.
+   - **Then the vocabulary corrector** (`voxtype_tui.vocab_corrector`, see Vocabulary above). Each stage fails open on its own.
 
 Sidecar holds category + `to_text`. Config.toml `[text] replacements` mirrors Replacement-category rules as a native-layer fallback (if `voxtype-tui-postprocess` is missing, Voxtype's own literal pass still catches them).
 
@@ -254,7 +257,7 @@ New releases can ship with schema changes (e.g. "enable the post-process CLI for
 2. **Headless CLI** — `voxtype-tui --apply-migrations` (implemented in `cli_migrate.py`, dispatched from `app.main()` before Textual boots). Loads state, runs migrations, saves, restarts the daemon. Idempotent. Intended for power users and the AUR post-install hook.
 3. **AUR pacman hook** — `voxtype-tui.install` (at repo root, referenced via `install=voxtype-tui.install` in PKGBUILD). Shown to users on install/upgrade; tells them migrations will apply on next TUI launch and offers the CLI one-liner for immediate activation. The hook does NOT invoke anything itself (it runs as root and can't touch per-user config + user systemd service reliably).
 
-**Schema version**: `sidecar.SCHEMA_VERSION` (int, currently `2`). Fresh in-memory sidecars start at SCHEMA_VERSION so they skip pending migrations; file-loaded sidecars use whatever version the file declares (default `1` for pre-migration-era sidecars). Migrations advance `sc.version` even when no individual migration had visible work — the version is the claim "every migration up to N has been considered".
+**Schema version**: `sidecar.SCHEMA_VERSION` (int, currently `3`; v2 wires the post-processor for installs with dictionary rules, v3 for installs with vocabulary — `migrations.wants_post_process` is the shared gate used by both the migration and `AppState.save`). Fresh in-memory sidecars start at SCHEMA_VERSION so they skip pending migrations; file-loaded sidecars use whatever version the file declares (default `1` for pre-migration-era sidecars). Migrations advance `sc.version` even when no individual migration had visible work — the version is the claim "every migration up to N has been considered".
 
 **Adding a migration**: append to `migrations.MIGRATIONS` with `target_version = SCHEMA_VERSION + 1`, bump `SCHEMA_VERSION`, add a test. The migration function is idempotent by contract and takes `(doc, sc)` → returns `True` when it changed anything.
 

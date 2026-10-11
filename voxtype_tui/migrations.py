@@ -60,6 +60,30 @@ class Migration:
     touches_config: bool
 
 
+def wants_post_process(sc: sidecar.Sidecar) -> bool:
+    """True when `voxtype-tui-postprocess` has work to do for this sidecar:
+    dictionary rules (dictionary engine) or vocabulary (the always-on
+    vocabulary corrector). Shared by the save path and the migrations so
+    the two gates can't drift apart."""
+    return bool(sc.replacements or sc.vocabulary)
+
+
+def _wire_postprocess(doc: TOMLDocument) -> bool:
+    """Point `[output.post_process]` at our CLI with the default timeout.
+
+    Idempotent, and non-destructive: a user's own command is left alone.
+    Returns True when the doc changed."""
+    pp = config.get_post_process(doc)
+    existing = pp.get("command")
+    if existing and existing != config.POSTPROCESS_COMMAND:
+        return False
+    want_timeout = config.POSTPROCESS_TIMEOUT_MS
+    if existing == config.POSTPROCESS_COMMAND and pp.get("timeout_ms") == want_timeout:
+        return False
+    config.set_post_process(doc, config.POSTPROCESS_COMMAND, want_timeout)
+    return True
+
+
 def _enable_postprocess(doc: TOMLDocument, sc: sidecar.Sidecar) -> bool:
     """v1 → v2: activate our Vexis-style post-processor for any install
     that already has dictionary rules.
@@ -79,15 +103,23 @@ def _enable_postprocess(doc: TOMLDocument, sc: sidecar.Sidecar) -> bool:
     """
     if not sc.replacements:
         return False
-    pp = config.get_post_process(doc)
-    existing = pp.get("command")
-    if existing and existing != config.POSTPROCESS_COMMAND:
+    return _wire_postprocess(doc)
+
+
+def _enable_postprocess_for_vocabulary(doc: TOMLDocument, sc: sidecar.Sidecar) -> bool:
+    """v2 → v3: wire the post-processor for installs that have vocabulary.
+
+    The post-process CLI now also runs the always-on vocabulary corrector
+    (`vocab_corrector`), so it is useful whenever the vocabulary is
+    non-empty, not only when there are dictionary rules. Installs with a
+    vocabulary but no rules were never wired by v2; this wires them.
+
+    Same guarantees as v2: idempotent, leaves a user's own command alone,
+    no-op when there is neither vocabulary nor rules.
+    """
+    if not wants_post_process(sc):
         return False
-    want_timeout = config.POSTPROCESS_TIMEOUT_MS
-    if existing == config.POSTPROCESS_COMMAND and pp.get("timeout_ms") == want_timeout:
-        return False
-    config.set_post_process(doc, config.POSTPROCESS_COMMAND, want_timeout)
-    return True
+    return _wire_postprocess(doc)
 
 
 MIGRATIONS: list[Migration] = [
@@ -96,6 +128,13 @@ MIGRATIONS: list[Migration] = [
         name="enable_postprocess",
         description="Enable Vexis-style fuzzy/Unicode post-processor",
         apply=_enable_postprocess,
+        touches_config=True,
+    ),
+    Migration(
+        target_version=3,
+        name="enable_postprocess_for_vocabulary",
+        description="Run the vocabulary corrector (wire the post-processor when vocabulary exists)",
+        apply=_enable_postprocess_for_vocabulary,
         touches_config=True,
     ),
 ]

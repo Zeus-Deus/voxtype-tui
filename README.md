@@ -80,6 +80,10 @@ Everything that maps to Voxtype itself — vocabulary phrases, replacement maps,
 
 UI-only annotations that don't belong in Voxtype's config: vocabulary entries as structured objects (so the UI can show a list rather than parsing the comma-joined string on every render), per-replacement category tags (Replacement / Capitalization), and `added_at` timestamps. On load the sidecar is reconciled against the config. If you hand-edit `config.toml` and the sidecar diverges, **the config wins** — the sidecar is rebuilt from disk and a dismissible warning banner surfaces the divergence at the top of the affected tab.
 
+### Vocabulary corrector (automatic)
+
+Speech engines still mishear names ("clawed code", "code mux", "hyperland"), and engines other than Whisper never see the vocabulary prompt at all. So whenever you have vocabulary or dictionary entries, voxtype-tui wires its `voxtype-tui-postprocess` command into Voxtype's `[output.post_process]` (unless you set your own command there). It runs your dictionary rules first, then a vocabulary corrector that rewrites spans that look or sound like a vocabulary term to your spelling ("open clawed code" → "open Claude Code", "code mux" → "Codemux"). There is no setting: it is conservative by design (it never touches URLs, file names, plurals, terms of three letters or fewer, or ordinary English words), it adds a few milliseconds per dictation, and on any error it passes the transcript through unchanged. It uses cracklib's word list (`/usr/share/cracklib/cracklib-small`) or `/usr/share/dict/words` to recognise ordinary English; without either it only fixes casing and spacing. Existing installs are wired automatically on the next launch (or `voxtype-tui --apply-migrations`).
+
 ## Restart-sensitive fields
 
 Some Voxtype fields are baked in at daemon startup and need `systemctl --user restart voxtype` to take effect:

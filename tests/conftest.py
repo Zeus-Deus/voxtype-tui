@@ -24,6 +24,16 @@ FIXTURE_NAMES = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _isolate_sync_bundle(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every save writes `sync.json` at `sync.SYNC_PATH`, which defaults to
+    the real `~/.config/voxtype-tui/sync.json`. Point it at a temp dir so no
+    test ever touches the user's real bundle; tests that care about the
+    path still override it with their own monkeypatch."""
+    from voxtype_tui import sync
+    monkeypatch.setattr(sync, "SYNC_PATH", tmp_path_factory.mktemp("sync") / "sync.json")
+
+
 @pytest.fixture(params=FIXTURE_NAMES)
 def fixture_name(request: pytest.FixtureRequest) -> str:
     return request.param
