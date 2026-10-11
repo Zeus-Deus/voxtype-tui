@@ -139,7 +139,9 @@ def test_all_seven_engines_present_and_non_empty() -> None:
     """Every engine Voxtype supports must offer at least one model — no
     more empty placeholder lists."""
     expected = {"whisper", "parakeet", "moonshine", "sensevoice",
-                "paraformer", "dolphin", "omnilingual"}
+                "paraformer", "dolphin", "omnilingual",
+                # voxtype-tui's managed engine (extra_models / asr_server)
+                "qwen3-asr"}
     assert set(models.MODEL_CATALOG.keys()) == expected
     for engine, rows in models.MODEL_CATALOG.items():
         assert rows, f"{engine!r} catalog is empty — at least one model required"
@@ -163,7 +165,11 @@ def test_whisper_catalog_matches_voxtype_source() -> None:
     src = (VOXTYPE_SRC / "setup" / "model.rs").read_text()
     # Extract every `name: "<name>"` string inside WhisperModelInfo-style entries.
     names = set(re.findall(r'name:\s*"([\w.\-]+)"', src))
-    our_whisper = {m.name for m in models.MODEL_CATALOG["whisper"]}
+    from voxtype_tui import extra_models
+    our_whisper = {
+        m.name for m in models.MODEL_CATALOG["whisper"]
+        if not extra_models.is_extra_model("whisper", m.name)
+    }
     missing_ours = our_whisper - names
     assert not missing_ours, (
         f"Our whisper catalog has models Voxtype doesn't know about: {missing_ours}. "

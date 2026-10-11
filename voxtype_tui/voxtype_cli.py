@@ -85,7 +85,9 @@ def restart_daemon() -> tuple[bool, str]:
     running is reported as a failure so the UI never shows a green
     "restarted" toast over a daemon that never cycled. If the identity
     can't be read at all (systemctl show failing) we fall back to exit
-    code only rather than blocking the restart."""
+    code only, except pending Qwen3 teardown: it requires verified identity
+    change before retiring the old daemon's helper. All project restart
+    entrypoints use this API so cleanup errors remain retryable failures."""
     if shutil.which("systemctl") is None:
         return False, "systemctl not available"
     before = daemon_identity()
@@ -106,6 +108,13 @@ def restart_daemon() -> tuple[bool, str]:
             f"systemctl reported success but voxtype (PID {after[0]}) "
             "was not restarted — check `systemctl --user status voxtype`"
         )
+    from . import asr_server
+    if asr_server.teardown_pending():
+        if before is None or after is None:
+            return False, "daemon restart unverified; Qwen3-ASR teardown still pending"
+        problems = asr_server.finish_teardown_after_restart()
+        if problems:
+            return False, "daemon restarted; " + "; ".join(problems)
     return True, "voxtype restarted"
 
 
