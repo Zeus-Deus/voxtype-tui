@@ -556,7 +556,10 @@ def test_status_detail_is_short_and_blames_port_only_when_taken(qenv, monkeypatc
     monkeypatch.setattr(asr_server, "unit_status", lambda: {"available": True, "active_state": "inactive"})
     monkeypatch.setattr(asr_server, "probe_health", lambda p: (False, "connection refused"))
     assert asr_server.status(st.doc, st.sc)["qwen3"]["detail"] == "not running"
-    with socket.socket() as other:  # another program holds the port
+    with socket.socket() as other:  # bound but not listening (like TIME-WAIT leftovers)
+        other.bind(("127.0.0.1", port))
+        assert asr_server.status(st.doc, st.sc)["qwen3"]["detail"] == "not running"
+    with socket.socket() as other:  # another program really listens there
         other.bind(("127.0.0.1", port)); other.listen()
         assert asr_server.status(st.doc, st.sc)["qwen3"]["detail"] == "port taken by another program"
     monkeypatch.setattr(asr_server, "unit_status", lambda: {"available": True, "active_state": "deactivating"})

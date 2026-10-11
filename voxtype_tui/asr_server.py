@@ -162,6 +162,17 @@ def port_is_free(port: int) -> bool:
     return True
 
 
+def port_has_listener(port: int, timeout: float = 0.3) -> bool:
+    """True when some program accepts TCP connections on 127.0.0.1:port.
+    Unlike a bind test, sockets left in TIME-WAIT by a server that just
+    exited don't count."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def pick_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -755,9 +766,10 @@ def status(doc: Any, sc: Any, *, probe: bool = True) -> dict[str, Any]:
             elif unit.get("available") and state not in ("active", "activating"):
                 result = unit.get("result")
                 reason = f"unit {state}" + (f", {result}" if result not in (None, "success") else "")
-                # Only blame the port when the server is fully stopped: a
-                # stopping server or sockets in TIME-WAIT are not "another program".
-                if state in ("inactive", "failed") and not port_is_free(port):
+                # Only blame the port when our server is fully stopped and some
+                # other program is really listening there (a bind test would
+                # also trip on TIME-WAIT sockets left by our own server).
+                if state in ("inactive", "failed") and port_has_listener(port):
                     detail = "port taken by another program"
                     reason += f"; port {port} in use"
                 else:
