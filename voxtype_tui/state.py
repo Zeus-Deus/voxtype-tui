@@ -14,7 +14,7 @@ from pathlib import Path
 import tomlkit
 from tomlkit import TOMLDocument
 
-from . import config, migrations, sidecar, sync
+from . import asr_server, config, migrations, sidecar, sync
 
 _logger = logging.getLogger(__name__)
 
@@ -60,6 +60,9 @@ class AppState:
     sync_reconcile: "sync.SyncReconcileResult" = field(
         default_factory=lambda: sync.SyncReconcileResult()
     )
+    # Problems from the last save's Qwen3-ASR unit reconcile
+    # (`asr_server.apply_after_save`). Empty = fine / not in use.
+    asr_problems: list[str] = field(default_factory=list)
 
     @property
     def dirty(self) -> bool:
@@ -76,7 +79,10 @@ class AppState:
         vocab, w1 = sidecar.reconcile_vocab(raw_sc.vocabulary, initial)
         reps, w2 = sidecar.reconcile_replacements(raw_sc.replacements, cfg_reps)
 
-        sc = sidecar.Sidecar(vocabulary=vocab, replacements=reps, version=raw_sc.version)
+        sc = sidecar.Sidecar(
+            vocabulary=vocab, replacements=reps, version=raw_sc.version,
+            qwen3_asr=raw_sc.qwen3_asr,
+        )
 
         # Apply pending schema migrations. Runs AFTER reconcile so
         # migrations see the post-reconcile shape (e.g. new rules
@@ -131,7 +137,11 @@ class AppState:
                 or sync_result.needs_save_sidecar
             ),
             daemon_stale=config_dirty_from_migrations,
-            reconcile_warnings=w1 + w2,
+            # Extra-model problems (GPU-only model without the Vulkan
+            # binary, Qwen3-ASR engine/model file missing) ride the same
+            # banner as reconcile warnings — file checks only, no I/O to
+            # systemd at load time.
+            reconcile_warnings=w1 + w2 + asr_server.load_warnings(doc, sc),
             migrations_applied=migration_result.applied,
             sync_reconcile=sync_result,
         )
@@ -348,7 +358,16 @@ class AppState:
             sync.write_sync_bundle(self.doc, self.sc)
         except OSError as e:
             _logger.warning("sync.json write failed: %s", e)
+        # Qwen3-ASR server unit + hotwords env file follow the committed
+        # state (no-op unless Qwen3 is or was in use). Never raises.
+        asr = asr_server.apply_after_save(self.doc, self.sc)
+        self.asr_problems = asr.problems
         restart_fields = config.diff_restart_sensitive(baseline_doc, self.doc)
+        if asr.changed:
+            # Qwen3 model / hotwords / unit changed without a config.toml
+            # diff (e.g. q4_k -> q8_0): voxtype's restart restarts the
+            # server too (PartOf=), so report it like any restart field.
+            restart_fields = sorted(set(restart_fields) | {asr_server.RESTART_FIELD})
         if restart_fields or config_touched:
             self.daemon_stale = True
         self.loaded_dump = tomlkit.dumps(self.doc)

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -35,7 +36,9 @@ from textual.widgets import (
     Static,
 )
 
-from . import config
+from . import asr_server, config, downloader
+from . import extra_models as xm
+from .extra_models import ENGINE_QWEN3
 from .settings import MODEL_PATH_PER_ENGINE
 from .theme import MODAL_BORDER_STYLE
 from .vim_nav import VIM_NAV_ACTIONS, VIM_NAV_BINDINGS, VimTableNav
@@ -107,6 +110,15 @@ MODEL_CATALOG: dict[str, list[ModelInfo]] = {
         ModelInfo("300m", 3900),
     ],
 }
+
+# Extra models voxtype-tui downloads itself (see extra_models.py): the
+# quantized whisper files join the whisper catalog, and Qwen3-ASR is a
+# managed engine of its own. Appended after the drift-checked native
+# table so the voxtype-source drift test keeps comparing only natives.
+MODEL_CATALOG["whisper"] = MODEL_CATALOG["whisper"] + [
+    ModelInfo(m.name, m.size_mb) for m in xm.EXTRA_WHISPER_MODELS
+]
+MODEL_CATALOG[ENGINE_QWEN3] = [ModelInfo(m.name, m.size_mb) for m in xm.QWEN3_MODELS]
 
 
 # Config-key mapping lives in settings.py as MODEL_PATH_PER_ENGINE.
@@ -184,7 +196,10 @@ def model_file_path(engine: str, name: str, models_dir: Path | None = None) -> P
     """
     base = models_dir if models_dir is not None else MODELS_DIR
     if engine == "whisper":
-        return base / f"ggml-{name}.bin"
+        # Accept the config form of extra models too (`ggml-<name>.bin`).
+        return base / f"ggml-{xm.catalog_model_name('whisper', name)}.bin"
+    if engine == ENGINE_QWEN3:
+        return base / f"{xm.QWEN3_FILE_PREFIX}{name}{xm.QWEN3_FILE_SUFFIX}"
     if engine == "moonshine":
         return base / f"moonshine-{name}"
     if engine == "sensevoice":
@@ -252,6 +267,9 @@ def scan_downloaded(engine: str) -> dict[str, int]:
     out: dict[str, int] = {}
     if not MODELS_DIR.exists():
         return out
+
+    if engine == ENGINE_QWEN3:
+        return xm.scan_qwen3(MODELS_DIR)
 
     if engine == "whisper":
         for f in MODELS_DIR.glob("ggml-*.bin"):
@@ -402,15 +420,16 @@ class ModelsPane(VimTableNav, Vertical):
         """Render an engine name for the Select dropdown, tagging
         engines that aren't compiled into the user's voxtype binary
         so the choice is honest about what works."""
+        label = xm.engine_label(engine)
         if engine in self._compiled_engines:
-            return engine
-        return f"{engine} (not compiled)"
+            return label
+        return f"{label} (not compiled)"
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="models-top"):
             yield Label("Engine:", classes="label")
             yield Select(
-                options=[(e, e) for e in MODEL_CATALOG.keys()],
+                options=[(xm.engine_label(e), e) for e in MODEL_CATALOG.keys()],
                 allow_blank=False,
                 value="whisper",
                 id="models-engine",
@@ -459,6 +478,10 @@ class ModelsPane(VimTableNav, Vertical):
             self._compiled_engines = voxtype_cli.compiled_engines()
         except Exception:
             self._compiled_engines = {"whisper"}
+        # Qwen3-ASR runs through voxtype's whisper remote mode, so it is
+        # usable whenever whisper is.
+        if "whisper" in self._compiled_engines:
+            self._compiled_engines.add(ENGINE_QWEN3)
         # Re-label the engine Select so "(not compiled)" suffixes
         # appear on engines the user's binary can't use.
         select = self.query_one("#models-engine", Select)
@@ -495,10 +518,13 @@ class ModelsPane(VimTableNav, Vertical):
         self._update_disk_label()
 
     def _engine_from_state(self) -> str:
-        """Read the live engine from state.doc, lowercased.
-        Returns "" when state isn't loaded yet."""
+        """Read the live engine from state, lowercased — ``qwen3-asr``
+        when the Qwen3-ASR marker is active (see asr_server). Returns ""
+        when state isn't loaded yet."""
         if self.tui.state is None:
             return ""
+        if asr_server.is_qwen3_active(self.tui.state.doc, self.tui.state.sc):
+            return ENGINE_QWEN3
         engine = self.tui.state.doc.get("engine")
         if engine is None:
             return ""
@@ -510,14 +536,25 @@ class ModelsPane(VimTableNav, Vertical):
         return str(self.query_one("#models-engine", Select).value)
 
     def _active_model_for_engine(self) -> str:
+        """Catalog name of the active model for the selected engine ("" if
+        that engine isn't the live one for Qwen3-ASR, or unset)."""
         if self.tui.state is None:
             return ""
         engine = self._current_engine()
+        st = self.tui.state
+        live_engine, live_model = asr_server.active_engine_model(st.doc, st.sc)
+        if engine == ENGINE_QWEN3:
+            return live_model if live_engine == ENGINE_QWEN3 else ""
         path = MODEL_PATH_PER_ENGINE.get(engine)
         if path is None:
             return ""
+        if engine == "whisper" and live_engine == ENGINE_QWEN3:
+            # whisper.model is still in config (remote mode ignores it) but
+            # the live model is Qwen3's — don't mark a whisper row active.
+            return ""
         section, key = path.split(".")
-        return str(self.tui.state.doc.get(section, {}).get(key, ""))
+        value = str(self.tui.state.doc.get(section, {}).get(key, ""))
+        return xm.catalog_model_name(engine, value)
 
     def _selected_model_name(self) -> str | None:
         table = self.query_one(DataTable)
@@ -544,6 +581,9 @@ class ModelsPane(VimTableNav, Vertical):
         for m in catalog:
             seen_names.add(m.name)
             status = "downloaded" if m.name in downloaded else "—"
+            ok, reason = xm.availability(engine, m.name)
+            if not ok:
+                status = f"{status} · {reason}" if m.name in downloaded else reason
             active_mark = "●" if m.name == active else ""
             size = _fmt_size(
                 downloaded[m.name] if m.name in downloaded else m.size_mb * 1024 * 1024
@@ -551,7 +591,7 @@ class ModelsPane(VimTableNav, Vertical):
             table.add_row(m.name, size, status, active_mark, key=m.name)
         # Unknown .bin files on disk not in the catalog
         for name, size in downloaded.items():
-            if name in seen_names:
+            if name in seen_names or name.endswith(".part"):
                 continue
             table.add_row(
                 name, _fmt_size(size), "unknown", "",
@@ -560,15 +600,27 @@ class ModelsPane(VimTableNav, Vertical):
 
     def _update_disk_label(self) -> None:
         used = total_disk_usage()
-        self.query_one("#models-disk", Static).update(
-            f"Models dir: {humanize_bytes(used)} used"
-        )
+        text = f"Models dir: {humanize_bytes(used)} used"
+        st = self.tui.state
+        if (
+            st is not None
+            and self._current_engine() == ENGINE_QWEN3
+            and asr_server.is_qwen3_active(st.doc, st.sc)
+        ):
+            q = asr_server.status(st.doc, st.sc)["qwen3"]
+            health = "server ok" if q.get("healthy") else f"server: {q.get('detail')}"
+            text = f"{health} · {text}"
+        self.query_one("#models-disk", Static).update(text)
 
     # ---- event handlers ----
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "models-engine":
             self.refresh_table()
+            self._refresh_button_availability()
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if self._active_proc is None:
             self._refresh_button_availability()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -615,6 +667,12 @@ class ModelsPane(VimTableNav, Vertical):
         # prevents this from happening, but the guard makes the
         # invariant explicit.
         live_engine = self._engine_from_state() or "whisper"
+        if ENGINE_QWEN3 in (engine, live_engine):
+            # Switching to / away from Qwen3-ASR is an engine switch done
+            # right here: asr_server remembers / restores the whisper
+            # settings and flips `engine`.
+            self._set_active_managed(engine, name)
+            return
         if engine != live_engine:
             self.app.notify(
                 f"Models tab shows '{engine}' but the live engine is "
@@ -624,6 +682,10 @@ class ModelsPane(VimTableNav, Vertical):
                 title="Engine mismatch",
                 timeout=8,
             )
+            return
+        if xm.is_extra_model(engine, name):
+            # Quantized whisper: availability check + bare-filename value.
+            self._set_active_managed(engine, name)
             return
         path = MODEL_PATH_PER_ENGINE.get(engine)
         if not path:
@@ -658,6 +720,30 @@ class ModelsPane(VimTableNav, Vertical):
             pane.sync_from_state()
         self.app.notify(f"'{name}' marked active (ctrl+s to save)", timeout=3)
 
+    def _set_active_managed(self, engine: str, name: str) -> None:
+        """Set-active for Qwen3-ASR and the extra whisper models — and any
+        switch between Qwen3-ASR and whisper — through asr_server, which
+        owns the engine switch + restore. Refusals are warnings."""
+        assert self.tui.state is not None
+        try:
+            asr_server.set_active_model(
+                self.tui.state, engine, name,
+                models_dir=MODELS_DIR,
+                is_installed=lambda e, n: is_model_installed(e, n),
+            )
+        except xm.RefusedError as e:
+            self.app.notify(
+                str(e), severity="warning", title="Not activated", timeout=8,
+            )
+            return
+        self.tui.refresh_dirty()
+        self.refresh_table()
+        from .settings import SettingsPane
+        for pane in self.app.query(SettingsPane):
+            pane.sync_from_state()
+        label = xm.engine_label(engine)
+        self.app.notify(f"{label} '{name}' marked active (ctrl+s to save)", timeout=3)
+
     def _action_download(self) -> None:
         if self._active_proc is not None:
             self.app.notify("A download is already running", severity="warning")
@@ -691,6 +777,12 @@ class ModelsPane(VimTableNav, Vertical):
                 title=f"{engine} not compiled",
             )
             return
+        ok, reason = xm.availability(engine, name)
+        if not ok:
+            self.app.notify(
+                f"{name}: {reason}", severity="warning", title="Not available", timeout=8,
+            )
+            return
         asyncio.create_task(self._run_download(name))
 
     def _refresh_button_availability(self) -> None:
@@ -704,14 +796,26 @@ class ModelsPane(VimTableNav, Vertical):
             btn = self.query_one("#models-download", Button)
         except Exception:
             return
-        btn.disabled = engine not in self._compiled_engines
+        disabled = engine not in self._compiled_engines
+        name = self._selected_model_name() if self.is_mounted else None
+        if name and not xm.availability(engine, name)[0]:
+            disabled = True
+        btn.disabled = disabled
 
     def _action_delete(self) -> None:
         name = self._selected_model_name()
         if not name:
             return
         engine = self._current_engine()
-        if name == self._active_model_for_engine():
+        st = self.tui.state
+        remembered_whisper = ""
+        if st is not None and engine == "whisper":
+            # While Qwen3-ASR is active, whisper.model is the model we
+            # restore on switch-back — deleting it would strand that.
+            remembered_whisper = xm.catalog_model_name(
+                "whisper", str((st.doc.get("whisper") or {}).get("model", "")),
+            )
+        if name in (self._active_model_for_engine(), remembered_whisper):
             self.app.notify(
                 "Cannot delete the active model. Set a different model "
                 "active first.",
@@ -734,7 +838,17 @@ class ModelsPane(VimTableNav, Vertical):
             if not confirmed:
                 return
             try:
-                os.unlink(path)
+                if xm.is_extra_model(engine, name):
+                    st = self.tui.state
+                    xm.delete(
+                        engine, name, models_dir=MODELS_DIR,
+                        doc=st.doc if st else None, sc=st.sc if st else None,
+                    )
+                else:
+                    os.unlink(path)
+            except xm.RefusedError as e:
+                self.app.notify(str(e), severity="warning")
+                return
             except OSError as e:
                 self.app.notify(f"Delete failed: {e}", severity="error")
                 return
@@ -752,13 +866,23 @@ class ModelsPane(VimTableNav, Vertical):
         progress = self.query_one("#models-progress", ProgressBar)
         progress.update(progress=0)
         log.clear()
-        log.write(f"$ voxtype setup --download --model {name}")
+        engine = self._current_engine()
+        # A synced/missing-model name may arrive in config form.
+        name = xm.catalog_model_name(engine, name)
+        argv = xm.download_argv(engine, name)
+        log.write("$ " + " ".join(argv[2:] if argv[0] == sys.executable else argv))
+        env = None
+        if xm.is_extra_model(engine, name):
+            # Child resolves voxtype's models dir from this override so a
+            # test (or bridge) MODELS_DIR re-point is honoured.
+            env = dict(os.environ, VOXTYPE_MODELS_DIR=str(MODELS_DIR))
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                "voxtype", "setup", "--download", "--model", name,
+                *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=env,
             )
         except OSError as e:
             log.write(f"ERROR: {e}")
@@ -836,8 +960,15 @@ class ModelsPane(VimTableNav, Vertical):
             pass
 
         # Clean up the partial .bin so the next download starts fresh.
-        if name:
-            path = model_file_path(self._current_engine(), name)
+        engine = self._current_engine()
+        if name and xm.is_extra_model(engine, name):
+            # Our downloader writes `<file>.part` and only renames after
+            # the sha256 matched; the child removes the .part on SIGTERM,
+            # this catches a SIGKILLed child. Never touch a complete file.
+            if xm.cleanup_partial(engine, name, models_dir=MODELS_DIR):
+                log.write("[removed partial download]")
+        elif name:
+            path = model_file_path(engine, name)
             if path.exists():
                 try:
                     os.unlink(path)

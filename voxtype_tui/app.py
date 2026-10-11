@@ -791,6 +791,10 @@ class VoxtypeTUI(App[None]):
             return
         self.refresh_dirty()
         self.refresh_stale_pill()
+        for problem in self.state.asr_problems:
+            # Qwen3-ASR server unit could not be (re)written/enabled — say
+            # so instead of leaving voxtype pointed at a dead endpoint.
+            self.notify(problem, severity="error", title="Qwen3-ASR", timeout=12)
 
         # Modal only on the first-time transition into stale state. Once the
         # pill is up the user already has a persistent signal — further
@@ -1062,7 +1066,12 @@ class VoxtypeTUI(App[None]):
                 timeout=8,
             )
             return
-        self.state.set_setting("whisper.model", name)
+        from . import extra_models
+        # Extra (quantized) whisper models are written as their bare
+        # ggml-<name>.bin filename — the only form voxtype accepts.
+        self.state.set_setting(
+            "whisper.model", extra_models.config_model_value("whisper", name),
+        )
         self.refresh_dirty()
         # Hide the banner — the workflow is now complete; the user's
         # next step (Ctrl+S) is independent and signposted in the toast.

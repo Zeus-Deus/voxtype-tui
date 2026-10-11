@@ -67,6 +67,9 @@ class Sidecar:
     vocabulary: list[VocabEntry] = field(default_factory=list)
     replacements: list[ReplacementEntry] = field(default_factory=list)
     version: int = SCHEMA_VERSION
+    # Qwen3-ASR engine marker + remembered whisper settings, owned by
+    # `asr_server` (see its module docstring). None when never used.
+    qwen3_asr: dict | None = None
 
 
 def load(path: Path = SIDECAR_PATH) -> Sidecar:
@@ -92,10 +95,12 @@ def load(path: Path = SIDECAR_PATH) -> Sidecar:
             category=cat,
             added_at=r.get("added_at", _now_iso()),
         ))
+    qwen3 = data.get("qwen3_asr")
     return Sidecar(
         vocabulary=vocab,
         replacements=reps,
         version=data.get("version", 1),
+        qwen3_asr=qwen3 if isinstance(qwen3, dict) else None,
     )
 
 
@@ -106,6 +111,8 @@ def save_atomic(sc: Sidecar, path: Path = SIDECAR_PATH) -> None:
         "vocabulary": [asdict(v) for v in sc.vocabulary],
         "replacements": [asdict(r) for r in sc.replacements],
     }
+    if sc.qwen3_asr is not None:
+        data["qwen3_asr"] = sc.qwen3_asr
     fd, tmp = tempfile.mkstemp(
         prefix=path.name + ".", suffix=".tmp", dir=str(path.parent)
     )

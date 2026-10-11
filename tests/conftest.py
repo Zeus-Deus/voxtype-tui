@@ -34,6 +34,29 @@ def _isolate_sync_bundle(tmp_path_factory: pytest.TempPathFactory, monkeypatch: 
     monkeypatch.setattr(sync, "SYNC_PATH", tmp_path_factory.mktemp("sync") / "sync.json")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_extra_models(tmp_path_factory, monkeypatch: pytest.MonkeyPatch):
+    """Keep every test away from the real XDG dirs, the user's systemd
+    manager and the `voxtype info variants` probe: the Qwen3-ASR unit/env
+    files resolve under a temp XDG_CONFIG_HOME, systemctl calls from
+    `asr_server` are no-ops, and hardware detection is a fixed GPU box
+    (tests that need CPU-only override `extra_models._ACCEL_CACHE`)."""
+    from voxtype_tui import extra_models
+
+    root = tmp_path_factory.mktemp("xdg")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(root / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(root / "data"))
+    monkeypatch.delenv("VOXTYPE_MODELS_DIR", raising=False)
+    monkeypatch.setenv("VOXTYPE_TUI_SYSTEMCTL", "0")
+    monkeypatch.setattr(extra_models, "_ACCEL_CACHE", extra_models.Accel(
+        voxtype_installed=True, voxtype_variant="whisper-vulkan",
+        voxtype_gpu=True, cpu="avx512", physical_cores=6,
+    ))
+    # A refresh (after a GPU enable/disable) must not run the real binary.
+    monkeypatch.setattr(extra_models, "_voxtype_variant",
+                        lambda: (True, "whisper-vulkan"))
+
+
 @pytest.fixture(params=FIXTURE_NAMES)
 def fixture_name(request: pytest.FixtureRequest) -> str:
     return request.param

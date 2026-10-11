@@ -22,7 +22,9 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Checkbox, Collapsible, Input, Label, RichLog, Select, Switch
 
-from . import config, gpu
+from . import asr_server, config, gpu
+from . import extra_models as xm
+from .extra_models import ENGINE_QWEN3
 from .sudo import SudoPasswordModal, SudoResult, run_sudo_command
 
 if TYPE_CHECKING:
@@ -37,6 +39,12 @@ ENGINES: list[str] = [
     "paraformer", "dolphin", "omnilingual",
 ]
 
+# Engines offered in the UI: voxtype's own plus Qwen3-ASR, which voxtype-tui
+# runs as a local server behind voxtype's whisper remote mode (see
+# asr_server.py). `ENGINES` stays the set of valid `engine = …` config
+# values; selecting Qwen3-ASR goes through asr_server, never set_setting.
+UI_ENGINES: list[str] = ENGINES + [ENGINE_QWEN3]
+
 # Known model names per engine, sourced from `voxtype setup --help`. Users who
 # point at a local .bin file use the "Custom…" affordance instead.
 MODELS_PER_ENGINE: dict[str, list[str]] = {
@@ -44,13 +52,14 @@ MODELS_PER_ENGINE: dict[str, list[str]] = {
         "tiny", "tiny.en", "base", "base.en",
         "small", "small.en", "medium", "medium.en",
         "large-v3", "large-v3-turbo",
-    ],
+    ] + xm.extra_names("whisper"),
     "parakeet": ["parakeet-tdt-0.6b-v3", "parakeet-tdt-0.6b-v3-int8"],
     "moonshine": ["tiny", "base"],
     "sensevoice": ["small"],
     "paraformer": [],
     "dolphin": [],
     "omnilingual": [],
+    ENGINE_QWEN3: xm.extra_names(ENGINE_QWEN3),
 }
 
 # Where each engine stores its active-model name. All engines consistently
@@ -220,7 +229,7 @@ class SettingsPane(VerticalScroll):
             with Horizontal(classes="field-row"):
                 yield Label("Engine", classes="label")
                 yield Select(
-                    options=[(e, e) for e in ENGINES],
+                    options=[(xm.engine_label(e), e) for e in UI_ENGINES],
                     allow_blank=False,
                     value=ENGINES[0],
                     id="settings-engine",
@@ -448,31 +457,39 @@ class SettingsPane(VerticalScroll):
         return self.app  # type: ignore[return-value]
 
     def _current_engine(self) -> str:
+        """Live engine as the UI shows it (``qwen3-asr`` when its marker
+        is active, see asr_server.is_qwen3_active)."""
         if self.tui.state is None:
             return "whisper"
-        eng = self.tui.state.doc.get("engine")
-        return str(eng) if eng else "whisper"
+        return asr_server.ui_engine(self.tui.state.doc, self.tui.state.sc)
 
     def _current_model_for(self, engine: str) -> str:
+        """Catalog name of the configured model for ``engine`` (extra
+        whisper models are stored as ``ggml-<name>.bin`` and mapped back)."""
         if self.tui.state is None:
             return ""
+        if engine == ENGINE_QWEN3:
+            return str(asr_server.qwen3_state(self.tui.state.sc).get("model") or "")
         section, key = MODEL_PATH_PER_ENGINE[engine].split(".")
         node = self.tui.state.doc.get(section)
         if node is None:
             return ""
-        return str(node.get(key, ""))
+        return xm.catalog_model_name(engine, str(node.get(key, "")))
 
     def _model_options(self, engine: str) -> list[tuple[str, str]]:
         known = MODELS_PER_ENGINE.get(engine, [])
-        options = [
-            (
-                m if self._model_installed(engine, m)
-                else f"{m} (not downloaded)",
-                m,
-            )
-            for m in known
-        ]
-        options.append(("Custom path…", CUSTOM_MODEL))
+        options: list[tuple[str, str]] = []
+        for m in known:
+            ok, reason = xm.availability(engine, m)
+            if not ok:
+                label = f"{m} ({reason})"
+            elif self._model_installed(engine, m):
+                label = m
+            else:
+                label = f"{m} (not downloaded)"
+            options.append((label, m))
+        if engine != ENGINE_QWEN3:
+            options.append(("Custom path…", CUSTOM_MODEL))
         return options
 
     def _model_installed(self, engine: str, name: str) -> bool:
@@ -762,6 +779,15 @@ class SettingsPane(VerticalScroll):
             old_engine = self._current_engine()
             if new_engine == old_engine:
                 return
+            if new_engine == ENGINE_QWEN3:
+                self._switch_to_qwen3(old_engine)
+                return
+            if old_engine == ENGINE_QWEN3:
+                # Restore the whisper settings remembered on activation;
+                # the unit is disabled + stopped by the next save.
+                asr_server.deactivate_qwen3(
+                    self.tui.state, restore_engine=(new_engine == "whisper"),
+                )
             self.tui.state.set_setting("engine", new_engine)
             # Preserve current model if already set. If not, carry over
             # from the old engine IFF it's still valid — this is a
@@ -825,6 +851,27 @@ class SettingsPane(VerticalScroll):
                 if event.select.has_focus:
                     custom_input.focus()
                 # Don't write to config yet — wait for the Input to be filled.
+                return
+            if engine == ENGINE_QWEN3 or xm.is_extra_model(engine, value_str):
+                # Extra models + Qwen3-ASR: asr_server owns the config
+                # shape (bare .bin filename / remote-mode switch) and
+                # the availability + downloaded refusals.
+                try:
+                    asr_server.set_active_model(
+                        self.tui.state, engine, value_str,
+                        models_dir=self._models_dir(),
+                        is_installed=self._model_installed,
+                    )
+                except xm.RefusedError as e:
+                    self.app.notify(
+                        str(e), severity="warning", title="Not activated", timeout=8,
+                    )
+                    self._revert_model_select(engine)
+                    return
+                custom_row.add_class("hidden")
+                custom_input.value = ""
+                self._sync_models_tab()
+                self.tui.refresh_dirty()
                 return
             # Same hard guard as the Models tab's [Set active]
             # (models.py): writing an uninstalled model means the
@@ -943,6 +990,12 @@ class SettingsPane(VerticalScroll):
         # so Ctrl+Shift+R / restart-on-exit pick it up.
         if self.tui.state is not None:
             self.tui.state.daemon_stale = True
+            st = self.tui.state
+            if asr_server.is_qwen3_active(st.doc, st.sc):
+                # The Qwen3-ASR server (Vulkan build) must see the same
+                # device pinning as voxtype: re-render its unit now.
+                for problem in asr_server.apply_after_save(st.doc, st.sc).problems:
+                    log.write(f"[qwen3-asr] {problem}")
         self.tui.refresh_stale_pill()
 
         self.tui.notify(
@@ -1158,6 +1211,14 @@ class SettingsPane(VerticalScroll):
         if result.ok:
             # Status may have changed — refresh the section.
             await self._refresh_gpu_status_async()
+            accel = await asyncio.to_thread(xm.detect_accel, True)
+            warning = (
+                xm.quantized_whisper_warning(self.tui.state.doc, accel)
+                if self.tui.state is not None else None
+            )
+            if warning:
+                self.app.notify(warning, severity="error", title="Model needs GPU",
+                                timeout=15)
 
     def _render_sudo_result(self, result: SudoResult) -> None:
         log = self.query_one("#settings-gpu-log", RichLog)
@@ -1226,12 +1287,55 @@ class SettingsPane(VerticalScroll):
         if self.tui.state is None:
             return
         self.tui.state.set_setting(MODEL_PATH_PER_ENGINE[engine], model)
+        self._sync_models_tab()
+
+    def _sync_models_tab(self) -> None:
         # Models tab's ● active-mark is only re-rendered by refresh_table;
         # without this nudge it keeps pointing at the old row until ctrl+r.
         # Lazy import: settings ↔ models would otherwise be circular.
         from .models import ModelsPane
         for pane in self.app.query(ModelsPane):
             pane.sync_from_state()
+
+    def _models_dir(self):
+        from . import models
+        return models.MODELS_DIR
+
+    def _switch_to_qwen3(self, old_engine: str) -> None:
+        """Engine Select → Qwen3-ASR. Activates the last-used (or first
+        downloaded) Qwen3 model; refuses with a warning and snaps the
+        Select back when none is ready."""
+        assert self.tui.state is not None
+        remembered = str(asr_server.qwen3_state(self.tui.state.sc).get("model") or "")
+        candidates = ([remembered] if remembered else []) + [
+            m for m in MODELS_PER_ENGINE[ENGINE_QWEN3] if m != remembered
+        ]
+        ready = [m for m in candidates if self._model_installed(ENGINE_QWEN3, m)]
+        error = "no Qwen3-ASR model is downloaded yet — download one in the Models tab"
+        for name in ready:
+            try:
+                asr_server.set_active_model(
+                    self.tui.state, ENGINE_QWEN3, name, models_dir=self._models_dir(),
+                )
+                break
+            except xm.RefusedError as e:
+                error = str(e)
+        else:
+            self.app.notify(error, severity="warning", title="Qwen3-ASR not activated",
+                            timeout=8)
+            self._suppress_events = True
+            try:
+                self.query_one("#settings-engine", Select).value = old_engine
+            finally:
+                self._suppress_events = False
+            return
+        self._suppress_events = True
+        try:
+            self._refresh_model_options(ENGINE_QWEN3, preferred=name)
+        finally:
+            self._suppress_events = False
+        self._sync_models_tab()
+        self.tui.refresh_dirty()
 
     # --- actions ---
 
