@@ -7,7 +7,16 @@ Contract (per Voxtype's `src/output/post_process.rs`):
   - Timeout (default 30s) → hard kill, original text used.
 
 We read the sidecar (sole source of truth for dictionary rules + their
-`to_text` values and categories) and apply the Vexis-style engine.
+`to_text` values and categories, and for the vocabulary) and run two
+stages, in this order:
+
+  1. the Vexis-style dictionary engine (`dictionary_engine`), then
+  2. the vocabulary corrector (`vocab_corrector`), which rewrites misheard
+     vocabulary terms ("clawed code" -> "Claude Code"). Always on; it
+     only acts when the vocabulary is non-empty.
+
+Each stage fails open on its own, so a broken rule never disables the
+corrector and vice versa.
 
 Failure mode: fail-open. Any unexpected exception — missing sidecar,
 malformed JSON, regex error — is caught; we write stdin verbatim to
@@ -28,6 +37,7 @@ import sys
 import traceback
 from pathlib import Path
 
+from . import vocab_corrector
 from .dictionary_engine import (
     CAPITALIZATION,
     REPLACEMENT,
@@ -39,9 +49,34 @@ SIDECAR_PATH = Path.home() / ".config" / "voxtype-tui" / "metadata.json"
 CONFIG_PATH = Path.home() / ".config" / "voxtype" / "config.toml"
 
 
+def _read_sidecar(sidecar_path: Path = SIDECAR_PATH) -> dict:
+    """Parse the sidecar JSON; {} when missing or malformed."""
+    if not sidecar_path.exists():
+        return {}
+    try:
+        data = json.loads(sidecar_path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_vocab(sc_data: dict) -> list[str]:
+    """Vocabulary phrases from parsed sidecar data (bad entries skipped)."""
+    raw = sc_data.get("vocabulary", [])
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for entry in raw:
+        phrase = entry.get("phrase") if isinstance(entry, dict) else entry
+        if isinstance(phrase, str) and phrase.strip():
+            out.append(phrase.strip())
+    return out
+
+
 def _load_rules(
     sidecar_path: Path = SIDECAR_PATH,
     config_path: Path = CONFIG_PATH,
+    sc_data: dict | None = None,
 ) -> list[Rule]:
     """Build the rule list by joining sidecar (category + to_text) with
     config.toml `[text].replacements` (to_text fallback for entries that
@@ -51,12 +86,12 @@ def _load_rules(
     without a sidecar `to_text` fall back to config.toml's map. If
     neither has a `to_text`, the rule is skipped.
     """
-    sc_data: dict = {}
-    if sidecar_path.exists():
-        try:
-            sc_data = json.loads(sidecar_path.read_text())
-        except (OSError, json.JSONDecodeError):
-            sc_data = {}
+    if sc_data is None:
+        sc_data = _read_sidecar(sidecar_path)
+
+    sc_reps = sc_data.get("replacements", [])
+    if not isinstance(sc_reps, list) or not sc_reps:
+        return []
 
     config_reps: dict[str, str] = {}
     if config_path.exists():
@@ -71,10 +106,6 @@ def _load_rules(
             config_reps = {}
 
     rules: list[Rule] = []
-    sc_reps = sc_data.get("replacements", [])
-    if not isinstance(sc_reps, list):
-        return rules
-
     for entry in sc_reps:
         if not isinstance(entry, dict):
             continue
@@ -95,21 +126,45 @@ def _load_rules(
     return rules
 
 
+def _passthrough_note() -> None:
+    if os.environ.get("VOXTYPE_TUI_POSTPROCESS_DEBUG"):
+        traceback.print_exc(file=sys.stderr)
+    else:
+        sys.stderr.write("voxtype-tui-postprocess: passthrough on error\n")
+
+
+def process(
+    text: str,
+    sidecar_path: Path = SIDECAR_PATH,
+    config_path: Path = CONFIG_PATH,
+) -> str:
+    """Dictionary engine first, then the vocabulary corrector.
+
+    Each stage is fail-open: an exception leaves that stage's input
+    unchanged and the next stage still runs."""
+    sc_data = _read_sidecar(sidecar_path)
+    try:
+        rules = _load_rules(sidecar_path, config_path, sc_data=sc_data)
+        if rules:
+            text = DictionaryEngine(rules).process(text)
+    except Exception:  # fail-open — never drop a user's transcript
+        _passthrough_note()
+    try:
+        vocab = _load_vocab(sc_data)
+        if vocab:
+            text = vocab_corrector.correct(text, vocab)
+    except Exception:
+        _passthrough_note()
+    return text
+
+
 def main() -> int:
     text = sys.stdin.read()
     try:
-        rules = _load_rules()
-        if not rules:
-            sys.stdout.write(text)
-            return 0
-        engine = DictionaryEngine(rules)
-        sys.stdout.write(engine.process(text))
+        sys.stdout.write(process(text))
         return 0
     except Exception:  # fail-open — never drop a user's transcript
-        if os.environ.get("VOXTYPE_TUI_POSTPROCESS_DEBUG"):
-            traceback.print_exc(file=sys.stderr)
-        else:
-            sys.stderr.write("voxtype-tui-postprocess: passthrough on error\n")
+        _passthrough_note()
         sys.stdout.write(text)
         return 0
 

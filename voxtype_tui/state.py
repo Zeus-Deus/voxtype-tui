@@ -283,13 +283,15 @@ class AppState:
     def _ensure_post_process_enabled(self) -> None:
         """Opt the config into our Vexis-style post-processor on save.
 
-        Only wires up `[output.post_process]` when the user has no command
+        Wires up `[output.post_process]` whenever the sidecar has dictionary
+        rules OR vocabulary (the CLI runs the always-on vocabulary
+        corrector too), and only when the user has no command
         of their own — if they've set a custom post-process script (e.g.
         one of the LLM-cleanup examples shipped with Voxtype), we leave
         it alone. Idempotent: if our command is already set, nothing
         changes and `config_dirty` stays put.
         """
-        if not self.sc.replacements:
+        if not migrations.wants_post_process(self.sc):
             return
         pp = config.get_post_process(self.doc)
         existing = pp.get("command")

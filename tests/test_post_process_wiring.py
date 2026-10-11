@@ -72,6 +72,46 @@ def test_save_is_idempotent(tmp_path: Path) -> None:
     assert before == after
 
 
+def test_save_enables_post_process_when_only_vocabulary(tmp_path: Path) -> None:
+    """Vocabulary alone wires the hook: the CLI runs the vocabulary corrector."""
+    body = '[whisper]\ninitial_prompt = "Codemux, Hyprland"\n'
+    sc = sidecar.Sidecar(vocabulary=[
+        sidecar.VocabEntry(phrase="Codemux"),
+        sidecar.VocabEntry(phrase="Hyprland"),
+    ])
+    state = _bootstrap(tmp_path, body, sc)
+    state.save = _patch_save_without_validation(state)
+    state.save()
+    doc = tomlkit.parse((tmp_path / "config.toml").read_text())
+    pp = config.get_post_process(doc)
+    assert pp.get("command") == config.POSTPROCESS_COMMAND
+    assert pp.get("timeout_ms") == config.POSTPROCESS_TIMEOUT_MS
+
+
+def test_vocabulary_only_save_keeps_user_command(tmp_path: Path) -> None:
+    body = (
+        '[whisper]\ninitial_prompt = "Codemux"\n'
+        '[output.post_process]\ncommand = "ollama-cleanup.sh"\ntimeout_ms = 30000\n'
+    )
+    sc = sidecar.Sidecar(vocabulary=[sidecar.VocabEntry(phrase="Codemux")])
+    state = _bootstrap(tmp_path, body, sc)
+    state.save = _patch_save_without_validation(state)
+    state.save()
+    doc = tomlkit.parse((tmp_path / "config.toml").read_text())
+    assert config.get_post_process(doc).get("command") == "ollama-cleanup.sh"
+
+
+def test_load_migrates_v2_vocabulary_install(tmp_path: Path) -> None:
+    """An existing v2 install with vocabulary but no rules gets wired on load
+    (config_dirty so the next save persists it) and lands on v3."""
+    body = '[whisper]\ninitial_prompt = "Codemux"\n'
+    sc = sidecar.Sidecar(version=2, vocabulary=[sidecar.VocabEntry(phrase="Codemux")])
+    state = _bootstrap(tmp_path, body, sc)
+    assert state.sc.version == 3
+    assert state.config_dirty is True
+    assert config.get_post_process(state.doc).get("command") == config.POSTPROCESS_COMMAND
+
+
 # ---------------------------------------------------------------------------
 
 def _patch_save_without_validation(state: AppState):

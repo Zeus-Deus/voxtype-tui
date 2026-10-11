@@ -30,7 +30,7 @@ SIDECAR_PATH = Path.home() / ".config" / "voxtype-tui" / "metadata.json"
 # at this version so there's nothing to migrate for a brand-new install.
 # The "missing version field" fallback stays at 1 to catch pre-migration
 # sidecars written before this field was added.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 CATEGORIES: tuple[str, ...] = ("Replacement", "Capitalization")
 DEFAULT_CATEGORY = "Replacement"
