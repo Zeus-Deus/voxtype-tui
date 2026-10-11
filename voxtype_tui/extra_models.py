@@ -565,6 +565,10 @@ def delete(
     m = get_extra(engine, name)
     if m is None:
         raise RefusedError(f"'{name}' is not an extra {engine} model")
+    if engine == ENGINE_QWEN3:
+        from . import asr_server
+        if asr_server.teardown_pending():
+            raise RefusedError("Qwen3-ASR helper teardown is pending — restart voxtype before deleting models")
     if doc is not None:
         from . import asr_server
         act_engine, act_model = asr_server.active_engine_model(doc, sc)

@@ -68,7 +68,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     applied = state.migrations_applied
-    if not applied and not state.config_dirty:
+    if not applied and not state.config_dirty and not state.daemon_stale:
         out("==> voxtype-tui: schema already current, no migrations to apply.")
         return 0
 

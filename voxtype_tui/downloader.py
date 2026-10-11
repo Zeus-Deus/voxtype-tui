@@ -12,7 +12,8 @@ the pinned CrispASR server build. Contract, in order:
      verified new file. Never a truncated one.
 
 Any failure (HTTP error, short read, checksum mismatch, cancel) removes the
-``.part`` file and leaves ``<dest>`` untouched. Cancellation is cooperative:
+owned safe ``.part`` and leaves ``<dest>`` untouched. Unsafe staging entries
+or replaced inodes are refused and left alone. Cancellation is cooperative:
 pass a ``threading.Event``; the read loop checks it between chunks, so a
 SIGTERM handler that sets the event is enough to stop cleanly.
 
@@ -25,6 +26,7 @@ import fcntl
 import hashlib
 import os
 import shutil
+import stat
 import tarfile
 import tempfile
 import threading
@@ -102,7 +104,8 @@ def download_verified(
 
     Returns ``dest``. Raises :class:`DownloadCancelled`,
     :class:`ChecksumError` or :class:`DownloadError`; in every failure
-    case the ``.part`` file is gone and ``dest`` is untouched.
+    case ``dest`` is untouched. Only the owned safe ``.part`` is removed;
+    unsafe pre-existing or replaced entries are never followed or unlinked.
     """
     if not url.startswith(("https://", "http://127.0.0.1", "http://localhost")):
         # Plain http only for the local test fixture.
@@ -110,7 +113,10 @@ def download_verified(
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = part_path(dest)
-    fd = os.open(part, os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644)
+    except OSError as e:
+        raise DownloadError(f"{dest.name}: unsafe staging entry ({e.strerror})") from e
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -118,15 +124,20 @@ def download_verified(
         # Another process owns this .part: leave it alone (no cleanup).
         raise DownloadError(f"{dest.name} is already being downloaded") from None
     try:
+        if not _safe_staging(fd, part):
+            raise DownloadError(f"{dest.name}: unsafe staging entry")
+        if cancel is not None and cancel.is_set():
+            raise DownloadCancelled("cancelled")
         os.ftruncate(fd, 0)
         _stream_into(fd, url, sha256.lower(), size, progress, cancel, timeout, dest.name)
         os.fsync(fd)
+        if not _safe_staging(fd, part):
+            raise DownloadError(f"{dest.name}: unsafe staging entry changed during download")
         os.replace(part, dest)
     except BaseException:
-        try:
-            part.unlink()
-        except FileNotFoundError:
-            pass
+        # Never unlink another owner's replacement or an unsafe existing entry.
+        if _safe_staging(fd, part):
+            part.unlink(missing_ok=True)
         raise
     finally:
         try:
@@ -134,6 +145,19 @@ def download_verified(
         except OSError:
             pass
     return dest
+
+
+def _safe_staging(fd: int, part: Path) -> bool:
+    """Require the locked, singly-linked regular inode still at this path."""
+    try:
+        opened, entry = os.fstat(fd), part.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(opened.st_mode) and opened.st_nlink == 1
+        and stat.S_ISREG(entry.st_mode) and entry.st_nlink == 1
+        and (opened.st_dev, opened.st_ino) == (entry.st_dev, entry.st_ino)
+    )
 
 
 def _stream_into(

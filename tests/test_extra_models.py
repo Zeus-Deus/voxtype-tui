@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from voxtype_tui import asr_server, downloader, sidecar, state
+from voxtype_tui import asr_server, config, downloader, sidecar, state
 from voxtype_tui import extra_models as xm
 from voxtype_tui.extra_models import ENGINE_QWEN3, RefusedError
 
@@ -285,7 +285,7 @@ def test_delete_last_qwen3_removes_engine_build(tmp_path: Path) -> None:
 
 
 @pytest.fixture
-def qenv(tmp_path: Path):
+def qenv(tmp_path: Path, monkeypatch):
     """Loaded AppState on the stock fixture + downloaded q4_k + avx512 build."""
     cfg = tmp_path / "config.toml"
     shutil.copy(FIXTURES / "stock.toml", cfg)
@@ -298,6 +298,8 @@ def qenv(tmp_path: Path):
     b.parent.mkdir(parents=True)
     b.write_text("#!/bin/sh\n")
     b.chmod(0o755)
+    monkeypatch.setattr(config, "CONFIG_PATH", cfg)
+    monkeypatch.setattr(sidecar, "SIDECAR_PATH", tmp_path / "metadata.json")
     st = state.AppState.load(cfg, tmp_path / "metadata.json")
     return st, models_dir
 
@@ -503,13 +505,14 @@ def test_save_writes_unit_env_and_enables_then_cleans_up(qenv, monkeypatch) -> N
     assert asr_server.regenerate_hotwords(st2.sc) is True
     assert asr_server.regenerate_hotwords(st2.sc) is False
 
-    # switch back to whisper -> disable --now + files removed
+    # Switch-away save preserves the helper for the daemon's cached endpoint.
     calls.clear()
     asr_server.set_active_model(st2, "whisper", "base.en", models_dir=md,
                                 is_installed=_installed(md))
     st2.save()
-    assert ("disable", "--now", "voxtype-asr.service") in calls
-    assert not asr_server.unit_path().exists() and not asr_server.env_path().exists()
+    assert not calls
+    assert asr_server.teardown_pending()
+    assert asr_server.unit_path().exists() and asr_server.env_path().exists()
 
 
 def test_save_without_qwen3_never_touches_systemd(tmp_path, monkeypatch) -> None:

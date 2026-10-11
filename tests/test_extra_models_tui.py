@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 from textual.widgets import Button, DataTable, Select
 
-from voxtype_tui import asr_server, voxtype_cli
+from voxtype_tui import asr_server, config, sidecar, voxtype_cli
 from voxtype_tui import extra_models as xm
 from voxtype_tui.app import VoxtypeTUI
 from voxtype_tui.extra_models import ENGINE_QWEN3
@@ -34,6 +34,8 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     cfg = tmp_path / "config.toml"
     side = tmp_path / "metadata.json"
     shutil.copy(FIXTURES / "stock.toml", cfg)
+    monkeypatch.setattr(config, "CONFIG_PATH", cfg)
+    monkeypatch.setattr(sidecar, "SIDECAR_PATH", side)
     md = tmp_path / "models"
     md.mkdir()
     for f in ("ggml-base.en.bin", "ggml-large-v3-turbo-q5_0.bin", "qwen3-asr-0.6b-q4_k.gguf"):
@@ -170,7 +172,9 @@ async def test_qwen3_engine_listed_and_activated_from_models_tab(env, monkeypatc
         assert "mode" not in app.state.doc["whisper"]
         await pilot.press("ctrl+s")
         await pilot.pause()
-    assert not asr_server.unit_path().exists()
+    # Saving the native selection cannot interrupt the daemon's cached endpoint.
+    assert asr_server.unit_path().exists()
+    assert asr_server.teardown_pending()
 
 
 async def test_settings_engine_select_switches_to_qwen3_and_back(env, monkeypatch):

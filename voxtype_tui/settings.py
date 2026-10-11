@@ -994,7 +994,9 @@ class SettingsPane(VerticalScroll):
             if asr_server.is_qwen3_active(st.doc, st.sc):
                 # The Qwen3-ASR server (Vulkan build) must see the same
                 # device pinning as voxtype: re-render its unit now.
-                for problem in asr_server.apply_after_save(st.doc, st.sc).problems:
+                for problem in asr_server.apply_after_save(
+                    st.doc, st.sc, config_path=st.config_path, sidecar_path=st.sidecar_path,
+                ).problems:
                     log.write(f"[qwen3-asr] {problem}")
         self.tui.refresh_stale_pill()
 

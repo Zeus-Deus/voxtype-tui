@@ -136,7 +136,10 @@ class AppState:
                 sidecar_dirty
                 or sync_result.needs_save_sidecar
             ),
-            daemon_stale=config_dirty_from_migrations,
+            daemon_stale=config_dirty_from_migrations or (
+                asr_server.manages_default_service(config_path, sidecar_path)
+                and asr_server.teardown_pending()
+            ),
             # Extra-model problems (GPU-only model without the Vulkan
             # binary, Qwen3-ASR engine/model file missing) ride the same
             # banner as reconcile warnings — file checks only, no I/O to
@@ -360,7 +363,9 @@ class AppState:
             _logger.warning("sync.json write failed: %s", e)
         # Qwen3-ASR server unit + hotwords env file follow the committed
         # state (no-op unless Qwen3 is or was in use). Never raises.
-        asr = asr_server.apply_after_save(self.doc, self.sc)
+        asr = asr_server.apply_after_save(
+            self.doc, self.sc, config_path=self.config_path, sidecar_path=self.sidecar_path,
+        )
         self.asr_problems = asr.problems
         restart_fields = config.diff_restart_sensitive(baseline_doc, self.doc)
         if asr.changed:

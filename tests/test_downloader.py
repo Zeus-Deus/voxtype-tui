@@ -116,6 +116,78 @@ def test_cancel_mid_download_removes_part(server, tmp_path: Path) -> None:
     assert not downloader.part_path(dest).exists()
 
 
+@pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo", "directory"])
+@pytest.mark.parametrize("pre_cancel", [False, True])
+def test_unsafe_staging_preserves_destination(server, tmp_path, kind, pre_cancel):
+    base, _ = server
+    dest = tmp_path / "verified.bin"
+    dest.write_bytes(b"existing verified destination")
+    part = downloader.part_path(dest)
+    keeper = None
+    if kind == "symlink":
+        part.symlink_to(dest)
+    elif kind == "hardlink":
+        os.link(dest, part)
+    elif kind == "fifo":
+        os.mkfifo(part)
+        # Keep the old blocking O_WRONLY open from hanging this regression.
+        keeper = os.open(part, os.O_RDWR | os.O_NONBLOCK)
+    else:
+        part.mkdir()
+    cancel = threading.Event()
+    if pre_cancel:
+        cancel.set()
+    error = None
+    try:
+        try:
+            downloader.download_verified(f"{base}/model.bin", dest, SHA, cancel=cancel)
+        except Exception as e:
+            error = e
+        assert dest.read_bytes() == b"existing verified destination"
+        assert isinstance(error, downloader.DownloadError)
+        assert not isinstance(error, downloader.DownloadCancelled)
+        assert "unsafe staging" in str(error)
+    finally:
+        if keeper is not None:
+            os.close(keeper)
+
+
+def test_replaced_staging_entry_is_not_published_or_removed(server, tmp_path):
+    base, _ = server
+    dest = tmp_path / "verified.bin"
+    dest.write_bytes(b"existing verified destination")
+    part = downloader.part_path(dest)
+    swapped = False
+    def progress(done, total):
+        nonlocal swapped
+        if not swapped:
+            part.unlink()
+            part.symlink_to(dest)
+            swapped = True
+    error = None
+    try:
+        downloader.download_verified(f"{base}/model.bin", dest, SHA, progress=progress)
+    except downloader.DownloadError as e:
+        error = e
+    assert not dest.is_symlink()
+    assert dest.read_bytes() == b"existing verified destination"
+    assert error is not None and "unsafe staging" in str(error)
+    assert part.is_symlink()  # not the inode owned by this download
+
+
+def test_pre_cancel_preserves_destination_and_removes_safe_staging(server, tmp_path):
+    base, _ = server
+    dest = tmp_path / "verified.bin"
+    dest.write_bytes(b"existing verified destination")
+    downloader.part_path(dest).write_bytes(b"old partial")
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(downloader.DownloadCancelled):
+        downloader.download_verified(f"{base}/model.bin", dest, SHA, cancel=cancel)
+    assert dest.read_bytes() == b"existing verified destination"
+    assert not downloader.part_path(dest).exists()
+
+
 def test_http_error_and_refused_scheme(server, tmp_path: Path) -> None:
     base, _ = server
     with pytest.raises(downloader.DownloadError, match="HTTP 404"):

@@ -24,8 +24,10 @@ Vocabulary: voxtype's remote client only sends ``prompt``, which Qwen3
 ignores, so the vocabulary goes to the server as ``--hotwords`` read from
 an EnvironmentFile that :func:`apply_after_save` rewrites on every save.
 
-Lifecycle of the files is reconciled in one place, :func:`apply_after_save`,
-which ``AppState.save`` calls after config.toml + metadata.json committed.
+Lifecycle of the files is reconciled by :func:`apply_after_save`, which
+default-path ``AppState.save`` calls after config.toml + metadata.json commit.
+Switch-away teardown is deferred to :func:`finish_teardown_after_restart`,
+called by the shared restart API once the old daemon identity is gone.
 Mutations (:func:`set_active_model`, :func:`activate_qwen3`,
 :func:`deactivate_qwen3`) only touch the in-memory ``AppState``; the
 caller saves (and restarts voxtype) as for any other setting.
@@ -40,6 +42,7 @@ import shlex
 import socket
 import subprocess
 import shutil
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -77,6 +80,18 @@ def unit_path() -> Path:
 
 def env_path() -> Path:
     return _config_home() / "voxtype-tui" / "qwen3-asr.env"
+
+
+def teardown_path() -> Path:
+    return _config_home() / "voxtype-tui" / "qwen3-asr.teardown"
+
+
+def teardown_pending() -> bool:
+    """A saved switch-away awaiting a verified daemon restart."""
+    try:
+        return teardown_path().read_text().strip() == UNIT_MARKER
+    except OSError:
+        return False
 
 
 def gpu_dropin_path() -> Path:
@@ -288,8 +303,8 @@ def activate_qwen3(
 def deactivate_qwen3(st: Any, *, restore_engine: bool = True) -> bool:
     """Undo :func:`activate_qwen3`: restore the remembered whisper settings
     (and the previous engine when ``restore_engine``). Returns True when
-    Qwen3 was active. The unit is disabled/stopped by the next save
-    (:func:`apply_after_save`)."""
+    Qwen3 was active. The next save schedules teardown; the helper remains
+    available to the old daemon until a coordinated restart completes."""
     block = qwen3_state(st.sc)
     was_active = is_qwen3_active(st.doc, st.sc)
     if was_active:
@@ -593,6 +608,8 @@ def apply_after_save(
     doc: Any,
     sc: Any,
     *,
+    config_path: Path | None = None,
+    sidecar_path: Path | None = None,
     models_dir: Path | None = None,
     accel: xm.Accel | None = None,
 ) -> ApplyResult:
@@ -603,13 +620,15 @@ def apply_after_save(
       ``daemon-reload`` when the unit changed, ``enable`` it (adds it to
       ``voxtype.service.wants``). The server starts/restarts with the next
       voxtype start/restart.
-    * not active but our unit exists → ``disable --now``, remove unit and
-      env file, ``daemon-reload``.
+    * not active but our unit exists → persist pending teardown, retaining
+      files and lifecycle propagation until a verified daemon restart.
     * no marker and no unit → nothing (no filesystem or systemctl access).
 
     Never raises; problems come back in :attr:`ApplyResult.problems`.
     """
     res = ApplyResult()
+    if not manages_default_service(config_path, sidecar_path):
+        return res
     problems = res.problems
     block = qwen3_state(sc)
     try:
@@ -629,18 +648,59 @@ def apply_after_save(
             code, msg = _systemctl("enable", UNIT_NAME)
             if code != 0:
                 problems.append(f"could not enable {UNIT_NAME}: {msg}")
+            else:
+                res.changed |= teardown_pending()
+                teardown_path().unlink(missing_ok=True)
         elif block or _owned_unit_exists():
             if _owned_unit_exists():
-                res.changed = True
-                code, msg = _systemctl("disable", "--now", UNIT_NAME)
-                if code != 0:
-                    problems.append(f"could not disable {UNIT_NAME}: {msg}")
-                unit_path().unlink(missing_ok=True)
-                _systemctl("daemon-reload")
-            env_path().unlink(missing_ok=True)
+                res.changed = _write_if_changed(teardown_path(), UNIT_MARKER + "\n")
     except OSError as e:
         problems.append(f"Qwen3-ASR unit update failed: {e}")
     return res
+
+
+def manages_default_service(config_path: Path | None, sidecar_path: Path | None) -> bool:
+    """Only the default config AND sidecar own the global helper service.
+
+    Low-level callers omitting paths explicitly target the default service.
+    State/UI callers must pass their actual paths, including alternate ones.
+    """
+    from . import config, sidecar
+    return (
+        Path(config_path or config.CONFIG_PATH).absolute() == config.CONFIG_PATH.absolute()
+        and Path(sidecar_path or sidecar.SIDECAR_PATH).absolute() == sidecar.SIDECAR_PATH.absolute()
+    )
+
+
+def finish_teardown_after_restart() -> list[str]:
+    """Retire a pending helper only AFTER the daemon identity changed.
+
+    Called by the shared public restart API. Re-read canonical files, not
+    unsaved UI state; failed cleanup retains the marker for the next restart.
+    Never delete an unowned unit or interrupt an active Qwen3 configuration.
+    """
+    if not teardown_pending():
+        return []
+    from . import config, sidecar
+    try:
+        doc = config.load(config.CONFIG_PATH)
+        sc = sidecar.load(sidecar.SIDECAR_PATH)
+        if is_qwen3_active(doc, sc):
+            teardown_path().unlink(missing_ok=True)
+            return []
+        if _owned_unit_exists():
+            code, msg = _systemctl("disable", "--now", UNIT_NAME)
+            if code != 0:
+                return [f"could not retire {UNIT_NAME}: {msg}"]
+            unit_path().unlink(missing_ok=True)
+            env_path().unlink(missing_ok=True)
+            code, msg = _systemctl("daemon-reload")
+            if code != 0:
+                return [f"systemctl daemon-reload failed: {msg}"]
+        teardown_path().unlink(missing_ok=True)
+        return []
+    except OSError as e:
+        return [f"Qwen3-ASR teardown failed: {e}"]
 
 
 def vocab_phrases(sc: Any) -> list[str]:
@@ -677,7 +737,7 @@ def load_warnings(doc: Any, sc: Any, *, models_dir: Path | None = None) -> list[
     block = qwen3_state(sc)
     if block.get("active") and not is_qwen3_active(doc, sc):
         out.append("Qwen3-ASR was active but config.toml no longer points at its "
-                   "server — showing remote whisper; the server unit is removed on next save")
+                   "server — showing remote whisper; save and restart to retire the helper")
     elif is_qwen3_active(doc, sc):
         m = xm.get_extra(ENGINE_QWEN3, str(block.get("model") or ""))
         variant = str(block.get("variant") or "")
@@ -722,6 +782,10 @@ def unit_status() -> dict[str, Any]:
 
 
 def probe_health(port: int, timeout: float = 0.5) -> tuple[bool, str]:
+    # CrispASR v0.8.42, a53b513d1c54eba8a1bffa48b2cecb9e72f1ca35,
+    # examples/cli/crispasr_server.cpp:2388-2395. The CLI --server health
+    # response identifies its loaded backend; the standalone whisper server
+    # has a different schema and must not qualify as our Qwen3 helper.
     try:
         with urllib.request.urlopen(f"{endpoint_for(port)}/health", timeout=timeout) as r:
             body = r.read(512).decode("utf-8", "replace")
@@ -730,8 +794,12 @@ def probe_health(port: int, timeout: float = 0.5) -> tuple[bool, str]:
             try:
                 data = json.loads(body)
             except ValueError:
-                return True, "ok"
-            return data.get("status", "ok") == "ok", str(data.get("status", "ok"))
+                return False, "invalid health response"
+            if not isinstance(data, dict) or data.get("backend") != "qwen3":
+                return False, "unexpected health response"
+            return data.get("status") == "ok", str(data.get("status") or "missing status")
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}"
     except Exception as e:  # noqa: BLE001 — any failure is "unhealthy"
         return False, str(getattr(e, "reason", e))
 
@@ -759,11 +827,13 @@ def status(doc: Any, sc: Any, *, probe: bool = True) -> dict[str, Any]:
         unit = unit_status()
         healthy, reason = probe_health(port)
         detail = "ok" if healthy else "not responding"
-        if not healthy:
-            state = unit.get("active_state")
-            if unit.get("available") and state in ("activating", "reloading"):
+        state = unit.get("active_state")
+        if unit.get("available"):
+            running = state == "active" and unit.get("sub_state") == "running" and bool(unit.get("main_pid"))
+            healthy = healthy and running
+            if state in ("activating", "reloading"):
                 detail = "still starting"
-            elif unit.get("available") and state not in ("active", "activating"):
+            elif not running:
                 result = unit.get("result")
                 reason = f"unit {state}" + (f", {result}" if result not in (None, "success") else "")
                 # Only blame the port when our server is fully stopped and some
@@ -774,9 +844,10 @@ def status(doc: Any, sc: Any, *, probe: bool = True) -> dict[str, Any]:
                     reason += f"; port {port} in use"
                 else:
                     detail = "not running"
-            elif state == "active":
+            elif not healthy and reason == "HTTP 503":
                 detail = "still starting"
+            else:
+                detail = "ok" if healthy else "not responding"
         q.update(unit=unit, healthy=healthy, detail=detail, reason=reason)
-        q.update(unit=unit, healthy=healthy, detail=detail)
     out["qwen3"] = q
     return out
