@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -42,12 +43,26 @@ def validate_with_voxtype(path: Path, timeout: float = 10.0) -> tuple[bool, str]
         result = subprocess.run(
             ["voxtype", "-c", str(path), "config"],
             capture_output=True, text=True, timeout=timeout,
+            # Voxtype 1.1 can skip invalid sections and still exit zero.
+            # Keep its diagnostics visible even if the parent's RUST_LOG hides them.
+            env={**os.environ, "RUST_LOG": "warn"},
         )
     except subprocess.TimeoutExpired:
         return False, "voxtype validation timed out"
     except OSError as e:
         return False, f"could not invoke voxtype: {e}"
     if result.returncode == 0:
+        output = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout + "\n" + result.stderr)
+        skipped = [
+            line.strip() for line in output.splitlines()
+            if re.search(
+                r"\bWARN\s+(?:Config section '[^']+' could not be read and is using defaults\."
+                r"|[1-9]\d* config section\(s\) were skipped:)",
+                line,
+            )
+        ]
+        if skipped:
+            return False, "\n".join(skipped)
         return True, ""
     return False, (result.stderr or result.stdout).strip()
 
