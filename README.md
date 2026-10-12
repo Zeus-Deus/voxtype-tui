@@ -22,7 +22,7 @@ python -m voxtype_tui
 
 The Models tab also offers a few models voxtype doesn't ship. Quantized whisper files (`large-v3-turbo-q5_0`/`q8_0`) are files voxtype loads directly, and they need GPU acceleration. Qwen3-ASR runs on a local CrispASR server that voxtype reaches through its remote mode; the server starts and stops together with voxtype. Every download is pinned by sha256. Details: [docs/extra-models.md](docs/extra-models.md).
 
-Which model to pick: on a GPU, `large-v3-turbo-q5_0`; on CPU only, Qwen3-ASR `0.6b-q8_0` (or `0.6b-q4_k` on a slower CPU). Measured numbers: the [Which model?](https://github.com/Zeus-Deus/voxtype-omarchy-plugin#which-model) table in the Omarchy plugin README.
+Which model to pick: `large-v3-turbo-q5_0` on a GPU, Qwen3-ASR on CPU only. See the [Which model?](https://github.com/Zeus-Deus/voxtype-omarchy-plugin#which-model) table.
 
 ## Omarchy integration (optional)
 
