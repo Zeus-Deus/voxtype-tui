@@ -22,6 +22,8 @@ python -m voxtype_tui
 
 The Models tab also offers a few models voxtype doesn't ship. Quantized whisper files (`large-v3-turbo-q5_0`/`q8_0`) are files voxtype loads directly, and they need GPU acceleration. Qwen3-ASR runs on a local CrispASR server that voxtype reaches through its remote mode; the server starts and stops together with voxtype. Every download is pinned by sha256. Details: [docs/extra-models.md](docs/extra-models.md).
 
+Which model to pick: on a GPU, `large-v3-turbo-q5_0`; on CPU only, Qwen3-ASR `0.6b-q8_0` (or `0.6b-q4_k` on a slower CPU). Measured numbers: the [Which model?](https://github.com/Zeus-Deus/voxtype-omarchy-plugin#which-model) table in the Omarchy plugin README.
+
 ## Omarchy integration (optional)
 
 If you're running [Omarchy](https://omarchy.org), two scripts wire up a global keybinding and a floating-window rule so the TUI opens as a centered 1100×750 dialog.
