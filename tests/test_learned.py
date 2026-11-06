@@ -312,3 +312,81 @@ def test_notification_text_and_disabled_notify(tmp_path, monkeypatch):
     monkeypatch.setattr("subprocess.run", lambda *a, **k: called.append(a))
     assert L.notify_learned([{"id": "x", "written": "Omarchy"}]) is False
     assert called == []
+
+
+# ---------------------------------------------------------------- review r1 regressions
+
+def test_r1_english_heard_form_never_becomes_alias_after_merge():
+    L.submit_correction(rec("I read Austin yesterday"), "I read Austen yesterday", "fix")
+    L.submit_correction(rec("I read Auston yesterday", "r2"), "I read Austen yesterday", "fix")
+    assert L.apply("I flew to Austin today")[0] == "I flew to Austin today"
+    assert L.apply("I read Auston today")[0] == "I read Austen today"
+
+
+def test_r1_no_wordlist_passive_never_creates_alias(monkeypatch):
+    monkeypatch.setattr(vocab_corrector, "_words", None)
+    out = L.submit_correction(rec("I read Austin yesterday"), "I read Austen yesterday", "atspi")
+    e = out["applied"][0]
+    assert e["kind"] == "spelling" and e["state"] == "suggested" and e["aliases"] == []
+
+
+def test_r1_cold_apply_does_not_load_the_wordlist(monkeypatch):
+    L.submit_correction(rec("I read Austin yesterday"), "I read Austen yesterday", "fix")
+    monkeypatch.setattr(vocab_corrector, "_words", vocab_corrector._UNLOADED)
+    if not L._WORDS_FILE.exists():
+        pytest.skip("no cracklib wordlist on this machine")
+    t = time.perf_counter()
+    out = L.apply("then we went to Austun for the option")[0]
+    ms = (time.perf_counter() - t) * 1000
+    assert vocab_corrector._words is vocab_corrector._UNLOADED
+    assert out == "then we went to Austen for the option"
+    assert ms < 50, ms  # fresh-process cold numbers are in docs/auto-learn.md
+
+
+def test_r1_english_word_bisect_matches_wordlist():
+    if not L._WORDS_FILE.exists():
+        pytest.skip("no cracklib wordlist")
+    import voxtype_tui.vocab_corrector as vc
+    saved = vc._words
+    try:
+        vc._words = vc._UNLOADED
+        assert L._english_word("austin") and L._english_word("Option")
+        assert not L._english_word("omashi") and not L._english_word("zzzzzzzzq")
+        assert L._english_word("007bond")  # first line of the file
+    finally:
+        vc._words = saved
+
+
+def test_r1_same_letters_spelling_applies():
+    L.submit_correction(rec("we use code mux daily"), "we use Codemux daily", "fix")
+    assert L.apply("ship code mux now")[0] == "ship Codemux now"
+    assert L.apply("ship codemux now")[0] == "ship Codemux now"
+
+
+def test_r1_fail_open_returns_original_input():
+    L.compiled_path().parent.mkdir(parents=True, exist_ok=True)
+    L.compiled_path().write_text(json.dumps({"aliases": {"omashi": ["Omarchy", "l_x"]},
+                                             "max_n": 1, "terms": [[None, 1]]}))
+    assert L.apply("on Omashi") == ("on Omashi", [])
+
+
+@pytest.mark.parametrize("text", ["see https://omashi.com now", "cd /home/omashi", "omashi_config",
+                                  "open omashi.toml", "mail me@omashi", "a #omashi tag"])
+def test_r1_aliases_leave_urls_paths_identifiers(text):
+    L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")
+    assert L.apply(text)[0] == text
+
+
+def test_r1_unicode_protected_offsets():
+    L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")
+    text = "\u0130\u0130\u0130 Omashi Labs and Omashi"
+    out = L.apply(text, user_phrases=["Omashi Labs"])[0]
+    assert out == "\u0130\u0130\u0130 Omashi Labs and Omarchy"
+
+
+def test_import_does_not_pull_write_only_modules():
+    import subprocess, sys
+    code = ("import sys, voxtype_tui.cli_postprocess; before=set(sys.modules); "
+            "import voxtype_tui.learned; print(sorted(set(sys.modules)-before))")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
+    assert "tempfile" not in out and "secrets" not in out, out

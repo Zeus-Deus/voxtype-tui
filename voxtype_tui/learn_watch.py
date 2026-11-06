@@ -67,7 +67,8 @@ def log(msg: str) -> None:
     with contextlib.suppress(OSError):
         if _log_path.exists() and _log_path.stat().st_size > 256_000:
             _log_path.unlink()
-        with open(_log_path, "a", encoding="utf-8") as f:
+        fd = os.open(str(_log_path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(time.strftime("%H:%M:%S ") + msg + "\n")
 
 
@@ -324,6 +325,11 @@ def watch(final: str, *, window: dict | None, record: dict | None, window_s: flo
         return {**res, "reason": "password manager"}
     if cls.lower() in NO_TEXT_CLASSES:
         return {**res, "reason": f"{cls} exposes no text (use History > Fix)"}
+    rec_app = (record or {}).get("app")
+    if isinstance(rec_app, dict):
+        for k in ("address", "pid"):
+            if rec_app.get(k) and window.get(k) and rec_app[k] != window[k]:
+                return {**res, "reason": "the window changed before the watcher started"}
     try:
         Atspi = _atspi()
         from gi.repository import GLib  # type: ignore
@@ -349,6 +355,9 @@ def watch(final: str, *, window: dict | None, record: dict | None, window_s: flo
     # user pastes it themselves).
     span = None
     while time.monotonic() < deadline:
+        st0 = _states(Atspi, node)
+        if Atspi.StateType.DEFUNCT in st0 or Atspi.StateType.FOCUSED not in st0:
+            return {**res, "reason": "focus left before the dictated text appeared"}
         full = read_text(node)
         if full is None:
             return {**res, "reason": "field unreadable"}
@@ -448,7 +457,8 @@ def watch(final: str, *, window: dict | None, record: dict | None, window_s: flo
                       for e in out.get("applied", [])]
     res["skipped"] = out.get("skipped", [])
     res["reason"] = out.get("reason")
-    log(f"submit: {json.dumps(res['learned'])} skipped={len(res['skipped'])} reason={res['reason']}")
+    log(f"submit: learned={[e['id'] for e in res['learned']]} skipped={len(res['skipped'])} "
+        f"reason={res['reason'] if _debug_text() else bool(res['reason'])}")
     fresh = [e for e in out.get("applied", []) if e["state"] == "active" and e.get("count") == 1]
     if fresh:
         undone = learned.notify_learned(fresh, record_id=rec.get("id"),
@@ -515,7 +525,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         res = watch(final, window=active_window(), record=rec, window_s=min(a.window, WINDOW_S),
                     submit=not a.no_submit)
-        log("result " + json.dumps(res))
+        safe = res if _debug_text() else {k: v for k, v in res.items()
+                                          if k in ("ok", "end", "changed", "undone")} | {
+            "learned": len(res.get("learned") or []), "reason": res.get("reason") is not None}
+        log("result " + json.dumps(safe))
         if a.verbose:
             print(json.dumps(res))
         return 0

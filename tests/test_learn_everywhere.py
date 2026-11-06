@@ -108,3 +108,33 @@ def test_created_files_are_removed_on_disable(cfg):
     LE.set_enabled(False)
     assert not (cfg / "electron43-flags.conf").exists()
     assert not (cfg / "environment.d" / LE.ENV_FILE_NAME).exists()
+
+
+def test_r1_user_replaced_env_file_is_kept_on_disable(cfg):
+    LE.set_enabled(True)
+    env = cfg / "environment.d" / LE.ENV_FILE_NAME
+    env.write_text("QT_ACCESSIBILITY=1\n")  # the user's own file now
+    LE.set_enabled(False)
+    assert env.read_text() == "QT_ACCESSIBILITY=1\n"
+
+
+def test_r1_symlinked_flags_file_is_declined(cfg, tmp_path):
+    real = tmp_path / "dotfiles-chromium.conf"
+    real.write_text("--a\n")
+    (cfg / "chromium-flags.conf").symlink_to(real)
+    pv = {Path(f["path"]).name: f for f in LE.preview(True)["files"]}
+    assert pv["chromium-flags.conf"]["action"] == "none"
+    LE.set_enabled(True)
+    LE.set_enabled(False)
+    assert (cfg / "chromium-flags.conf").is_symlink() and real.read_text() == "--a\n"
+
+
+def test_r1_concurrent_enables_keep_ownership(cfg):
+    import threading
+    ts = [threading.Thread(target=LE.set_enabled, args=(True,)) for _ in range(4)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert len(LE._load_state()["files"]) == 4  # env + chromium + electron43 + obsidian
+    LE.set_enabled(False)
+    assert not (cfg / "environment.d" / LE.ENV_FILE_NAME).exists()
+    assert not (cfg / "electron43-flags.conf").exists()

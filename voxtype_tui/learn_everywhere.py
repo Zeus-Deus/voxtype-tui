@@ -7,8 +7,9 @@ small, clearly marked edits:
 
 * ``environment.d/90-voxtype-tui-accessibility.conf`` (whole file ours):
   ``NO_AT_BRIDGE=0``, ``QT_ACCESSIBILITY=1``,
-  ``QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1``. Read by the systemd user manager
-  at login; Omarchy's uwsm session hands it to every app.
+  ``QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1``, ``ACCESSIBILITY_ENABLED=1``. Read
+  by the systemd user manager at login; Omarchy's uwsm session hands it to
+  every app.
 * ``--force-renderer-accessibility`` appended, under a marker comment, to
   the flags file of every installed Chromium-family browser and system
   Electron (``chromium-flags.conf``, ``brave-flags.conf``,
@@ -21,10 +22,13 @@ the lines we added (later user edits in those files are kept) and deletes a
 file only if we created it and nothing else is left in it. Terminal key
 capture is not part of this release. Stdlib only.
 
-The change needs a re-login for apps started before it; as a convenience,
+The change needs a re-login for apps started before it. As a convenience,
 enabling also sets the variables in the running user manager
-(``systemctl --user set-environment``) so apps launched afterwards pick them
-up, and disabling unsets them again (skipped when ``VOXTYPE_TUI_SYSTEMCTL=0``).
+(``systemctl --user set-environment``) and turns on the accessibility bus's
+``org.a11y.Status.IsEnabled`` for this session, so browsers restarted
+afterwards already work; disabling unsets the variables and puts
+``IsEnabled`` back if we changed it (both skipped when
+``VOXTYPE_TUI_SYSTEMCTL=0``).
 """
 
 from __future__ import annotations
@@ -45,6 +49,9 @@ ENV_VARS = (
     ("NO_AT_BRIDGE", "0"),
     ("QT_ACCESSIBILITY", "1"),
     ("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1"),
+    # Chromium/Electron only build their accessibility bridge when the
+    # platform says a11y is on; the flag alone is not enough (VM-verified).
+    ("ACCESSIBILITY_ENABLED", "1"),
 )
 ENV_HEADER = (
     "# Managed by voxtype-tui: lets apps expose their text to the accessibility bus\n"
@@ -191,9 +198,13 @@ def _disable_flags_text(cur: str, rec: dict) -> str | None:
     return new
 
 
-def _disable_env_text(cur: str) -> str | None:
-    ours = {f"{k}={v}" for k, v in ENV_VARS}
+def _disable_env_text(cur: str) -> str | None | bool:
+    """Remove our lines; None = delete the file; False = not ours any more
+    (our header is gone: the user replaced the file), leave it alone."""
     header = set(ENV_HEADER.splitlines())
+    if not header & set(cur.splitlines()):
+        return False
+    ours = {f"{k}={v}" for k, v in ENV_VARS}
     kept = [ln for ln in cur.splitlines(keepends=True)
             if ln.rstrip("\n") not in ours and ln.rstrip("\n") not in header]
     if "".join(kept).strip() == "":
@@ -209,7 +220,10 @@ def _plan(enable: bool) -> list[dict]:
     cur = _read(envp)
     if enable:
         want = _env_content()
-        if cur == want:
+        if envp.is_symlink():
+            plan.append({"path": envp, "action": "none", "old": cur, "new": cur, "rec": None,
+                         "reason": "a symlink, not ours"})
+        elif cur == want:
             plan.append({"path": envp, "action": "none", "old": cur, "new": cur,
                          "rec": st["files"].get(str(envp)) or {"kind": "env", "created": False},
                          "reason": "already in place"})
@@ -220,6 +234,10 @@ def _plan(enable: bool) -> list[dict]:
             plan.append({"path": envp, "action": "none", "old": cur, "new": cur, "rec": None,
                          "reason": "a file with this name exists and is not ours"})
         for path, why in flag_files():
+            if path.is_symlink():
+                plan.append({"path": path, "action": "none", "old": None, "new": None, "rec": None,
+                             "reason": f"a symlink; add {FLAG} to it yourself", "app": why})
+                continue
             old = _read(path)
             new, rec = _enable_flags_text(old)
             if new is None:
@@ -237,6 +255,10 @@ def _plan(enable: bool) -> list[dict]:
                              "rec": rec, "reason": "already gone"})
                 continue
             new = _disable_env_text(curp) if rec.get("kind") == "env" else _disable_flags_text(curp, rec)
+            if new is False or new == curp:
+                plan.append({"path": path, "action": "none", "old": curp, "new": curp, "rec": rec,
+                             "reason": "no longer contains our lines"})
+                continue
             plan.append({"path": path, "action": "remove" if new is None else "edit",
                          "old": curp, "new": new, "rec": rec})
     return plan
@@ -278,7 +300,28 @@ def preview(enable: bool | None = None) -> dict:
             "needs_relogin": any(f["action"] != "none" for f in files)}
 
 
-def _session_env(enable: bool) -> None:
+def _bus_enabled() -> bool | None:
+    try:
+        p = subprocess.run(["busctl", "--user", "get-property", "org.a11y.Bus", "/org/a11y/bus",
+                            "org.a11y.Status", "IsEnabled"], capture_output=True, text=True,
+                           timeout=3, check=False)
+        v = p.stdout.strip()
+        return True if v == "b true" else False if v == "b false" else None
+    except Exception:
+        return None
+
+
+def _set_bus_enabled(value: bool) -> None:
+    with contextlib.suppress(Exception):
+        subprocess.run(["busctl", "--user", "set-property", "org.a11y.Bus", "/org/a11y/bus",
+                        "org.a11y.Status", "IsEnabled", "b", "true" if value else "false"],
+                       timeout=3, check=False, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _session_env(enable: bool, st: dict) -> None:
+    """Live-session convenience (not persisted). Records what it changed in
+    ``st`` so disable only undoes our own change."""
     if os.environ.get("VOXTYPE_TUI_SYSTEMCTL") == "0" or not _which("systemctl"):
         return
     with contextlib.suppress(Exception):
@@ -288,6 +331,14 @@ def _session_env(enable: bool) -> None:
             argv = ["systemctl", "--user", "unset-environment"] + [k for k, _ in ENV_VARS]
         subprocess.run(argv, timeout=5, check=False, stdin=subprocess.DEVNULL,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not _which("busctl"):
+        return
+    if enable:
+        if _bus_enabled() is False:
+            _set_bus_enabled(True)
+            st["bus_was_disabled"] = True
+    elif st.pop("bus_was_disabled", False):
+        _set_bus_enabled(False)
 
 
 def _set_feature(enabled: bool) -> None:
@@ -297,32 +348,54 @@ def _set_feature(enabled: bool) -> None:
         features.update({"learning": {"everywhere": enabled}})
 
 
+@contextlib.contextmanager
+def _locked():
+    import fcntl
+
+    d = _state_path().parent
+    d.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(d / "learn-everywhere.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def set_enabled(enabled: bool) -> dict:
     """Apply (or undo) the managed edits. Returns
     ``{"ok", "enabled", "files":[{path, action}], "needs_relogin"}``."""
-    plan = _plan(bool(enabled))
+    with _locked():
+        return _set_enabled_locked(bool(enabled))
+
+
+def _set_enabled_locked(enabled: bool) -> dict:
+    plan = _plan(enabled)
     st = _load_state()
     done = []
     try:
         for it in plan:
             path: Path = it["path"]
+            if enabled and it["rec"] is not None and it["action"] != "none":
+                # record ownership BEFORE touching the file, so a crash
+                # between the two can still be undone
+                st["files"][str(path)] = it["rec"]
+                _save_state(st)
             if it["action"] in ("create", "append", "edit"):
                 _atomic_write(path, it["new"])
             elif it["action"] == "remove":
                 with contextlib.suppress(FileNotFoundError):
                     path.unlink()
-            if enabled and it["rec"] is not None and it["action"] != "none":
-                st["files"][str(path)] = it["rec"]
+            if not enabled and it["action"] in ("edit", "remove", "none"):
+                st["files"].pop(str(path), None)
             done.append({"path": str(path), "action": it["action"]})
     except OSError as e:
         _save_state(st)
         return {"ok": False, "error": f"could not write {e.filename or ''}: {e.strerror or e}",
                 "files": done}
-    if not enabled:
-        st["files"] = {}
-    st["enabled"] = bool(enabled)
+    st["enabled"] = enabled
+    _session_env(enabled, st)
     _save_state(st)
-    _session_env(bool(enabled))
-    _set_feature(bool(enabled))
-    return {"ok": True, "enabled": bool(enabled), "files": done,
+    _set_feature(enabled)
+    return {"ok": True, "enabled": enabled, "files": done,
             "needs_relogin": any(d["action"] != "none" for d in done)}

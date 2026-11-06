@@ -77,3 +77,10 @@ def test_spawn_detaches(tmp_path, monkeypatch):
     assert W.spawn("rec-1") is True
     assert seen["start_new_session"] is True and seen["close_fds"] is True
     assert seen["argv"][-2:] == ["--id", "rec-1"]
+
+
+def test_r1_window_must_match_the_dictation(monkeypatch):
+    monkeypatch.setattr(W, "_atspi", lambda: (_ for _ in ()).throw(AssertionError("no a11y")))
+    res = W.watch("text", window={"class": "org.gnome.TextEditor", "pid": 5, "address": "0xb"},
+                  record={"id": "r", "final": "text", "app": {"address": "0xa", "pid": 5}})
+    assert res["ok"] is False and "window changed" in res["reason"]

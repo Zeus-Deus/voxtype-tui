@@ -38,8 +38,6 @@ import contextlib
 import json
 import os
 import re
-import secrets
-import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -139,6 +137,8 @@ def _ensure_dir(p: Path) -> None:
 
 
 def _atomic_write_json(path: Path, data: Any, *, indent: int | None = 2) -> None:
+    import tempfile  # write path only: keep post-process imports lean
+
     _ensure_dir(path.parent)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
     try:
@@ -339,7 +339,8 @@ def diff_candidates(original: str, edited: str, *, passive: bool) -> tuple[list[
 
 def classify(heard: str, written: str, *, user_vocab: Iterable[str] = (),
              user_triggers: Iterable[str] = (), kind: str | None = None,
-             words: frozenset[str] | None = None) -> tuple[str | None, str | None]:
+             words: frozenset[str] | None = None,
+             passive: bool = False) -> tuple[str | None, str | None]:
     """Decide the learned kind for one pair, or why it is skipped.
 
     Returns ``(kind, None)`` or ``(None, reason)``."""
@@ -373,6 +374,10 @@ def classify(heard: str, written: str, *, user_vocab: Iterable[str] = (),
         return None, "the words are too different (a different word, not a mishearing)"
     if kind in ("spelling", "sounds_like"):
         k = kind
+    elif words is None and passive:
+        # Without a wordlist we cannot tell "Austin" (a word) from "Omashi"
+        # (a mishearing): a passive capture never creates an exact alias then.
+        k = "spelling"
     else:
         k = "spelling" if _is_english(h, words) else "sounds_like"
     if k == "spelling" and w.lower() in uv:
@@ -439,6 +444,8 @@ _KIND_RANK = {"spelling": 0, "sounds_like": 1, "replace": 2}
 
 
 def _new_id() -> str:
+    import secrets
+
     return "l_" + secrets.token_hex(5)
 
 
@@ -509,7 +516,7 @@ def submit_correction(record: dict | str, edited_text: str, source: str = "fix",
         changed = False
         for p in pairs:
             k, why = classify(p["heard"], p["written"], user_vocab=uv, user_triggers=ut,
-                              kind=kind, words=words)
+                              kind=kind, words=words, passive=passive)
             if k is None:
                 out["skipped"].append({"heard": p["heard"], "written": p["written"], "reason": why})
                 continue
@@ -526,13 +533,19 @@ def submit_correction(record: dict | str, edited_text: str, source: str = "fix",
                     "state": "suggested", "source": source, "sources": {},
                     "app": app_class if isinstance(app_class, str) else None,
                     "count": 0, "hits": 0, "first_seen": _iso(now), "last_seen": _iso(now),
-                    "decided_at": None, "records": [], "seen": [],
+                    "decided_at": None, "records": [], "seen": [], "aliases": [],
                 }
                 store["entries"].append(e)
             if _KIND_RANK[k] > _KIND_RANK.get(e["kind"], 0):
                 e["kind"] = k
             if p["heard"].lower() not in {h.lower() for h in e["heard"]}:
                 e["heard"].append(p["heard"])
+            # Exact aliases are decided per heard form: "Auston" may be an
+            # alias of "Austen" while the English "Austin" never is.
+            aliases = e.setdefault("aliases", [])
+            if k in ("sounds_like", "replace") and \
+                    p["heard"].lower() not in {h.lower() for h in aliases}:
+                aliases.append(p["heard"])
             duplicate = rec_id is not None and rec_id in e.get("records", [])
             if not duplicate:
                 e["count"] = int(e.get("count", 0)) + 1
@@ -671,9 +684,10 @@ def promote(entry_id: str, *, add_to_user: Callable[[dict], dict] | None = None,
 
 def user_additions(entry: dict) -> dict:
     """What promoting ``entry`` adds to the user's own lists."""
-    if entry["kind"] == "spelling":
+    aliases = entry.get("aliases") if isinstance(entry.get("aliases"), list) else entry["heard"]
+    if entry["kind"] == "spelling" or not aliases:
         return {"vocab": [entry["written"]], "rules": []}
-    return {"vocab": [], "rules": [[h, entry["written"]] for h in entry["heard"]]}
+    return {"vocab": [], "rules": [[h, entry["written"]] for h in aliases]}
 
 
 def _add_to_user_default(entry: dict, config_path: Path | None, sidecar_path: Path | None) -> dict:
@@ -732,7 +746,7 @@ def _compile(store: dict) -> dict:
     active.sort(key=lambda e: score(e, now), reverse=True)
     for e in active:
         if e["kind"] in ("sounds_like", "replace"):
-            for h in e["heard"]:
+            for h in (e["aliases"] if isinstance(e.get("aliases"), list) else e["heard"]):
                 key = " ".join(t.lower() for t in _WORD.findall(h))
                 if key and key not in aliases and key != e["written"].lower():
                     aliases[key] = [e["written"], e["id"]]
@@ -799,27 +813,32 @@ def _overlaps(a: int, b: int, spans: list[tuple[int, int]]) -> bool:
 def _phrase_spans(text: str, phrases: Iterable[str]) -> list[tuple[int, int]]:
     """Occurrences (case-insensitive, word-bounded) of the user's own output
     strings: their dictionary replacements and vocabulary. Learned entries
-    must never rewrite inside them."""
+    must never rewrite inside them. Offsets are taken on ``text`` itself
+    (lowercasing can change string length for some Unicode letters)."""
     spans = []
-    low = text.lower()
     for p in phrases:
-        if not isinstance(p, str):
+        if not isinstance(p, str) or not p.strip():
             continue
-        p = p.strip().lower()
-        if not p:
-            continue
-        start = 0
-        while True:
-            i = low.find(p, start)
-            if i < 0:
-                break
-            j = i + len(p)
-            left = i == 0 or not low[i - 1].isalnum()
-            right = j >= len(low) or not low[j].isalnum()
+        for m in re.finditer(re.escape(p.strip()), text, re.IGNORECASE):
+            i, j = m.start(), m.end()
+            left = i == 0 or not text[i - 1].isalnum()
+            right = j >= len(text) or not text[j].isalnum()
             if left and right:
                 spans.append((i, j))
-            start = i + 1
     return spans
+
+
+def _url_like(text: str, a: int, b: int) -> bool:
+    """Part of a URL, path, file name or identifier (same rule as the
+    vocabulary corrector): never rewrite those."""
+    n = len(text)
+    if a > 0 and text[a - 1] in "./\\_@:#~=":
+        return True
+    if b < n and text[b] in "_@=" :
+        return True
+    if b < n - 1 and text[b] in "./\\:" and (text[b + 1].isalnum() or text[b + 1] in "/\\"):
+        return True
+    return False
 
 
 def apply(text: str, protected_spans: Iterable[tuple[int, int]] = (), *,
@@ -832,6 +851,7 @@ def apply(text: str, protected_spans: Iterable[tuple[int, int]] = (), *,
     user's dictionary outputs and vocabulary). Returns ``(text, hit_ids)``.
     Never raises; with learning off, nothing learned, or any error it returns
     ``(text, [])``."""
+    original = text
     try:
         if not text or not isinstance(text, str) or len(text) > MAX_TEXT_CHARS:
             return text, []
@@ -847,7 +867,7 @@ def apply(text: str, protected_spans: Iterable[tuple[int, int]] = (), *,
         text = _apply_terms(text, comp, prot, hits)
         return text, hits
     except Exception:
-        return text, []
+        return original, []
 
 
 def _apply_aliases(text: str, comp: dict, prot: list[tuple[int, int]],
@@ -880,7 +900,7 @@ def _apply_aliases(text: str, comp: dict, prot: list[tuple[int, int]],
                 continue
             a = group[0].start()
             b = group[-1].end() - len(suffix)
-            if _overlaps(a, b, prot):
+            if _overlaps(a, b, prot) or _url_like(text, a, group[-1].end()):
                 continue
             edits.append((a, b, hit[0]))
             hits.append(hit[1])
@@ -913,72 +933,122 @@ def _apply_aliases(text: str, comp: dict, prot: list[tuple[int, int]],
     return "".join(out), moved + new_prot
 
 
+_WORDS_FILE = Path("/usr/share/cracklib/cracklib-small")  # byte-sorted, lowercase
+
+
+def _english_word(w: str) -> bool:
+    """Is ``w`` an ordinary English word? Uses the corrector's wordlist when
+    this process already loaded it, else a binary search in the sorted
+    cracklib file (no ~9 ms load on the post-process path)."""
+    w = w.lower().strip("'\u2019")
+    try:
+        from . import vocab_corrector as vc
+        if vc._words is not vc._UNLOADED:
+            return vc._words is not None and w in vc._words  # type: ignore[operator]
+        import mmap
+        with open(_WORDS_FILE, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            key = w.encode()
+            lo, hi = 0, len(mm)
+            while lo < hi:  # find the first line >= key
+                mid = (lo + hi) // 2
+                ls = mm.rfind(b"\n", 0, mid) + 1
+                le = mm.find(b"\n", ls)
+                le = len(mm) if le < 0 else le
+                if mm[ls:le] < key:
+                    lo = le + 1
+                else:
+                    hi = ls
+            le = mm.find(b"\n", lo)
+            return mm[lo:(len(mm) if le < 0 else le)] == key
+    except Exception:
+        words = _wordlist()
+        return bool(words) and w in words  # type: ignore[operator]
+
+
 def _apply_terms(text: str, comp: dict, prot: list[tuple[int, int]], hits: list[str]) -> str:
+    """Fuzzy stage for learned spellings: the vocabulary corrector's rules,
+    restricted to spans of 1-2 tokens outside protected text."""
     terms = comp.get("terms") or []
     if not terms:
         return text
-    toks = [m for m in _WORD.finditer(text) if not _overlaps(m.start(), m.end(), prot)]
+    toks = list(_WORD.finditer(text))
     if not toks:
         return text
-    # Cheap gate: a term goes to the corrector only if some unprotected
-    # token (or two adjacent tokens) is already close to it. This keeps the
-    # corrector, and its one-off ~9 ms wordlist load, off dictations that
-    # cannot match any learned term.
-    sq = [squash(m.group(0)) for m in toks]
-    spans = [s for s in sq if s]
-    spans += [a + b for a, b in zip(sq, sq[1:]) if a and b]
-    by_first: dict[str, list[str]] = {}
-    for s_ in spans:
-        by_first.setdefault(s_[0], []).append(s_)
-    picked = []
-    for written, eid in terms:
+    spans = []  # (a, b, squashed, n_tokens, [token texts])
+    for i in range(len(toks)):
+        for w in (1, 2):
+            if i + w > len(toks):
+                break
+            g = toks[i:i + w]
+            if w == 2 and not text[g[0].end():g[1].start()].isspace():
+                continue
+            a, b = g[0].start(), g[-1].end()
+            if _overlaps(a, b, prot) or _url_like(text, a, b):
+                continue
+            words = [x.group(0) for x in g]
+            if w == 2 and (words[0].lower() in _STOP or words[1].lower() in _STOP):
+                continue
+            sq = squash(text[a:b])
+            if sq:
+                spans.append((a, b, sq, w, words))
+    if not spans:
+        return text
+    by_first: dict[str, list[tuple]] = {}
+    for sp in spans:
+        by_first.setdefault(sp[2][0], []).append(sp)
+    cands = []
+    for written, eid in terms[:MAX_FUZZY_TERMS]:
         tq = squash(written)
-        cands = by_first.get(tq[:1])
-        if not cands:
+        if not tq:
             continue
+        n = len(written.split())
         tol = max(2, len(tq) // 3)
         tk = None
-        for c in cands:
-            if c == tq or abs(len(c) - len(tq)) > tol or len(c) < 5:
+        for a, b, sq, w, words in by_first.get(tq[0], ()):
+            if w > max(2, n):
                 continue
-            sm = SequenceMatcher(None, c, tq)
+            if sq == tq:
+                if text[a:b] != written:
+                    cands.append((2, w, 2.0, a, b, written, eid))  # casing/spacing
+                continue
+            if sq in (tq + "s", tq + "es") or len(sq) < 5 or abs(len(sq) - len(tq)) > tol:
+                continue
+            if w == 1 and "-" in words[0]:
+                continue
+            sm = SequenceMatcher(None, sq, tq)
             if sm.quick_ratio() < 0.6:
                 continue
-            r = sm.ratio()
-            if r < 0.78:
-                tk = tk or _skeleton(written)
-                r = max(r, 0.95 * SequenceMatcher(None, _skeleton(c), tk).ratio())
-            if r >= 0.78:
-                picked.append((written, eid))
-                break
-        if len(picked) >= MAX_FUZZY_PER_TEXT:
-            break
-    if not picked:
+            r1 = sm.ratio()
+            tk = tk or _skeleton(written)
+            score = max(r1, 0.95 * SequenceMatcher(None, _skeleton(text[a:b]), tk).ratio())
+            need = 0.88 if len(tq) <= 6 else 0.80
+            if w > n:
+                need = max(need, 0.85)
+            if score < need:
+                continue
+            if all(_english_word(x) for x in words) and not (w >= 2 and n >= 2):
+                continue  # real English ("cloud", "preset") is never fuzzed
+            cands.append((1, w, score, a, b, written, eid))
+    if not cands:
         return text
-    from . import vocab_corrector
+    taken: list[tuple[int, int]] = []
+    edits = []
+    for tier, w, score, a, b, written, eid in sorted(cands, key=lambda c: c[:3], reverse=True):
+        if any(a < tb and ta < b for ta, tb in taken):
+            continue
+        taken.append((a, b))
+        edits.append((a, b, written, eid))
+    for a, b, written, eid in sorted(edits, reverse=True):
+        text = text[:a] + written + text[b:]
+        hits.append(eid)
+    return text
 
-    names = [w for w, _ in picked]
-    segs = []
-    pos = 0
-    for s, e in sorted(prot):
-        if s > pos:
-            segs.append((pos, s, True))
-        segs.append((max(pos, s), max(pos, e), False))
-        pos = max(pos, e)
-    segs.append((pos, len(text), True))
-    out = []
-    for a, b, free in segs:
-        piece = text[a:b]
-        if free and piece.strip():
-            fixed = vocab_corrector.correct(piece, names)
-            if fixed != piece:
-                before = {w: piece.count(w) for w in names}
-                for w, eid in picked:
-                    if fixed.count(w) > before[w]:
-                        hits.append(eid)
-                piece = fixed
-        out.append(piece)
-    return "".join(out)
+
+_STOP = frozenset({
+    "a", "an", "the", "and", "but", "or", "in", "on", "of", "to", "for",
+    "with", "is", "it", "my", "as", "at", "by", "be", "then", "that",
+    "this", "so", "if", "what", "you", "i", "we", "can",
+})
 
 
 # ---------------------------------------------------------------- notify
@@ -1043,7 +1113,7 @@ def _bench(n_entries: int = 500, words: int = 60) -> dict:  # pragma: no cover
             w = w.rstrip("0123456789") + "x" * (i % 3)
             store["entries"].append({
                 "id": f"l_{i:05x}", "kind": "sounds_like" if i % 2 else "spelling",
-                "written": w, "heard": [w.lower() + "h"], "state": "active",
+                "written": w, "heard": [w.lower() + "h"], "aliases": [w.lower() + "h"], "state": "active",
                 "source": "fix", "sources": {"fix": 1}, "count": 1, "hits": 0,
                 "first_seen": _iso(_now()), "last_seen": _iso(_now()), "decided_at": None,
             })
