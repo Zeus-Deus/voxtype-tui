@@ -82,5 +82,26 @@ def test_spawn_detaches(tmp_path, monkeypatch):
 def test_r1_window_must_match_the_dictation(monkeypatch):
     monkeypatch.setattr(W, "_atspi", lambda: (_ for _ in ()).throw(AssertionError("no a11y")))
     res = W.watch("text", window={"class": "org.gnome.TextEditor", "pid": 5, "address": "0xb"},
-                  record={"id": "r", "final": "text", "app": {"address": "0xa", "pid": 5}})
+                  record={"id": "r", "final": "text", "delivery_window": {"address": "0xa", "pid": 5}})
     assert res["ok"] is False and "window changed" in res["reason"]
+
+
+def test_on_post_output_never_raises_and_respects_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    (tmp_path / "voxtype-tui").mkdir()
+    (tmp_path / "voxtype-tui" / "features.json").write_text(json.dumps({"learning": {"enabled": False}}))
+    monkeypatch.setattr(W, "active_window", lambda: {"class": "x", "pid": 1})
+    assert W.on_post_output({"final": "hi"}) is None
+    assert W.on_post_output(None) is None  # type: ignore[arg-type]
+
+
+def test_on_post_output_binds_delivery_window(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    monkeypatch.setattr(W, "active_window", lambda: {"class": "foot", "pid": 7, "address": "0x1"})
+    seen = {}
+    monkeypatch.setattr(W, "watch", lambda final, window, record: seen.update(r=record) or {"ok": False})
+    W.on_post_output({"id": "r1", "final": "hello", "app": {"class": "old", "address": "0x9"}})
+    assert seen["r"]["delivery_window"] == {"address": "0x1", "pid": 7, "class": "foot"}
+    assert seen["r"]["app"]["class"] == "foot"

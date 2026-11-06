@@ -370,7 +370,7 @@ def test_r1_fail_open_returns_original_input():
     assert L.apply("on Omashi") == ("on Omashi", [])
 
 
-@pytest.mark.parametrize("text", ["see https://omashi.com now", "cd /home/omashi", "omashi_config",
+@pytest.mark.parametrize("text", ["see https://omashi.com now", "cd /opt/omashi/data", "omashi_config",
                                   "open omashi.toml", "mail me@omashi", "a #omashi tag"])
 def test_r1_aliases_leave_urls_paths_identifiers(text):
     L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")

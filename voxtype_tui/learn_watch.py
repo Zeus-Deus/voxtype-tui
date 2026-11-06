@@ -137,12 +137,41 @@ def _is_watcher(pid: int) -> bool:
         cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
         return False
-    return b"voxtype_tui.learn_watch" in cmd
+    # standalone watcher, or the post-output hook process running one
+    return b"voxtype_tui.learn_watch" in cmd or b"voxtype-tui-hook" in cmd
 
 
 # ---------------------------------------------------------------- window
 
+def _hypr_socket_window() -> dict | None:
+    """Active window over Hyprland's request socket (~1 ms, no subprocess)."""
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    rt = os.environ.get("XDG_RUNTIME_DIR")
+    if not sig or not rt:
+        return None
+    import socket
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(0.3)
+            s.connect(os.path.join(rt, "hypr", sig, ".socket.sock"))
+            s.sendall(b"j/activewindow")
+            chunks = []
+            while True:
+                b = s.recv(65536)
+                if not b:
+                    break
+                chunks.append(b)
+        w = json.loads(b"".join(chunks) or b"null")
+    except (OSError, ValueError):
+        return None
+    return w if isinstance(w, dict) and w.get("pid") else None
+
+
 def active_window() -> dict | None:
+    w = _hypr_socket_window()
+    if w is not None:
+        return w
     try:
         p = subprocess.run(["hyprctl", "activewindow", "-j"], capture_output=True,
                            text=True, timeout=2, check=False)
@@ -150,6 +179,14 @@ def active_window() -> dict | None:
         return data if isinstance(data, dict) and data.get("pid") else None
     except Exception:
         return None
+
+
+def _same_window(a: dict | None, b: dict | None) -> bool:
+    if not a or not b:
+        return False
+    if a.get("address") and b.get("address"):
+        return a["address"] == b["address"]
+    return a.get("pid") == b.get("pid")
 
 
 def _pid_tree(root: int) -> set[int]:
@@ -325,11 +362,9 @@ def watch(final: str, *, window: dict | None, record: dict | None, window_s: flo
         return {**res, "reason": "password manager"}
     if cls.lower() in NO_TEXT_CLASSES:
         return {**res, "reason": f"{cls} exposes no text (use History > Fix)"}
-    rec_app = (record or {}).get("app")
-    if isinstance(rec_app, dict):
-        for k in ("address", "pid"):
-            if rec_app.get(k) and window.get(k) and rec_app[k] != window[k]:
-                return {**res, "reason": "the window changed before the watcher started"}
+    delivered = (record or {}).get("delivery_window")
+    if isinstance(delivered, dict) and not _same_window(delivered, window):
+        return {**res, "reason": "the window changed before the watcher started"}
     try:
         Atspi = _atspi()
         from gi.repository import GLib  # type: ignore
@@ -349,6 +384,8 @@ def watch(final: str, *, window: dict | None, record: dict | None, window_s: flo
         return {**res, "reason": f"no focused text field on the accessibility bus ({cls})"}
     if is_password(Atspi, node):
         return {**res, "reason": "password field"}
+    if not _same_window(window, active_window()):
+        return {**res, "reason": "the window changed before the watcher started"}
     log(f"field found in {cls} role={node.get_role_name()}")
 
     # Wait for the dictated text to be in the field (clipboard mode: the
@@ -499,6 +536,45 @@ def _latest_record() -> dict | None:
     return None
 
 
+def on_post_output(record: dict) -> dict | None:
+    """Entry point for the post-output hook, which already runs in its own
+    detached process: watch this record's correction window in-process.
+    Never raises."""
+    global _log_path
+    try:
+        window = active_window()  # the window the text was just delivered to
+        from . import learned
+        if not isinstance(record, dict) or not learned.is_enabled():
+            return None
+        final = record.get("final")
+        if not isinstance(final, str):
+            return None
+        _runtime_dir().mkdir(parents=True, exist_ok=True)
+        _log_path = _runtime_dir() / "learn-watch.log"
+        _claim_slot()
+        rec = dict(record)
+        if window is not None:
+            rec["delivery_window"] = {k: window.get(k) for k in ("address", "pid", "class")}
+            rec["app"] = {k: window.get(k) for k in ("class", "title", "pid", "address")}
+        res = watch(final, window=window, record=rec)
+        log("result " + json.dumps(_safe_result(res)))
+        return res
+    except Exception as e:
+        log(f"error: {type(e).__name__}: {e}")
+        return None
+    finally:
+        _release_slot()
+
+
+def _safe_result(res: dict) -> dict:
+    if _debug_text():
+        return res
+    out = {k: v for k, v in res.items() if k in ("ok", "end", "changed", "undone")}
+    out["learned"] = len(res.get("learned") or [])
+    out["reason"] = res.get("reason") is not None
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     global _log_path, _verbose
     ap = argparse.ArgumentParser(prog="voxtype_tui.learn_watch")
@@ -525,10 +601,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         res = watch(final, window=active_window(), record=rec, window_s=min(a.window, WINDOW_S),
                     submit=not a.no_submit)
-        safe = res if _debug_text() else {k: v for k, v in res.items()
-                                          if k in ("ok", "end", "changed", "undone")} | {
-            "learned": len(res.get("learned") or []), "reason": res.get("reason") is not None}
-        log("result " + json.dumps(safe))
+        log("result " + json.dumps(_safe_result(res)))
         if a.verbose:
             print(json.dumps(res))
         return 0
