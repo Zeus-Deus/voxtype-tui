@@ -72,6 +72,16 @@ When to enable:
 - AMD GPU → ROCm or Vulkan.
 - Intel GPU / no dedicated GPU → Vulkan may still help for Whisper; often comparable to AVX-512 CPU.
 
+## Media, indicator & notifications ◎
+
+Collapsed by default. Stock Voxtype settings; each needs a daemon restart. A key you never touch stays out of `config.toml`, so Voxtype's own default applies.
+
+**Pause media** (`audio.pause_media`, default off; Omarchy's config turns it on) pauses players while you record. **Lower other audio** (`audio.duck_media`) lowers other streams instead, to **Lowered to (%)** (`duck_media_volume_percent`, 34) with a **Fade (ms)** (`duck_media_fade_ms`, 150).
+
+**Indicator (OSD)** (`osd.enabled`) with its renderer (`osd.frontend`: gtk4 / native / quickshell), **layout** (`osd.layout`), **position** (`osd.position`) and **colors** (`osd.palette`; "style decides" removes the key).
+
+**Remove um/uh** (`text.filter_filler_words`, on), **Restore clipboard** after a paste (`output.restore_clipboard`), **Shift+Enter newlines** for chat apps (`output.shift_enter_newlines`), and the four notification switches (`output.notification.on_recording_start`, `on_recording_stop`, `on_transcription`, `on_no_speech`).
+
 ## VAD (Voice Activity Detection) ◎
 
 Collapsed by default. When enabled, voxtype trims silence from the ends of your recording and chunks continuous speech. Improves accuracy on longer recordings at the cost of a small preprocessing step.

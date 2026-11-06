@@ -1,0 +1,122 @@
+# Insights: usage stats, recent history, archive
+
+voxtype-tui can count your dictations, keep a short history of what you said,
+and (if you ask for it) save every dictation as a dataset. Everything stays on
+your machine. Voxtype itself is not modified: voxtype-tui uses Voxtype's
+standard hook settings.
+
+## The switches
+
+All in `~/.config/voxtype-tui/features.json` (the Omarchy panel and the
+headless API below change it for you). A missing file means the defaults.
+
+| Feature | Default | What is stored |
+|---|---|---|
+| Usage stats (`usage.enabled`) | on | Counters only, never text: dictations, words, measured seconds and the model, per day and hour. |
+| Recent history (`history.enabled`, `history.keep_days`) | on, 30 days | The raw transcript and the final text, so you can copy or fix one later. Keep 7 / 30 / 90 / 365 days or forever (`null`). |
+| Archive (`archive.enabled`, `dir`, `save_audio`, `save_text`) | off | A WAV and a JSON file per dictation, in a folder you choose. |
+| Learn from corrections (`learning.*`) | on | See the auto-learn docs. |
+
+Turning a switch off stops writing for that feature right away, without a restart.
+History you already have stays until it expires or you clear it.
+
+### Archive folder
+
+If you turn the archive on without picking a folder, it uses `~/Documents/Voxtype`:
+
+```
+~/Documents/Voxtype/YYYY/MM/DD/<id>.wav    # a separate 16 kHz mono recording of your mic
+~/Documents/Voxtype/YYYY/MM/DD/<id>.json   # the record below (+ text when "save text" is on)
+~/Documents/Voxtype/index.jsonl            # one line per dictation
+```
+
+The WAV is recorded alongside Voxtype by `pw-record` (or `parec`) on the same
+`audio.device`. It is not Voxtype's exact model input: it starts about 40 ms
+after Voxtype starts recording and stops when Voxtype stops. The JSON's
+`audio_info.start_offset_s` gives the measured offset for that dictation.
+When a recording is cancelled, or VAD finds no speech, nothing is archived.
+
+## Files
+
+| Path | Content |
+|---|---|
+| `~/.config/voxtype-tui/features.json` | the switches, plus `managed_hooks` (which hook commands voxtype-tui wrote) |
+| `~/.local/share/voxtype-tui/queue.jsonl` | records waiting to be counted (emptied after each dictation or on the next read) |
+| `~/.local/share/voxtype-tui/usage.json` | counters, no text |
+| `~/.local/share/voxtype-tui/history.jsonl` | recent dictations (text), pruned to `keep_days` |
+| `~/.local/share/voxtype-tui/health.json`, `failures.jsonl` | last capture time and recent capture errors |
+| `$XDG_RUNTIME_DIR/voxtype-tui/` | per-dictation scratch (RAM): recording start, the last record for the archive and the learning watcher, the temp WAV |
+
+The files are created 0600 in 0700 directories. None of them are in `sync.json` or in Export.
+
+## How it hooks into Voxtype
+
+voxtype-tui sets these Voxtype settings only when a switch needs them, and only
+if you have not set them yourself:
+
+- `[output.post_process] command = "voxtype-tui-postprocess"` (as before for vocabulary
+  and dictionary users). It is the only program that sees the text. After the
+  existing stages it adds one line to the queue (about 0.3 ms).
+- `pre_recording_command`, for usage, history or archive: it notes when recording
+  started (for measured durations) and which window was focused, and starts the
+  archive recorder. Voxtype starts capturing before it runs this hook, so the hook
+  cannot cost you words. The hook returns in about 13 ms. The rest runs in the background.
+- `post_output_command`, only for the archive or the learning watcher. Voxtype waits
+  for this hook before it can record again, so the hook only starts a background
+  process and returns.
+
+The command it writes is safe if voxtype-tui is removed:
+
+```
+command -v voxtype-tui-hook >/dev/null 2>&1 && exec voxtype-tui-hook pre-recording; exit 0
+```
+
+If you already have your own `pre_recording_command` or `post_output_command`,
+voxtype-tui leaves it alone. The feature that needs it shows as unavailable,
+with the reason. With your own post-processing command (an LLM cleanup script,
+say), usage and history are unavailable, because voxtype-tui never sees the text.
+
+Changing these settings needs a daemon restart, like any Voxtype config change.
+The panel's "Restart to apply" and the TUI's restart prompt cover it.
+Uninstalling the package (pacman) removes the hook commands voxtype-tui wrote
+and nothing else.
+
+## What is not available, and why
+
+- **Duration and words per minute** come from the moments Voxtype writes `recording`
+  and `transcribing` to its state file. If the pre-recording hook is not ours, durations
+  are `null`, never estimated, and "time saved" is not shown.
+- **The model** is read from `config.toml`. When the config is newer than the
+  running daemon, the record says `model_uncertain: true`.
+- **Dictations made before the upgrade** are not counted. voxtype-tui does not
+  read the journal.
+
+## Headless API (`voxtype_tui.insights`, stdlib only)
+
+```python
+from voxtype_tui import insights
+
+insights.get_features()               # {features, available:{usage,history,archive,learning,everywhere}, reasons}
+insights.set_features({"history": {"keep_days": 90}})   # + restart_needed, config_changed
+insights.usage_summary(days=365)      # {enabled, days:[{date,dictations,words,seconds}], totals:{dictations,words,seconds,wpm,saved_seconds}, hours:[24], models, since, health}
+insights.history_list(before=None, limit=20)            # {enabled, keep_days, items:[record], next}
+insights.history_delete(record_id)    # {removed}
+insights.history_clear()              # {removed}
+```
+
+`wpm` = words / measured minutes. `saved_seconds` = the time typing those words
+at `usage.typing_wpm` (default 40) would have taken, minus the time you spent
+speaking. Both are `null` until something has been measured.
+
+A record:
+
+```json
+{"id": "20261106T203553Z-1a2b", "ts": "2026-11-06T20:35:53.628Z", "started_at": "…", "duration_s": 8.9,
+ "raw": "…Omashi…", "final": "…Omarchy…", "words": 31, "chars": 212,
+ "engine": "whisper", "model": "base.en", "language": "en", "model_uncertain": false,
+ "app": {"class": "foot", "title": "…", "pid": 1234, "address": "0x…"},
+ "changed_by": ["dictionary", "vocab", "learned"], "audio": "2026/11/06/20261106T203553Z-1a2b.wav"}
+```
+
+Command line: `voxtype-tui-hook --sync` re-applies the hook wiring for the
+current switches. `voxtype-tui-hook --unwire` removes voxtype-tui's hooks.

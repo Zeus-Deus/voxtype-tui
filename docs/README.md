@@ -17,6 +17,7 @@ Short, topic-focused notes on what each setting does and when you'd want to touc
 - [Restart-sensitive fields](./restart-sensitive.md) — which changes need a daemon restart, which don't, and why.
 - [Theming](./theming.md) — Omarchy auto-detect, user overrides, the `ctrl+p` theme picker.
 - [Keybindings reference](./keybindings.md) — app-level, vim navigation, per-tab actions.
+- [Insights](./insights.md) — usage stats, recent history, the archive, their switches and files.
 
 ## If you're brand new
 
