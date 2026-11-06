@@ -127,12 +127,13 @@ def _insights_wire_hooks(doc: TOMLDocument, sc: sidecar.Sidecar) -> bool:
 
     The wiring itself is :func:`hooks.reconcile`, which needs to know
     whether ``doc`` is the daemon's live config (features.json describes
-    only that one), so ``AppState.load`` runs it right after this step when
-    the sidecar crosses v3 → v4. ``AppState.save`` and ``features.update``
-    reconcile again, so a fresh install without metadata.json — where no
-    migration ever runs — is wired at its first save (DESIGN A4). This
-    entry versions the schema and is the anchor L2's ``learned-*``
-    migration is appended after. Returns False: it changes nothing itself.
+    only that one), so ``AppState.load`` runs it right after the migrations
+    on every load of the live config; ``AppState.save``, ``features.update``
+    and ``--apply-migrations`` reconcile too, so a fresh install without
+    metadata.json — where no migration ever runs — is wired as well
+    (DESIGN A4). This entry versions the schema and is the anchor L2's
+    ``learned-*`` migration is appended after. Returns False: it changes
+    nothing by itself.
     """
     return False
 
