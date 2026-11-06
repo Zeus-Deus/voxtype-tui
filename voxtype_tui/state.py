@@ -142,10 +142,12 @@ class AppState:
         # absent or recorded-as-ours values change; a change marks the
         # config dirty + stale like any migration, and the next save writes
         # it. Alternate configs are never rewired.
-        if _reconcile_hooks(doc, config_path):
-            config_dirty_from_migrations = True
-            if "insights-wire-hooks" not in migration_result.applied:
-                migration_result.applied.append("insights-wire-hooks")
+        # Dirty only: nothing is written by a load, so the running daemon is
+        # not stale yet (a quit without saving must not restart it); the
+        # save that writes the wiring marks it stale.
+        config_dirty_from_hooks = _reconcile_hooks(doc, config_path)
+        if config_dirty_from_hooks and "insights-wire-hooks" not in migration_result.applied:
+            migration_result.applied.append("insights-wire-hooks")
         sidecar_dirty_from_migrations = migration_result.new_version != raw_sc.version
 
         # If reconcile changed the sidecar, mark it dirty so the next save
@@ -185,6 +187,7 @@ class AppState:
             loaded_dump=pre_sync_dump,
             config_dirty=(
                 config_dirty_from_migrations
+                or config_dirty_from_hooks
                 or sync_result.needs_save_doc
             ),
             sidecar_dirty=(

@@ -127,12 +127,19 @@ def _sanitize(d: dict) -> dict:
             except ValueError:
                 out[section][key] = copy.deepcopy(dv)
     out["version"] = VERSION
-    for key in (MANAGED_HOOKS_KEY, PENDING_HOOKS_KEY):
-        mh = out.get(key)
-        if not isinstance(mh, dict) or not all(
-            isinstance(k, str) and isinstance(v, str) for k, v in mh.items()
-        ):
-            out[key] = {}
+    mh = out.get(MANAGED_HOOKS_KEY)
+    if not isinstance(mh, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in mh.items()
+    ):
+        out[MANAGED_HOOKS_KEY] = {}
+    pend = out.get(PENDING_HOOKS_KEY)
+    clean: dict[str, list[str]] = {}
+    if isinstance(pend, dict):
+        for k, v in pend.items():
+            vals = [v] if isinstance(v, str) else v
+            if isinstance(k, str) and isinstance(vals, list) and all(isinstance(x, str) for x in vals):
+                clean[k] = list(vals)
+    out[PENDING_HOOKS_KEY] = clean
     return out
 
 
@@ -256,9 +263,10 @@ def update(
 
 
 def set_managed_hooks(managed: dict[str, str], path: Path | None = None,
-                      pending: dict[str, str] | None = None) -> None:
+                      pending: "dict[str, list[str]] | None" = None) -> None:
     """Replace the ownership record (hooks/state modules only). ``pending``
-    = strings about to be written; ``{}``/``None`` clears it."""
+    = hook key -> strings that may be in config.toml until a save commits;
+    ``{}``/``None`` clears it."""
     path = path or features_path()
     pending = dict(pending or {})
     fd = _locked(path)
@@ -283,10 +291,13 @@ def set_managed_hooks(managed: dict[str, str], path: Path | None = None,
 def owned_hook_strings(feats: dict, key: str) -> tuple[str, ...]:
     """Every string for hook ``key`` we recorded (committed or pending)."""
     out = []
-    for k in (MANAGED_HOOKS_KEY, PENDING_HOOKS_KEY):
-        v = (feats.get(k) or {}).get(key)
-        if isinstance(v, str):
-            out.append(v)
+    v = (feats.get(MANAGED_HOOKS_KEY) or {}).get(key)
+    if isinstance(v, str):
+        out.append(v)
+    p = (feats.get(PENDING_HOOKS_KEY) or {}).get(key)
+    for x in ([p] if isinstance(p, str) else (p or [])):
+        if isinstance(x, str):
+            out.append(x)
     return tuple(out)
 
 

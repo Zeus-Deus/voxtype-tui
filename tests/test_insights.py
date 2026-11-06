@@ -232,9 +232,11 @@ def test_queue_is_bounded(xdg, monkeypatch):
 
 def test_summary_one_year_is_fast(xdg):
     u = {"version": 1, "since": "2025-11-06", "last_id": "z", "days": {}}
-    base = time.time()
+    from datetime import date, timedelta
+
+    today = date.today()
     for d in range(366):
-        day = time.strftime("%Y-%m-%d", time.localtime(base - d * 86400))
+        day = (today - timedelta(days=d)).isoformat()  # DST-safe calendar days
         u["days"][day] = {"n": 20, "w": 600, "c": 3000, "md": 20, "mw": 600, "ms": 200.0,
                           "h": {str(h): 1 for h in range(20)}, "m": {"whisper\tbase.en": 20}}
     features.atomic_write_text(history.usage_path(), json.dumps(u))
@@ -473,10 +475,14 @@ def test_learned_stage_guarded_and_spans_protect_rules(xdg, monkeypatch, tmp_pat
 
 def test_fresh_install_without_metadata_gets_wired_on_load(live_config):
     st = AppState.load(config.CONFIG_PATH, sidecar.SIDECAR_PATH)
-    assert st.config_dirty and st.daemon_stale  # A4: reconciled on every live load
+    assert st.config_dirty  # A4: reconciled on every live load
+    # review r3 #3: nothing was written, so quitting without saving must not
+    # restart the daemon (the exit hook restarts only when stale).
+    assert not st.daemon_stale
     assert "insights-wire-hooks" in st.migrations_applied
     assert "voxtype-tui-hook" not in live_config.read_text()  # nothing written by a load
     st.save()
+    assert st.daemon_stale
     text = live_config.read_text()
     assert "voxtype-tui-hook pre-recording" in text
     assert "voxtype-tui-postprocess" in text
@@ -488,7 +494,7 @@ def test_upgrade_from_v3_runs_v4_and_wires(live_config):
     sidecar.SIDECAR_PATH.write_text(json.dumps({"version": 3, "vocabulary": [], "replacements": []}))
     st = AppState.load(config.CONFIG_PATH, sidecar.SIDECAR_PATH)
     assert st.sc.version == 4 == sidecar.SCHEMA_VERSION
-    assert st.config_dirty and st.daemon_stale
+    assert st.config_dirty
     assert "insights-wire-hooks" in st.migrations_applied
     st.save()
     assert "voxtype-tui-hook pre-recording" in live_config.read_text()
@@ -822,7 +828,7 @@ def test_failed_save_keeps_old_and_new_hook_strings_ours(live_config, monkeypatc
         hooks.sync_config()
     f = features.load()
     assert f["managed_hooks"][hooks.PRE_RECORDING] == old
-    assert f["managed_hooks_pending"][hooks.PRE_RECORDING] == hooks.OUR_COMMANDS[hooks.PRE_RECORDING]
+    assert f["managed_hooks_pending"][hooks.PRE_RECORDING] == [hooks.OUR_COMMANDS[hooks.PRE_RECORDING]]
     plan = hooks.reconcile(tomlkit.parse(live_config.read_text()), f)
     assert hooks.PRE_RECORDING not in plan.foreign
     monkeypatch.setattr(config, "safe_save", real_save)  # never undo(): it would drop the CONFIG_PATH patch
@@ -843,7 +849,7 @@ def test_save_records_intent_for_hooks_wired_earlier_in_memory(live_config, monk
         return real(doc, path, **k)
     monkeypatch.setattr(config, "safe_save", spy)
     st.save()
-    assert seen["pending"].get(hooks.PRE_RECORDING) == hooks.OUR_COMMANDS[hooks.PRE_RECORDING]
+    assert seen["pending"].get(hooks.PRE_RECORDING) == [hooks.OUR_COMMANDS[hooks.PRE_RECORDING]]
     assert features.load()["managed_hooks_pending"] == {}
 
 
@@ -856,3 +862,34 @@ def test_start_info_is_not_kept_when_the_archive_is_off(xdg, monkeypatch, tmp_pa
             {"start": time.time() - 3, "app": {"class": "foot"}}))
         _run_main(monkeypatch, "words here")
     assert not list(features.runtime_dir().glob("rec-*.json"))
+
+
+
+def test_record_intent_keeps_earlier_pending_strings(xdg):
+    """review r3 #4: a string pending from a crashed/failed save stays ours
+    until a save commits, even when the next plan removes that hook."""
+    old_pending = "voxtype-tui-hook pre-recording --v2"
+    features.set_managed_hooks({}, pending={hooks.PRE_RECORDING: [old_pending]})
+    plan = hooks.Plan()
+    plan.managed = {hooks.POST_OUTPUT: hooks.OUR_COMMANDS[hooks.POST_OUTPUT]}
+    hooks.record_intent(features.load(), plan)
+    f = features.load()
+    assert f["managed_hooks_pending"][hooks.PRE_RECORDING] == [old_pending]
+    assert f["managed_hooks_pending"][hooks.POST_OUTPUT] == [hooks.OUR_COMMANDS[hooks.POST_OUTPUT]]
+    assert old_pending in features.owned_hook_strings(f, hooks.PRE_RECORDING)
+    hooks.commit_ownership(plan)
+    assert features.load()["managed_hooks_pending"] == {}
+
+
+def test_hook_entry_passes_its_start_time_to_the_worker(xdg, monkeypatch):
+    """review r3 #2: the generation boundary is taken before the fork."""
+    from voxtype_tui import hook_main
+
+    seen = {}
+    monkeypatch.setattr(hook_main, "_detach", lambda: True)
+    monkeypatch.setattr(hooks, "on_post_output", lambda entered_at=None: seen.setdefault("t", entered_at))
+    monkeypatch.setattr(os, "_exit", lambda code: (_ for _ in ()).throw(SystemExit(code)))
+    t0 = time.time()
+    with pytest.raises(SystemExit):
+        hook_main.main(["post-output"])
+    assert t0 <= seen["t"] <= time.time()

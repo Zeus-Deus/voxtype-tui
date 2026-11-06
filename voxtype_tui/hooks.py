@@ -242,9 +242,17 @@ def record_intent(feats: dict, plan: "Plan", features_file: Path | None = None) 
     """Before config.toml is written: record the hook strings about to be
     ours as *pending*, keeping the committed record intact (DESIGN A3)."""
     old = dict(feats.get(F.MANAGED_HOOKS_KEY) or {})
-    intent = {k: v for k, v in plan.managed.items() if old.get(k) != v}
-    if intent:
-        F.set_managed_hooks(old, features_file, pending=intent)
+    pending = {k: list(v) for k, v in (feats.get(F.PENDING_HOOKS_KEY) or {}).items()}
+    changed = False
+    # Keep every string already pending (it may be installed after an
+    # earlier crash or failed save) and add the ones about to be written.
+    for k, v in plan.managed.items():
+        if old.get(k) != v and v not in pending.setdefault(k, []):
+            pending[k].append(v)
+            changed = True
+    pending = {k: v for k, v in pending.items() if v}
+    if changed:
+        F.set_managed_hooks(old, features_file, pending=pending)
 
 
 def commit_ownership(plan: "Plan", features_file: Path | None = None) -> None:
@@ -535,12 +543,14 @@ def _discard_unconsumed_recording(entered_at: float) -> None:
             pass
 
 
-def on_post_output() -> None:
+def on_post_output(entered_at: float | None = None) -> None:
     """Runs in the detached process (see hook_main): voxtype waits for this
-    hook before it goes idle, so nothing here may run in the hook itself."""
+    hook before it goes idle, so nothing here may run in the hook itself.
+    ``entered_at`` = when voxtype started the hook (taken before the fork),
+    so a recording that began after this hook is never touched."""
     from . import history
 
-    entered_at = time.time()
+    entered_at = time.time() if entered_at is None else entered_at
     feats = F.load()
     rec = history.latest()
     if rec is not None and not _claim(rec.get("id")):
@@ -590,7 +600,8 @@ def main(argv: list[str] | None = None) -> int:
         if event == "pre-recording":
             on_pre_recording()
         elif event == "post-output":
-            on_post_output()
+            started = os.environ.get("VOXTYPE_TUI_HOOK_STARTED")
+            on_post_output(float(started) if started else None)
         elif event == "pre-output":
             pass
         elif event == "--unwire":

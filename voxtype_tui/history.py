@@ -549,14 +549,20 @@ def _strip_queue_text(data_dir: Path | None, record_id: str | None) -> int:
                     continue
                 if isinstance(obj, dict):
                     items.append(obj)
-        hit = [i for i in items if "final" in i and (record_id is None or i.get("id") == record_id)]
-        if not hit:
+        hits = 0
+        out = []
+        for i in items:
+            if "final" in i and (record_id is None or i.get("id") == record_id):
+                out.append(_strip_text(i))
+                hits += 1
+            else:
+                out.append(i)
+        if not hits:
             return 0
-        out = [_strip_text(i) if i in hit else i for i in items]
         data = "".join(json.dumps(i, ensure_ascii=False, separators=(",", ":")) + "\n" for i in out)
         os.ftruncate(qfd, 0)
         os.pwrite(qfd, data.encode(), 0)
-        return len(hit)
+        return hits
     finally:
         os.close(qfd)
 

@@ -37,6 +37,11 @@ def _detach() -> bool:
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     event = argv[0] if argv else ""
+    import time
+
+    # The moment voxtype ran this hook, before any fork or delay: the
+    # detached worker uses it to tell this dictation from a newer one.
+    os.environ["VOXTYPE_TUI_HOOK_STARTED"] = repr(time.time())
     if event == "pre-output":
         return 0
     if event in _DETACHED_EVENTS:
