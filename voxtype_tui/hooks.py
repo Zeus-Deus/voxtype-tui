@@ -453,6 +453,37 @@ def _claim(record_id: object) -> bool:
     return True
 
 
+def _discard_unconsumed_recording() -> None:
+    """A rec-start.json still present at post-output was never claimed by a
+    transcription (cancel / no speech): stop its recorder, delete its WAV."""
+    from . import capture
+
+    p = capture.rec_start_path()
+    try:
+        info = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return
+    try:
+        p.unlink()
+    except OSError:
+        pass
+    pid = int(info.get("recorder_pid") or 0) if isinstance(info, dict) else 0
+    for _ in range(60):  # the supervisor stops it once voxtype leaves `recording`
+        if not pid:
+            break
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            break
+        time.sleep(0.05)
+    wav = info.get("wav") if isinstance(info, dict) else None
+    if isinstance(wav, str) and wav.startswith(str(F.runtime_dir())):
+        try:
+            os.unlink(wav)
+        except OSError:
+            pass
+
+
 def on_post_output() -> None:
     """Runs in the detached process (see hook_main): voxtype waits for this
     hook before it goes idle, so nothing here may run in the hook itself."""
@@ -462,9 +493,12 @@ def on_post_output() -> None:
     rec = history.latest()
     if rec is not None and not _claim(rec.get("id")):
         # Voxtype also runs post_output after a cancelled / no-speech
-        # recording: the newest record is then an older dictation that was
-        # already handled. Never archive or watch it twice.
+        # recording (measured): the newest record is then an older
+        # dictation that was already handled. Never archive or watch it
+        # twice; drop the cancelled recording's scratch audio instead.
         rec = None
+    if rec is None:
+        _discard_unconsumed_recording()
     try:
         try:
             history.maintain(feats=feats)

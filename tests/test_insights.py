@@ -708,3 +708,21 @@ def test_resolve_source_matches_partial_device_names(monkeypatch):
     assert hooks.resolve_source("analog-stereo")[0] == "alsa_input.pci-0000_00_1f.3.analog-stereo"
     target, note = hooks.resolve_source("usb-mic")
     assert target is None and "not found" in note
+
+
+def test_post_output_after_cancel_drops_scratch_audio_and_keeps_archive(xdg, tmp_path, monkeypatch):
+    feats = features.update({"archive": {"enabled": True, "dir": str(tmp_path / "a")}}, wire=False)
+    rec = {"id": history.new_id(), "ts": history.iso(time.time()), "final": "x", "words": 1}
+    features.atomic_write_text(history.last_record_path(), json.dumps(rec))
+    assert hooks._claim(rec["id"])  # already handled by its own post-output
+    rt = features.ensure_private_dir(features.runtime_dir() / "rec")
+    wav = rt / "1.wav"
+    wav.write_bytes(b"RIFF")
+    features.atomic_write_text(capture.rec_start_path(), json.dumps(
+        {"start": time.time(), "wav": str(wav), "recorder_pid": 0}))
+    called = []
+    monkeypatch.setattr("voxtype_tui.archive.finalize", lambda *a, **k: called.append(a))
+    hooks.on_post_output()
+    assert not wav.exists() and not capture.rec_start_path().exists()
+    assert called == []
+    _ = feats
