@@ -34,6 +34,43 @@ def _toml_equals(a: object, b: object) -> bool:
         return False
 
 
+def _is_live_config(path: Path) -> bool:
+    """True for the config the daemon reads (``config.CONFIG_PATH``).
+    Hook wiring follows the user's features.json, which only describes
+    that config — alternate configs (tests, exports) are never rewired."""
+    try:
+        return Path(path).expanduser().resolve() == Path(config.CONFIG_PATH).expanduser().resolve()
+    except OSError:
+        return False
+
+
+def _reconcile_hooks(doc: TOMLDocument, path: Path) -> bool:
+    """Apply :func:`hooks.reconcile` to ``doc``; True when it changed.
+    Fail-open: a broken features file must never block loading/saving."""
+    if not _is_live_config(path):
+        return False
+    try:
+        from . import features, hooks
+
+        return hooks.reconcile(doc, features.load()).changed
+    except Exception as e:  # pragma: no cover - defensive
+        _logger.warning("insights hook reconcile failed: %s", e)
+        return False
+
+
+def _record_managed_hooks(doc: TOMLDocument) -> None:
+    """After a successful config save, persist which hook strings are ours."""
+    try:
+        from . import features, hooks
+
+        feats = features.load()
+        plan = hooks.reconcile(tomlkit.parse(tomlkit.dumps(doc)), feats)
+        if plan.managed != (feats.get(features.MANAGED_HOOKS_KEY) or {}):
+            features.set_managed_hooks(plan.managed)
+    except Exception as e:  # pragma: no cover - defensive
+        _logger.warning("could not record managed hooks: %s", e)
+
+
 @dataclass
 class AppState:
     doc: TOMLDocument
@@ -91,6 +128,14 @@ class AppState:
         # the sync bundle uses the migrated config shape.
         migration_result = migrations.run_pending(doc, sc)
         config_dirty_from_migrations = migration_result.touches_config
+        # v4 (insights): wire the hooks the enabled features need, on the
+        # live config only, never touching a user's own hook. Upgrades get
+        # it here (dirty + stale, like every config migration); fresh
+        # installs (no metadata.json → no migrations) get it at their first
+        # save or features change, which reconcile again (DESIGN A4).
+        if raw_sc.version < 4 <= sc.version and _reconcile_hooks(doc, config_path):
+            config_dirty_from_migrations = True
+            migration_result.applied.append("insights-wire-hooks")
         sidecar_dirty_from_migrations = migration_result.new_version != raw_sc.version
 
         # If reconcile changed the sidecar, mark it dirty so the next save
@@ -339,6 +384,8 @@ class AppState:
         then pull as truth.
         """
         self._ensure_post_process_enabled()
+        if _reconcile_hooks(self.doc, self.config_path):
+            self.config_dirty = True
         baseline_doc = tomlkit.parse(self.loaded_dump)
         # Capture whether this save carries any config.toml mutation.
         # Used below to gate the broad `daemon_stale` flag — any config
@@ -350,6 +397,8 @@ class AppState:
         # the stale pill + exit-time auto-restart.
         config_touched = self.config_dirty
         config.safe_save(self.doc, self.config_path)
+        if _is_live_config(self.config_path):
+            _record_managed_hooks(self.doc)
         sidecar.save_atomic(self.sc, self.sidecar_path)
         # Both primary saves succeeded — derive and write the portable
         # bundle. A write failure here (disk full, unwritable path, etc.)

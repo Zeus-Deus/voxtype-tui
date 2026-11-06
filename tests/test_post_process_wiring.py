@@ -107,7 +107,7 @@ def test_load_migrates_v2_vocabulary_install(tmp_path: Path) -> None:
     body = '[whisper]\ninitial_prompt = "Codemux"\n'
     sc = sidecar.Sidecar(version=2, vocabulary=[sidecar.VocabEntry(phrase="Codemux")])
     state = _bootstrap(tmp_path, body, sc)
-    assert state.sc.version == 3
+    assert state.sc.version == sidecar.SCHEMA_VERSION
     assert state.config_dirty is True
     assert config.get_post_process(state.doc).get("command") == config.POSTPROCESS_COMMAND
 

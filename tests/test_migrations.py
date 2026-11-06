@@ -115,9 +115,11 @@ def test_broken_migration_does_not_brick_run(monkeypatch) -> None:
     doc = _fresh_doc()
     sc = sidecar.Sidecar(version=1)
     result = migrations.run_pending(doc, sc)
-    # broken migration produced no visible change, but version still advanced
+    # broken migration produced no visible change, and the version stops
+    # just below it so it is retried on the next load (was: advanced past
+    # it, so a transient failure was never retried).
     assert result.applied == []
-    assert sc.version == 99
+    assert sc.version == 98
 
 
 def test_version_advances_even_when_migration_noops() -> None:
@@ -133,9 +135,9 @@ def test_version_advances_even_when_migration_noops() -> None:
 # v3: enable_postprocess_for_vocabulary
 # ---------------------------------------------------------------------------
 
-def test_schema_version_is_3() -> None:
-    assert migrations.SCHEMA_VERSION == sidecar.SCHEMA_VERSION == 3
-    assert [m.target_version for m in migrations.MIGRATIONS] == [2, 3]
+def test_schema_version_is_4() -> None:
+    assert migrations.SCHEMA_VERSION == sidecar.SCHEMA_VERSION == 4
+    assert [m.target_version for m in migrations.MIGRATIONS] == [2, 3, 4]
 
 
 def test_v3_wires_postprocess_for_vocabulary_only_install() -> None:
@@ -148,7 +150,7 @@ def test_v3_wires_postprocess_for_vocabulary_only_install() -> None:
     pp = config.get_post_process(doc)
     assert pp.get("command") == config.POSTPROCESS_COMMAND
     assert pp.get("timeout_ms") == config.POSTPROCESS_TIMEOUT_MS
-    assert sc.version == 3
+    assert sc.version == migrations.SCHEMA_VERSION
 
 
 def test_v3_from_v1_with_vocabulary_only() -> None:
@@ -178,7 +180,7 @@ def test_v3_noop_without_vocabulary_or_rules() -> None:
     result = migrations.run_pending(doc, sc)
     assert result.applied == []
     assert config.get_post_process(doc) == {}
-    assert sc.version == 3
+    assert sc.version == migrations.SCHEMA_VERSION
 
 
 def test_v3_respects_user_custom_command() -> None:

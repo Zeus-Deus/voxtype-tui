@@ -167,6 +167,26 @@ RESTART_SENSITIVE_PATHS: frozenset[str] = frozenset({
     "text.replacements",
     "text.spoken_punctuation",
     "text.smart_auto_submit",
+    # Stock voxtype keys exposed in the insights release; voxtype reports
+    # every one of them as "needs restart" (`voxtype config schema`).
+    "audio.pause_media",
+    "audio.duck_media",
+    "audio.duck_media_volume_percent",
+    "audio.duck_media_fade_ms",
+    "osd.enabled",
+    "osd.frontend",
+    "osd.layout",
+    "osd.position",
+    "osd.palette",
+    "text.filter_filler_words",
+    "output.restore_clipboard",
+    "output.shift_enter_newlines",
+    "output.notification.on_recording_start",
+    "output.notification.on_recording_stop",
+    "output.notification.on_transcription",
+    "output.notification.on_no_speech",
+    "output.pre_recording_command",
+    "output.post_output_command",
 })
 
 

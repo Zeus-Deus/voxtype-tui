@@ -106,7 +106,8 @@ APPROX_CHARS_PER_TOKEN: int = 4
 # Why these specifically:
 #   * whisper.remote_api_key    — credential, full stop.
 #   * output.post_process.command, output.pre_output_command,
-#     output.post_output_command — each is an arbitrary shell command
+#     output.post_output_command, output.pre_recording_command — each is
+#     an arbitrary shell command
 #     executed by Voxtype on every transcription. A malicious bundle that
 #     set any of these to `bash -c '…'` would achieve RCE on the next
 #     recording. Treating them as secrets means (a) they are never
@@ -117,6 +118,7 @@ SECRET_PATHS: tuple[tuple[str, ...], ...] = (
     ("output", "post_process", "command"),
     ("output", "pre_output_command"),
     ("output", "post_output_command"),
+    ("output", "pre_recording_command"),
 )
 
 # Dangerous-but-not-necessarily-secret: any change to one of these requires

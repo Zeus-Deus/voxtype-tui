@@ -122,6 +122,21 @@ def _enable_postprocess_for_vocabulary(doc: TOMLDocument, sc: sidecar.Sidecar) -
     return _wire_postprocess(doc)
 
 
+def _insights_wire_hooks(doc: TOMLDocument, sc: sidecar.Sidecar) -> bool:
+    """v3 → v4: insights (usage, history, archive, learning hooks).
+
+    The wiring itself is :func:`hooks.reconcile`, which needs to know
+    whether ``doc`` is the daemon's live config (features.json describes
+    only that one), so ``AppState.load`` runs it right after this step when
+    the sidecar crosses v3 → v4. ``AppState.save`` and ``features.update``
+    reconcile again, so a fresh install without metadata.json — where no
+    migration ever runs — is wired at its first save (DESIGN A4). This
+    entry versions the schema and is the anchor L2's ``learned-*``
+    migration is appended after. Returns False: it changes nothing itself.
+    """
+    return False
+
+
 MIGRATIONS: list[Migration] = [
     Migration(
         target_version=2,
@@ -137,6 +152,15 @@ MIGRATIONS: list[Migration] = [
         apply=_enable_postprocess_for_vocabulary,
         touches_config=True,
     ),
+    Migration(
+        target_version=4,
+        name="insights-wire-hooks",
+        description="Wire usage/history/archive hooks (only absent or our own commands)",
+        apply=_insights_wire_hooks,
+        touches_config=True,
+    ),
+    # TODO(auto-learn): L2's `learned-*` migration is appended here, after
+    # insights-wire-hooks, and bumps sidecar.SCHEMA_VERSION in the merge.
 ]
 
 
@@ -164,6 +188,7 @@ def run_pending(doc: TOMLDocument, sc: sidecar.Sidecar) -> MigrationResult:
     applied: list[str] = []
     touches_config = False
     start = sc.version
+    first_failed: int | None = None
     for migration in MIGRATIONS:
         if migration.target_version <= start:
             continue
@@ -174,17 +199,23 @@ def run_pending(doc: TOMLDocument, sc: sidecar.Sidecar) -> MigrationResult:
                 "migration %s (v%d) raised %s; skipping",
                 migration.name, migration.target_version, e,
             )
+            if first_failed is None:
+                first_failed = migration.target_version
             continue
         if changed:
             applied.append(migration.name)
             if migration.touches_config:
                 touches_config = True
-    # Advance the schema version regardless of whether any migration
-    # had work to do — the version is the claim "every migration up to
-    # N has been considered", not "every migration up to N made changes".
-    sc.version = SCHEMA_VERSION
+    # Advance the schema version whether or not a migration had work to
+    # do — the version is the claim "every migration up to N has been
+    # considered", not "every migration up to N made changes". A migration
+    # that RAISED was not considered: stop the version just below it so it
+    # is retried on the next load (migrations are idempotent, so re-running
+    # the ones after it is harmless).
+    new_version = SCHEMA_VERSION if first_failed is None else max(start, first_failed - 1)
+    sc.version = new_version
     return MigrationResult(
         applied=applied,
         touches_config=touches_config,
-        new_version=SCHEMA_VERSION,
+        new_version=new_version,
     )
