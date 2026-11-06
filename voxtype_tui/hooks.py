@@ -164,23 +164,29 @@ def reconcile(doc: Any, feats: dict) -> Plan:
         recorded = plan.managed.get(key)
         cur = _get(doc, key)
         cur_s = None if cur is None else str(cur)
-        is_ours = cur_s is not None and (cur_s == ours or (recorded is not None and cur_s == recorded))
+        # A3: we only ever modify or remove a value equal to the string we
+        # recorded writing. An unrecorded value that happens to be exactly
+        # our command is adopted when wanted (no edit needed) and otherwise
+        # left alone.
+        owned = recorded is not None and cur_s == recorded
         if want[key]:
-            if cur_s is None or cur_s == "" or is_ours:
+            if cur_s is None or cur_s == "" or owned:
                 if cur_s != ours:
                     _set_output(doc, key, ours)
                     plan.changed = True
                     plan.wired.append(key)
                 plan.managed[key] = ours
+            elif cur_s == ours:
+                plan.managed[key] = ours
             else:
                 plan.foreign[key] = cur_s
                 plan.managed.pop(key, None)
         else:
-            if is_ours:
+            if owned:
                 _del_output(doc, key)
                 plan.changed = True
                 plan.unwired.append(key)
-            elif cur_s is not None and cur_s != "":
+            elif cur_s is not None and cur_s not in ("", ours):
                 plan.foreign[key] = cur_s
             plan.managed.pop(key, None)
     if want["post_process"]:
@@ -222,10 +228,14 @@ def sync_config(config_path: Path | None = None, features_file: Path | None = No
         return {"changed": False, "wired": [], "unwired": [],
                 "unavailable": availability({}, feats, {})}
     doc = config.load(path)
+    old = dict(feats.get(F.MANAGED_HOOKS_KEY) or {})
     plan = reconcile(doc, feats)
     if plan.changed:
+        # Record intent BEFORE writing config.toml, so a crash in between
+        # never leaves a hook of ours that we don't know we own.
+        F.set_managed_hooks({**old, **plan.managed}, features_file)
         config.safe_save(doc, path)
-    if plan.managed != (feats.get(F.MANAGED_HOOKS_KEY) or {}):
+    if plan.managed != F.load(features_file).get(F.MANAGED_HOOKS_KEY):
         F.set_managed_hooks(plan.managed, features_file)
     return {"changed": plan.changed, "wired": plan.wired, "unwired": plan.unwired,
             "unavailable": plan.unavailable}
@@ -243,7 +253,7 @@ def unwire_all(config_path: Path | None = None, features_file: Path | None = Non
         doc = config.load(path)
         for key in (PRE_RECORDING, POST_OUTPUT):
             cur = _get(doc, key)
-            if cur is not None and str(cur) in (OUR_COMMANDS[key], managed.get(key)):
+            if cur is not None and key in managed and str(cur) == managed[key]:
                 _del_output(doc, key)
                 changed = True
         if changed:
@@ -299,46 +309,68 @@ def _recorder_argv(binary: str, device: str, wav: str) -> list[str]:
     return argv + [wav]
 
 
-def _purge_stale_wavs(rec_dir: Path, keep: str | None = None) -> None:
+def _purge_stale(rt: Path, keep: str | None = None) -> None:
+    """Scratch of cancelled / no-speech recordings (no post-output ran)."""
+    now = time.time()
+    for pattern in ("rec/*.wav", "rec-used-*.json"):
+        try:
+            for p in rt.glob(pattern):
+                if str(p) != keep and now - p.stat().st_mtime > 600:
+                    p.unlink()
+        except OSError:
+            pass
+
+
+def resolve_source(device: str) -> tuple[str | None, str]:
+    """Map voxtype's ``audio.device`` to a PipeWire/Pulse source name.
+    Returns (target or None for the default source, note). Voxtype accepts
+    partial device names; pw-record needs a node name, so we match the
+    configured string against the source list ourselves."""
+    import subprocess
+
+    if not device or device == "default":
+        return None, "default source"
     try:
-        for p in rec_dir.glob("*.wav"):
-            if str(p) != keep and time.time() - p.stat().st_mtime > 600:
-                p.unlink()
-    except OSError:
-        pass
+        out = subprocess.run(["pactl", "list", "short", "sources"], capture_output=True,
+                             text=True, timeout=2).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    names = [line.split("\t")[1] for line in out.splitlines() if line.count("\t") >= 1]
+    names = [n for n in names if not n.endswith(".monitor")] or names
+    if device in names:
+        return device, "configured device"
+    low = device.lower()
+    for n in names:
+        if low in n.lower():
+            return n, f"matched configured device {device!r}"
+    return None, f"configured device {device!r} not found; recorded the default source"
 
 
-def _supervise(rec_pid: int, cap_s: float) -> None:
-    """Detached: stop the recorder once voxtype leaves `recording`."""
+def _supervise(proc, cap_s: float) -> None:
+    """Detached: stop the recorder once voxtype leaves `recording` (50 ms
+    polls, only while recording) or at the cap, then reap it."""
     import signal
 
     from . import capture
 
     deadline = time.time() + cap_s
-    time.sleep(0.2)
-    while time.time() < deadline:
+    if cap_s > 0:
+        time.sleep(0.2)
+    while time.time() < deadline and proc.poll() is None:
         state, _ = capture.read_state()
         if state != "recording":
             break
-        try:
-            os.kill(rec_pid, 0)
-        except OSError:
-            return
         time.sleep(0.05)
-    try:
-        os.kill(rec_pid, signal.SIGINT)
-    except OSError:
-        return
-    for _ in range(100):
+    if proc.poll() is None:
         try:
-            os.kill(rec_pid, 0)
-        except OSError:
-            return
-        time.sleep(0.05)
-    try:
-        os.kill(rec_pid, signal.SIGKILL)
-    except OSError:
-        pass
+            proc.send_signal(signal.SIGINT)  # pw-record finalizes the WAV header
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                pass
 
 
 def on_pre_recording() -> None:
@@ -362,28 +394,63 @@ def on_pre_recording() -> None:
             cfg = capture.config_info()
             rec_dir = F.ensure_private_dir(rt / "rec")
             wav = str(rec_dir / f"{int(start * 1000)}.wav")
-            _purge_stale_wavs(rec_dir, keep=wav)
+            _purge_stale(rt, keep=wav)
+            target, note = resolve_source(str(cfg.get("device", "default")))
             old_umask = os.umask(0o077)
             try:
                 proc = subprocess.Popen(
-                    _recorder_argv(binary, cfg.get("device", "default"), wav),
+                    _recorder_argv(binary, target or "default", wav),
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True,
                 )
             finally:
                 os.umask(old_umask)
-            info.update({"wav": wav, "recorder_pid": proc.pid, "recorder_started": time.time(),
-                         "device": cfg.get("device", "default"),
-                         "recorder": os.path.basename(binary)})
-            F.atomic_write_text(rt / "rec-start.json", json.dumps(info))
-            # Already detached (hook_main): supervise the recorder right here.
-            _supervise(proc.pid, float(cfg.get("max_duration_secs") or 60) + 5)
+            cap = float(cfg.get("max_duration_secs") or 60) + 5
+            try:
+                info.update({"wav": wav, "recorder_pid": proc.pid, "recorder_started": time.time(),
+                             "device": cfg.get("device", "default"), "source": target or "default",
+                             "source_note": note, "recorder": os.path.basename(binary)})
+                F.atomic_write_text(rt / "rec-start.json", json.dumps(info))
+            except BaseException:
+                cap = 0  # could not hand it off: stop the recorder now
+                raise
+            finally:
+                # Already detached (hook_main). The cap holds even when the
+                # hand-off failed, so a recorder never outlives its recording.
+                _supervise(proc, cap)
+                if cap == 0:
+                    try:
+                        os.unlink(wav)
+                    except OSError:
+                        pass
             return
         else:
             from . import history
 
             history.note_failure("archive", "pw-record not found; audio not saved")
     F.atomic_write_text(rt / "rec-start.json", json.dumps(info))
+
+
+def _claim(record_id: object) -> bool:
+    """True once per record id (atomic O_EXCL marker in the runtime dir)."""
+    if not isinstance(record_id, str) or not record_id:
+        return False
+    d = F.ensure_private_dir(F.runtime_dir() / "claimed")
+    try:
+        fd = os.open(str(d / record_id), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+    now = time.time()
+    try:
+        for p in d.iterdir():
+            if now - p.stat().st_mtime > 3600:
+                p.unlink()
+    except OSError:
+        pass
+    return True
 
 
 def on_post_output() -> None:
@@ -393,6 +460,11 @@ def on_post_output() -> None:
 
     feats = F.load()
     rec = history.latest()
+    if rec is not None and not _claim(rec.get("id")):
+        # Voxtype also runs post_output after a cancelled / no-speech
+        # recording: the newest record is then an older dictation that was
+        # already handled. Never archive or watch it twice.
+        rec = None
     try:
         try:
             history.maintain(feats=feats)

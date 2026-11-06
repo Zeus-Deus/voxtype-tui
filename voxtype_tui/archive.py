@@ -35,9 +35,9 @@ def archive_dir(feats: dict) -> Path:
     return Path(os.path.expanduser(d))
 
 
-def _rec_used() -> dict | None:
+def _rec_used(record_id: str) -> dict | None:
     try:
-        info = json.loads((F.runtime_dir() / "rec-used.json").read_text())
+        info = json.loads(capture.rec_used_path(record_id).read_text())
     except (OSError, ValueError):
         return None
     return info if isinstance(info, dict) else None
@@ -80,7 +80,9 @@ def finalize(rec: dict, feats: dict, timeout: float = 15.0) -> dict | None:
     rid = rec["id"]
     ts = history.parse_ts(rec.get("ts")) or time.time()
     rel = _rel_day(ts)
-    info = _rec_used()
+    if (root / rel / f"{rid}.json").exists():
+        return None  # already archived (claim once; never overwrite)
+    info = _rec_used(rid)
     wav_src = None
     if info and info.get("wav") and rec.get("started_at") is not None:
         if abs(float(info.get("start", 0)) - (history.parse_ts(rec["started_at"]) or 0)) < 0.01:
@@ -135,7 +137,6 @@ def finalize(rec: dict, feats: dict, timeout: float = 15.0) -> dict | None:
             except OSError:
                 pass
         try:
-            (F.runtime_dir() / "rec-used.json").unlink()
+            capture.rec_used_path(rid).unlink()  # only this record's handoff
         except OSError:
             pass
-        _ = capture  # keeps the module graph explicit for packagers

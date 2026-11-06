@@ -44,15 +44,23 @@ def _is_live_config(path: Path) -> bool:
         return False
 
 
-def _reconcile_hooks(doc: TOMLDocument, path: Path) -> bool:
+def _reconcile_hooks(doc: TOMLDocument, path: Path, *, record_intent: bool = False) -> bool:
     """Apply :func:`hooks.reconcile` to ``doc``; True when it changed.
-    Fail-open: a broken features file must never block loading/saving."""
+    With ``record_intent`` (right before a save) the hook strings about to
+    be written are recorded as ours first (DESIGN A3: never a hook of ours
+    we don't know we own). Fail-open: a broken features file must never
+    block loading/saving."""
     if not _is_live_config(path):
         return False
     try:
         from . import features, hooks
 
-        return hooks.reconcile(doc, features.load()).changed
+        feats = features.load()
+        plan = hooks.reconcile(doc, feats)
+        if record_intent and plan.changed:
+            old = dict(feats.get(features.MANAGED_HOOKS_KEY) or {})
+            features.set_managed_hooks({**old, **plan.managed})
+        return plan.changed
     except Exception as e:  # pragma: no cover - defensive
         _logger.warning("insights hook reconcile failed: %s", e)
         return False
@@ -384,7 +392,7 @@ class AppState:
         then pull as truth.
         """
         self._ensure_post_process_enabled()
-        if _reconcile_hooks(self.doc, self.config_path):
+        if _reconcile_hooks(self.doc, self.config_path, record_intent=True):
             self.config_dirty = True
         baseline_doc = tomlkit.parse(self.loaded_dump)
         # Capture whether this save carries any config.toml mutation.

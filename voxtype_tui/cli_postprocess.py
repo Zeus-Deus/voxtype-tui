@@ -243,16 +243,19 @@ def _capture(raw: str, final: str, changed_by: list[str], hits: list[str]) -> No
     if not (usage_on or hist_on or arch_on or learn_on):
         return
     now = time.time()
+    rid = history.new_id(now)
     cfg = capture.config_info()
     start_info = capture.read_rec_start()
     if start_info is not None:
+        # Hand the recording's start info to exactly this record (the
+        # archive finalizer claims rec-used-<id>.json); never reused.
         try:
-            os.replace(capture.rec_start_path(), capture.rec_start_path().with_name("rec-used.json"))
+            os.replace(capture.rec_start_path(), capture.rec_used_path(rid))
         except OSError:
             pass
     started, duration = capture.measure_duration(start_info, cfg.get("max_duration_secs") or 60)
     rec = {
-        "id": history.new_id(now),
+        "id": rid,
         "ts": history.iso(now),
         "started_at": history.iso(started) if started is not None else None,
         "duration_s": duration,
@@ -280,8 +283,14 @@ def _capture(raw: str, final: str, changed_by: list[str], hits: list[str]) -> No
     if usage_on or hist_on:
         history.enqueue(queued)
     if arch_on or learn_on:
+        # Runtime copy (RAM) for the post-output hook. Text only when a
+        # consumer that is on may keep it: the learning watcher, or the
+        # archive with "save text".
+        last = rec
+        if not (learn_on or (arch_on and feats["archive"]["save_text"])):
+            last = {k: v for k, v in rec.items() if k not in ("raw", "final")}
         features.atomic_write_text(
-            history.last_record_path(), json.dumps(rec, ensure_ascii=False),
+            history.last_record_path(), json.dumps(last, ensure_ascii=False),
         )
 
 

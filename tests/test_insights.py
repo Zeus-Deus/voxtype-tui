@@ -128,7 +128,7 @@ def test_enqueue_and_maintain_counts_usage_and_keeps_history(xdg):
     assert page["next"] is not None
     rest = history.list_items(before=page["next"], limit=2)
     assert [i["final"] for i in rest["items"]] == ["final 0"] and rest["next"] is None
-    assert history.queue_path().stat().st_size == 0
+    assert not history.queue_path().exists()  # drained (renamed away, then removed)
     for p in (history.usage_path(), history.history_path()):
         assert stat.S_IMODE(p.stat().st_mode) == 0o600
 
@@ -532,35 +532,179 @@ def test_hook_entry_returns_fast_and_work_runs_detached(xdg):
     assert r.returncode == 0
 
 
-def test_enqueue_during_drain_is_not_lost(xdg, monkeypatch):
-    """maintain() holds the queue's own flock, so an append that arrives
-    while it drains waits and survives the truncate."""
-    import threading
-
+def test_enqueue_during_drain_never_waits_and_is_not_lost(xdg, monkeypatch):
+    """maintain() renames the queue away under its flock (microseconds) and
+    drains the renamed copy, so a dictation's enqueue never waits on a
+    drain and is never truncated away (review r1 #1)."""
     history.enqueue(_rec(1))
     orig = history._update_health
-    appended = {}
+    seen = {}
 
     def slow_health(*a, **k):
-        t = threading.Thread(target=lambda: appended.setdefault("ok", history.enqueue(_rec(2))))
-        t.start()
-        time.sleep(0.3)
-        appended["alive_during_drain"] = t.is_alive()  # blocked on the queue flock
+        t = time.perf_counter()
+        seen["ok"] = history.enqueue(_rec(2))  # same process: would deadlock if locked
+        seen["ms"] = (time.perf_counter() - t) * 1000
         orig(*a, **k)
-        appended["thread"] = t
     monkeypatch.setattr(history, "_update_health", slow_health)
     history.maintain()
-    appended["thread"].join(5)
-    assert appended["alive_during_drain"] is True and appended["ok"] is True
     monkeypatch.setattr(history, "_update_health", orig)
+    assert seen["ok"] is True and seen["ms"] < 50
     assert history.summary(30)["totals"]["dictations"] == 2
+
+
+def test_crash_mid_drain_of_a_huge_batch_never_double_counts(xdg, monkeypatch):
+    monkeypatch.setattr(history, "RECENT_IDS_KEEP", 5)
+    for i in range(8):
+        history.enqueue(_rec(i))
+    batch = history.queue_path().read_bytes()
+    history.maintain()
+    history._draining_path(None).write_bytes(batch)  # crash before unlink
+    history.maintain()
+    assert history.summary(30)["totals"]["dictations"] == 8
+    assert len(history.list_items(limit=50)["items"]) == 8
+
+
+def test_get_never_returns_expired_records(xdg):
+    history.enqueue(_rec(1, ts=time.time() - 40 * 86400))
+    rid = json.loads(history.queue_path().read_text())["id"]
+    assert history.get(rid) is None
+    history.maintain()
+    assert history.get(rid) is None
 
 
 def test_delete_queued_item_keeps_count_but_drops_text(xdg):
     history.enqueue(_rec(1))
     rid = json.loads(history.queue_path().read_text())["id"]
     assert history.delete(rid) == 1
-    q = json.loads(history.queue_path().read_text())
-    assert "final" not in q and q["keep_text"] is False
+    q = history.queue_path()
+    assert not q.exists() or "final" not in q.read_text()
     assert history.summary(30)["totals"]["dictations"] == 1
     assert history.list_items()["items"] == []
+    assert history.get(rid) is None
+
+
+def test_archive_only_without_text_keeps_no_text_anywhere(xdg, monkeypatch, tmp_path):
+    """review r1 #2: archive on, save_text off, history/learning off."""
+    monkeypatch.setattr(cli_postprocess, "SIDECAR_PATH", tmp_path / "none.json")
+    features.update({"usage": {"enabled": False}, "history": {"enabled": False},
+                     "learning": {"enabled": False},
+                     "archive": {"enabled": True, "dir": str(tmp_path / "a"), "save_text": False}},
+                    wire=False)
+    assert _run_main(monkeypatch, "secret words") == "secret words"
+    last = json.loads(history.last_record_path().read_text())
+    assert "raw" not in last and "final" not in last and last["words"] == 2
+    assert not history.queue_path().exists()
+
+
+def _fake_recorder(tmp_path: Path) -> str:
+    rec = tmp_path / "bin" / "pw-record"
+    rec.parent.mkdir()
+    rec.write_text("#!/bin/sh\nexec sleep 30\n")
+    rec.chmod(0o755)
+    return str(rec)
+
+
+def test_recorder_is_stopped_when_handoff_fails(xdg, monkeypatch, tmp_path):
+    """review r1 #3: a recorder must never outlive a failed setup."""
+    import subprocess as sp
+
+    features.update({"archive": {"enabled": True, "dir": str(tmp_path / "a")}}, wire=False)
+    monkeypatch.setattr(hooks, "recorder_binary", lambda: _fake_recorder(tmp_path))
+    monkeypatch.setattr(hooks, "resolve_source", lambda d: (None, "default source"))
+    started = {}
+    real_popen = sp.Popen
+
+    def popen(*a, **k):
+        p = real_popen(*a, **k)
+        started["p"] = p
+        return p
+    monkeypatch.setattr(sp, "Popen", popen)
+    real_write = features.atomic_write_text
+
+    def failing_write(path, text):
+        if Path(path).name == "rec-start.json":
+            raise OSError("disk full")
+        return real_write(path, text)
+    monkeypatch.setattr(features, "atomic_write_text", failing_write)
+    with pytest.raises(OSError):
+        hooks.on_pre_recording()
+    assert started["p"].poll() is not None  # stopped and reaped
+
+
+def test_archive_claims_each_record_once_with_its_own_handoff(xdg, tmp_path):
+    """review r1 #4/#5: finalizer A never touches B's handoff, and a second
+    post-output for an old record never overwrites its archive entry."""
+    import wave as wv
+
+    from voxtype_tui import archive
+
+    feats = features.update({"archive": {"enabled": True, "dir": str(tmp_path / "a")}}, wire=False)
+    features.ensure_private_dir(features.runtime_dir() / "rec")
+    recs = []
+    for i in range(2):
+        start = time.time() - 5 + i
+        wav = features.runtime_dir() / "rec" / f"{i}.wav"
+        with wv.open(str(wav), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(b"\x01\x00" * 16000)
+        rid = history.new_id()[:-4] + f"{i:04x}"
+        features.atomic_write_text(capture.rec_used_path(rid), json.dumps(
+            {"start": start, "wav": str(wav), "recorder_pid": 0, "recorder_started": start + 0.04}))
+        recs.append({"id": rid, "ts": history.iso(time.time()), "started_at": history.iso(start),
+                     "duration_s": 1.0, "raw": "r", "final": "f", "words": 1})
+    entry = archive.finalize(recs[0], feats)
+    assert entry["audio"] and capture.rec_used_path(recs[1]["id"]).exists()
+    assert archive.finalize(recs[0], feats) is None  # claimed once
+    meta = json.loads((tmp_path / "a" / entry["json"]).read_text())
+    assert meta["audio"] == entry["audio"]
+    assert archive.finalize(recs[1], feats)["audio"]
+    lines = (tmp_path / "a" / "index.jsonl").read_text().splitlines()
+    assert len(lines) == 2
+    assert hooks._claim("x1") is True and hooks._claim("x1") is False
+
+
+def test_unrecorded_copy_of_our_command_is_never_removed(xdg):
+    """review r1 #7 (A3): modify/remove only the recorded string."""
+    ours = hooks.OUR_COMMANDS[hooks.PRE_RECORDING]
+    doc = _doc(f'[output]\npre_recording_command = "{ours}"\n')
+    off = features.load()
+    for k in ("usage", "history", "archive", "learning"):
+        off[k]["enabled"] = False
+    plan = hooks.reconcile(doc, off)
+    assert doc["output"]["pre_recording_command"] == ours and not plan.changed
+    plan = hooks.reconcile(doc, features.load())  # wanted: adopted, not edited
+    assert hooks.PRE_RECORDING not in plan.wired
+    assert plan.managed[hooks.PRE_RECORDING] == ours
+
+
+def test_unwire_all_leaves_unrecorded_values(live_config):
+    ours = hooks.OUR_COMMANDS[hooks.PRE_RECORDING]
+    live_config.write_text(f'[output]\npre_recording_command = "{ours}"\n')
+    assert hooks.unwire_all()["changed"] is False
+    assert ours in live_config.read_text()
+
+
+def test_apply_migrations_wires_a_fresh_install(live_config):
+    from voxtype_tui import cli_migrate
+
+    rc = cli_migrate.main(["--apply-migrations", "--config-path", str(live_config),
+                           "--sidecar-path", str(sidecar.SIDECAR_PATH), "--no-restart", "--quiet"])
+    assert rc == 0
+    assert "voxtype-tui-hook pre-recording" in live_config.read_text()
+    assert features.load()["managed_hooks"]
+
+
+def test_resolve_source_matches_partial_device_names(monkeypatch):
+    """review r1 #10: voxtype accepts partial device names; pw-record needs
+    the node name."""
+    import subprocess as sp
+
+    out = ("50\talsa_output.pci-0000_00_1f.3.analog-stereo.monitor\tPipeWire\ts32le 2ch 48000Hz\tIDLE\n"
+           "51\talsa_input.pci-0000_00_1f.3.analog-stereo\tPipeWire\ts32le 2ch 48000Hz\tIDLE\n")
+    monkeypatch.setattr(sp, "run", lambda *a, **k: sp.CompletedProcess(a, 0, out, ""))
+    assert hooks.resolve_source("default") == (None, "default source")
+    assert hooks.resolve_source("analog-stereo")[0] == "alsa_input.pci-0000_00_1f.3.analog-stereo"
+    target, note = hooks.resolve_source("usb-mic")
+    assert target is None and "not found" in note

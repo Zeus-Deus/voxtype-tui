@@ -65,13 +65,14 @@ def last_record_path() -> Path:
 # --- locking ---
 
 class _Lock:
-    """Exclusive lock for maintenance/edits: ``.lock`` for our own writers,
-    plus the queue file's own ``flock`` — the one :func:`enqueue` takes — so
-    a dictation appended mid-drain is never truncated away."""
+    """Exclusive lock for maintenance/edits (``.lock``). With ``queue=True``
+    it also takes the queue file's own ``flock`` — the one :func:`enqueue`
+    takes — for short in-place queue edits (delete/clear)."""
 
-    def __init__(self, data_dir: Path | None = None):
+    def __init__(self, data_dir: Path | None = None, *, queue: bool = False):
         self.path = _dir(data_dir) / ".lock"
         self.queue = queue_path(data_dir)
+        self.want_queue = queue
         self.fd = -1
         self.qfd = -1
 
@@ -81,6 +82,8 @@ class _Lock:
         F.ensure_private_dir(self.path.parent)
         self.fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(self.fd, fcntl.LOCK_EX)
+        if not self.want_queue:
+            return self
         try:
             self.qfd = os.open(str(self.queue), os.O_RDWR)
         except FileNotFoundError:
@@ -158,26 +161,40 @@ def note_failure(where: str, msg: str, data_dir: Path | None = None) -> None:
 def enqueue(record: dict, data_dir: Path | None = None) -> bool:
     """Append one record to the queue. Bounded: when the queue is over
     QUEUE_MAX_BYTES (nobody drained it for thousands of dictations) the
-    record is dropped and counted. Returns True when written."""
+    record is dropped and counted. Returns True when written.
+
+    The queue lock is only ever held by other writers for microseconds
+    (maintenance renames the file away and drains the renamed copy), so
+    this never waits on a drain. If the file was renamed between our open
+    and our lock, we reopen the new one."""
     import fcntl
 
     p = queue_path(data_dir)
     F.ensure_private_dir(p.parent)
     line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
-    fd = os.open(str(p), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        if os.fstat(fd).st_size + len(line) > QUEUE_MAX_BYTES:
-            dfd = os.open(str(p.parent / "dropped"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    for _ in range(5):
+        fd = os.open(str(p), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            st = os.fstat(fd)
             try:
-                os.write(dfd, b"1\n")
-            finally:
-                os.close(dfd)
-            return False
-        os.write(fd, line)
-        return True
-    finally:
-        os.close(fd)  # releases the flock
+                same = os.stat(str(p)).st_ino == st.st_ino
+            except FileNotFoundError:
+                same = False
+            if not same:
+                continue  # renamed away for draining: append to the new queue
+            if st.st_size + len(line) > QUEUE_MAX_BYTES:
+                dfd = os.open(str(p.parent / "dropped"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+                try:
+                    os.write(dfd, b"1\n")
+                finally:
+                    os.close(dfd)
+                return False
+            os.write(fd, line)
+            return True
+        finally:
+            os.close(fd)  # releases the flock
+    return False
 
 
 # --- storage ---
@@ -275,56 +292,92 @@ def _expired(rec: dict, cutoff: float | None) -> bool:
     return ts is not None and ts < cutoff
 
 
+def _draining_path(data_dir: Path | None) -> Path:
+    return _dir(data_dir) / "queue.draining.jsonl"
+
+
+def _claim_queue(data_dir: Path | None) -> None:
+    """Rename queue.jsonl -> queue.draining.jsonl under the queue's flock
+    (held for microseconds; enqueue then reopens a fresh queue file)."""
+    import fcntl
+
+    qp = queue_path(data_dir)
+    try:
+        qfd = os.open(str(qp), os.O_RDWR)
+    except FileNotFoundError:
+        return
+    try:
+        fcntl.flock(qfd, fcntl.LOCK_EX)
+        if os.fstat(qfd).st_size == 0:
+            return
+        os.rename(str(qp), str(_draining_path(data_dir)))
+    finally:
+        os.close(qfd)
+
+
 def maintain(data_dir: Path | None = None, feats: dict | None = None, now: float | None = None) -> dict:
     """Drain the queue into usage/history, prune expired history, update
-    health. Idempotent; safe to call from anywhere. Returns a small report."""
+    health. Idempotent (a crash mid-drain leaves queue.draining.jsonl,
+    which the next run finishes; ids are deduped). Never blocks enqueue
+    for longer than a rename. Returns a small report."""
     feats = feats or F.load()
     report = {"drained": 0, "pruned": 0}
-    with _Lock(data_dir) as lock:
-        qp = queue_path(data_dir)
-        records = list(_read_jsonl(qp)) if lock.qfd >= 0 else []
-        hp = history_path(data_dir)
-        if records:
-            records.sort(key=lambda r: str(r.get("id", "")))
-            u = _load_usage(data_dir)
-            # Dedupe by id, not by ordering: a clock step backwards must
-            # not drop records, and a re-drain must not double count.
-            seen = [i for i in (u.get("recent_ids") or []) if isinstance(i, str)]
-            seen_set = set(seen)
-            changed_usage = False
-            for rec in records:
-                rid = str(rec.get("id", ""))
-                if rec.get("count_usage") and rid and rid not in seen_set:
-                    _add_usage(u, rec)
-                    seen.append(rid)
-                    seen_set.add(rid)
-                    changed_usage = True
-            u["recent_ids"] = seen[-RECENT_IDS_KEEP:]
-            u.pop("last_id", None)
-            if changed_usage:
-                F.atomic_write_text(usage_path(data_dir), json.dumps(u, separators=(",", ":")) + "\n")
-            hist_ids = _history_tail_ids(hp)
-            # Text is kept only when history was on at capture time AND is
-            # still on now (turning it off drops queued text too).
-            new_items = [
-                _history_item(r) for r in records
-                if feats["history"]["enabled"] and r.get("keep_text") and "final" in r
-                and str(r.get("id", "")) not in hist_ids
-            ]
-            if new_items:
-                F.ensure_private_dir(hp.parent)
-                fd = os.open(str(hp), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-                try:
-                    os.write(fd, "".join(
-                        json.dumps(i, ensure_ascii=False, separators=(",", ":")) + "\n" for i in new_items
-                    ).encode())
-                finally:
-                    os.close(fd)
-            _update_health(data_dir, records[-1])
-            lock.rewrite_queue([])
-            report["drained"] = len(records)
+    hp = history_path(data_dir)
+    with _Lock(data_dir):
+        dp = _draining_path(data_dir)
+        for claim in (False, True):
+            if claim:
+                _claim_queue(data_dir)
+            if not dp.exists():
+                continue
+            records = list(_read_jsonl(dp))
+            if records:
+                _drain(records, data_dir, feats, hp)
+                report["drained"] += len(records)
+            dp.unlink()
         report["pruned"] = _prune(hp, feats["history"]["keep_days"], now)
     return report
+
+
+def _drain(records: list[dict], data_dir: Path | None, feats: dict, hp: Path) -> None:
+    records.sort(key=lambda r: str(r.get("id", "")))
+    u = _load_usage(data_dir)
+    # Dedupe by id, not by ordering: a clock step backwards must not drop
+    # records, and re-draining after a crash must not double count. The
+    # whole batch stays in the window, however large it is.
+    seen = [i for i in (u.get("recent_ids") or []) if isinstance(i, str)]
+    seen_set = set(seen)
+    changed_usage = False
+    for rec in records:
+        rid = str(rec.get("id", ""))
+        if rec.get("count_usage") and rid and rid not in seen_set:
+            _add_usage(u, rec)
+            seen.append(rid)
+            seen_set.add(rid)
+            changed_usage = True
+    u["recent_ids"] = seen[-max(RECENT_IDS_KEEP, len(records)):]
+    u.pop("last_id", None)
+    if changed_usage:
+        F.atomic_write_text(usage_path(data_dir), json.dumps(u, separators=(",", ":")) + "\n")
+    batch_bytes = sum(len(json.dumps(r)) for r in records)
+    hist_ids = _history_tail_ids(hp, max(262144, 2 * batch_bytes))
+    # Text is kept only when history was on at capture time AND is still on
+    # now (turning it off drops queued text too).
+    new_items = [
+        _history_item(r) for r in records
+        if feats["history"]["enabled"] and r.get("keep_text") and "final" in r
+        and str(r.get("id", "")) not in hist_ids
+    ]
+    if new_items:
+        F.ensure_private_dir(hp.parent)
+        fd = os.open(str(hp), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, "".join(
+                json.dumps(i, ensure_ascii=False, separators=(",", ":")) + "\n" for i in new_items
+            ).encode())
+        finally:
+            os.close(fd)
+    _update_health(data_dir, records[-1])
 
 
 def _history_item(rec: dict) -> dict:
@@ -457,15 +510,19 @@ def list_items(before: str | None = None, limit: int = 20, data_dir: Path | None
 
 
 def get(record_id: str, data_dir: Path | None = None) -> dict | None:
+    """A record by id (history, queue or the runtime copy of the newest
+    one). Expired records are never returned."""
+    cutoff = _cutoff(F.load()["history"]["keep_days"])
     rec = _read_last()
-    if rec and rec.get("id") == record_id:
+    if rec and rec.get("id") == record_id and not _expired(rec, cutoff):
         return rec
     for item in _read_jsonl(history_path(data_dir)):
         if item.get("id") == record_id:
-            return item
-    for item in _read_jsonl(queue_path(data_dir)):
-        if item.get("id") == record_id and "final" in item:
-            return _history_item(item)
+            return None if _expired(item, cutoff) else item
+    for p in (queue_path(data_dir), _draining_path(data_dir)):
+        for item in _read_jsonl(p):
+            if item.get("id") == record_id and "final" in item and not _expired(item, cutoff):
+                return _history_item(item)
     return None
 
 
@@ -491,7 +548,8 @@ def latest(max_age_s: float = 120.0) -> dict | None:
 
 
 def delete(record_id: str, data_dir: Path | None = None) -> int:
-    with _Lock(data_dir) as lock:
+    maintain(data_dir)  # nothing left in queue.draining.jsonl afterwards
+    with _Lock(data_dir, queue=True) as lock:
         removed = 0
         hp = history_path(data_dir)
         items = list(_read_jsonl(hp))
@@ -521,7 +579,8 @@ def _strip_text(rec: dict) -> dict:
 
 
 def clear(data_dir: Path | None = None) -> int:
-    with _Lock(data_dir) as lock:
+    maintain(data_dir)
+    with _Lock(data_dir, queue=True) as lock:
         hp = history_path(data_dir)
         n = sum(1 for _ in _read_jsonl(hp))
         if lock.qfd >= 0:

@@ -48,6 +48,10 @@ def rec_start_path() -> Path:
     return F.runtime_dir() / "rec-start.json"
 
 
+def rec_used_path(record_id: str) -> Path:
+    return F.runtime_dir() / f"rec-used-{record_id}.json"
+
+
 def config_path() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     return Path(base) / "voxtype" / "config.toml"
