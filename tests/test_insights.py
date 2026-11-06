@@ -331,10 +331,25 @@ def test_reconcile_upgrades_a_recorded_older_string(xdg):
 def test_wired_command_is_uninstall_safe():
     import subprocess
 
-    env = {"PATH": "/usr/bin:/bin"}  # no voxtype-tui-hook on this PATH
+    env = {"PATH": "/usr/bin:/bin"}  # no voxtype-tui-* on this PATH
     for cmd in hooks.OUR_COMMANDS.values():
         r = subprocess.run(["sh", "-c", cmd], env=env, capture_output=True, timeout=5)
         assert r.returncode == 0 and r.stdout == b"" and r.stderr == b""
+    # post_process: voxtype writes the transcript to stdin and dies of
+    # SIGPIPE if the command exits without reading it; the wired form
+    # passes the text through unchanged when the CLI is gone.
+    r = subprocess.run(["sh", "-c", config.POSTPROCESS_COMMAND], env=env,
+                       input=b"keep this text", capture_output=True, timeout=5)
+    assert r.returncode == 0 and r.stdout == b"keep this text" and r.stderr == b""
+
+
+def test_legacy_postprocess_command_is_ours_and_upgraded(xdg):
+    doc = _doc('[output]\n[output.post_process]\ncommand = "voxtype-tui-postprocess"\ntimeout_ms = 5000\n')
+    assert config.is_our_post_process(doc)
+    plan = hooks.reconcile(doc, features.load())
+    assert doc["output"]["post_process"]["command"] == config.POSTPROCESS_COMMAND
+    assert "output.post_process.command" in plan.wired
+    assert "usage" not in plan.unavailable
 
 
 def test_sync_config_and_unwire_all_roundtrip(live_config):

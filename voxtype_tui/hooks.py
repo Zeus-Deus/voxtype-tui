@@ -129,7 +129,7 @@ def availability(doc: Any, feats: dict, foreign: dict[str, str] | None = None) -
                 foreign[key] = str(cur)
     reasons: dict[str, str] = {}
     pp = config.get_post_process(doc).get("command")
-    pp_foreign = bool(pp) and str(pp) != config.POSTPROCESS_COMMAND
+    pp_foreign = bool(pp) and not config.is_our_post_process_command(pp)
     if pp_foreign:
         why = "your own post-processing command is set"
         reasons["usage"] = why

@@ -75,7 +75,7 @@ def _wire_postprocess(doc: TOMLDocument) -> bool:
     Returns True when the doc changed."""
     pp = config.get_post_process(doc)
     existing = pp.get("command")
-    if existing and existing != config.POSTPROCESS_COMMAND:
+    if existing and not config.is_our_post_process_command(existing):
         return False
     want_timeout = config.POSTPROCESS_TIMEOUT_MS
     if existing == config.POSTPROCESS_COMMAND and pp.get("timeout_ms") == want_timeout:

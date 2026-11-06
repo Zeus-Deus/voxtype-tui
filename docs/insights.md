@@ -54,9 +54,14 @@ The files are created 0600 in 0700 directories. None of them are in `sync.json` 
 voxtype-tui sets these Voxtype settings only when a switch needs them, and only
 if you have not set them yourself:
 
-- `[output.post_process] command = "voxtype-tui-postprocess"` (as before for vocabulary
-  and dictionary users). It is the only program that sees the text. After the
-  existing stages it adds one line to the queue (about 0.3 ms).
+- `[output.post_process] command` runs `voxtype-tui-postprocess`, as before for vocabulary
+  and dictionary users. It is the only program that sees the text. After the
+  existing stages it adds one line to the queue (about 0.3 ms). The command is
+  `command -v voxtype-tui-postprocess >/dev/null 2>&1 && exec voxtype-tui-postprocess; exec cat`.
+  If voxtype-tui is removed, `cat` passes the text through unchanged. A bare
+  command that exits without reading the text can kill the Voxtype 1.1.1 daemon
+  (SIGPIPE, measured), so the old bare `voxtype-tui-postprocess` value is
+  upgraded to this form when voxtype-tui rewires.
 - `pre_recording_command`, for usage, history or archive: it notes when recording
   started (for measured durations) and which window was focused, and starts the
   archive recorder. Voxtype starts capturing before it runs this hook, so the hook
