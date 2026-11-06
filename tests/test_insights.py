@@ -30,6 +30,15 @@ def xdg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _no_learning_watcher(monkeypatch: pytest.MonkeyPatch):
+    """Tests decide whether L2's watcher module exists (it changes whether
+    post_output is wired for learning)."""
+    real = hooks._module_exists
+    monkeypatch.setattr(hooks, "_module_exists",
+                        lambda name: False if name == "voxtype_tui.learn_watch" else real(name))
+
+
 @pytest.fixture
 def live_config(xdg: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A config.toml that AppState treats as the daemon's live config."""
@@ -254,6 +263,18 @@ def test_reconcile_wires_needed_hooks_and_is_idempotent(xdg):
     before = tomlkit.dumps(doc)
     again = hooks.reconcile(doc, feats)
     assert not again.changed and tomlkit.dumps(doc) == before
+
+
+def test_learning_watcher_wires_post_output_only_when_installed(xdg, monkeypatch):
+    doc = _doc()
+    monkeypatch.setattr(hooks, "_module_exists", lambda name: True)
+    hooks.reconcile(doc, features.load())
+    assert doc["output"]["post_output_command"] == hooks.OUR_COMMANDS[hooks.POST_OUTPUT]
+    feats = features.load()
+    feats["learning"]["enabled"] = False
+    feats["managed_hooks"] = {hooks.POST_OUTPUT: hooks.OUR_COMMANDS[hooks.POST_OUTPUT]}
+    hooks.reconcile(doc, feats)
+    assert "post_output_command" not in doc["output"]
 
 
 def test_reconcile_archive_wires_post_output(xdg):
