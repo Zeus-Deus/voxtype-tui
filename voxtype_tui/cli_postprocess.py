@@ -35,7 +35,6 @@ import json
 import os
 import sys
 import time
-import traceback
 from pathlib import Path
 
 from . import vocab_corrector
@@ -129,6 +128,8 @@ def _load_rules(
 
 def _passthrough_note() -> None:
     if os.environ.get("VOXTYPE_TUI_POSTPROCESS_DEBUG"):
+        import traceback  # lazy: ~9 ms of startup on every dictation otherwise
+
         traceback.print_exc(file=sys.stderr)
     else:
         sys.stderr.write("voxtype-tui-postprocess: passthrough on error\n")

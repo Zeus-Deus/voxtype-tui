@@ -37,9 +37,11 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Any
 
 from . import features as F
 
@@ -100,14 +102,17 @@ def _get(doc: Any, dotted: str) -> Any:
     return node
 
 
-@dataclass
 class Plan:
-    changed: bool = False
-    managed: dict[str, str] = field(default_factory=dict)
-    wired: list[str] = field(default_factory=list)
-    unwired: list[str] = field(default_factory=list)
-    foreign: dict[str, str] = field(default_factory=dict)  # hook path -> current value
-    unavailable: dict[str, str] = field(default_factory=dict)  # feature -> reason
+    """Result of :func:`reconcile` (plain class: dataclasses costs ~8 ms of
+    import time in the per-dictation hook process)."""
+
+    def __init__(self, managed: dict[str, str] | None = None):
+        self.changed = False
+        self.managed: dict[str, str] = dict(managed or {})
+        self.wired: list[str] = []
+        self.unwired: list[str] = []
+        self.foreign: dict[str, str] = {}  # hook path -> current value
+        self.unavailable: dict[str, str] = {}  # feature -> reason
 
 
 def availability(doc: Any, feats: dict, foreign: dict[str, str] | None = None) -> dict[str, str]:
@@ -280,28 +285,6 @@ def _hypr_active_window() -> dict | None:
             "address": w.get("address")}
 
 
-def _detach() -> bool:
-    """Double-fork. Returns True in the detached grandchild, False in the
-    original process (which should return promptly)."""
-    pid = os.fork()
-    if pid > 0:
-        os.waitpid(pid, 0)
-        return False
-    try:
-        os.setsid()
-        if os.fork() > 0:
-            os._exit(0)
-        devnull = os.open(os.devnull, os.O_RDWR)
-        # Voxtype waits on the hook's stdio; never hold its pipes open.
-        for fd in (0, 1, 2):
-            os.dup2(devnull, fd)
-        if devnull > 2:
-            os.close(devnull)
-        return True
-    except Exception:
-        os._exit(0)
-
-
 def _recorder_argv(binary: str, device: str, wav: str) -> list[str]:
     name = os.path.basename(binary)
     if name == "parec":
@@ -393,12 +376,8 @@ def on_pre_recording() -> None:
                          "device": cfg.get("device", "default"),
                          "recorder": os.path.basename(binary)})
             F.atomic_write_text(rt / "rec-start.json", json.dumps(info))
-            cap = float(cfg.get("max_duration_secs") or 60) + 5
-            if _detach():
-                try:
-                    _supervise(proc.pid, cap)
-                finally:
-                    os._exit(0)
+            # Already detached (hook_main): supervise the recorder right here.
+            _supervise(proc.pid, float(cfg.get("max_duration_secs") or 60) + 5)
             return
         else:
             from . import history
@@ -408,12 +387,12 @@ def on_pre_recording() -> None:
 
 
 def on_post_output() -> None:
+    """Runs in the detached process (see hook_main): voxtype waits for this
+    hook before it goes idle, so nothing here may run in the hook itself."""
     from . import history
 
     feats = F.load()
     rec = history.latest()
-    if not _detach():
-        return
     try:
         try:
             history.maintain(feats=feats)
@@ -442,8 +421,8 @@ def on_post_output() -> None:
                 pass
             except Exception as e:
                 history.note_failure("learn_watch", str(e))
-    finally:
-        os._exit(0)
+    except Exception as e:
+        history.note_failure("post-output", repr(e))
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -486,3 +486,26 @@ def test_failed_migration_does_not_advance_past_it(monkeypatch):
 def test_pre_recording_command_is_a_dangerous_secret():
     assert ("output", "pre_recording_command") in sync.SECRET_PATHS
     assert ("output", "pre_recording_command") in sync.DANGEROUS_PATHS
+
+
+def test_hook_entry_returns_fast_and_work_runs_detached(xdg):
+    import subprocess
+    import sys
+
+    repo = Path(__file__).resolve().parent.parent
+    env = dict(os.environ, PYTHONPATH=str(repo))
+    t = time.perf_counter()
+    r = subprocess.run([sys.executable, "-m", "voxtype_tui.hook_main", "pre-recording"],
+                       env=env, capture_output=True, timeout=10, cwd=str(repo))
+    elapsed = time.perf_counter() - t
+    assert r.returncode == 0 and r.stdout == b"" and r.stderr == b""
+    for _ in range(100):
+        if capture.rec_start_path().exists():
+            break
+        time.sleep(0.05)
+    info = json.loads(capture.rec_start_path().read_text())
+    assert abs(info["start"] - time.time()) < 10
+    assert elapsed < 5
+    r = subprocess.run([sys.executable, "-m", "voxtype_tui.hook_main", "bogus"],
+                       env=env, capture_output=True, timeout=10, cwd=str(repo))
+    assert r.returncode == 0

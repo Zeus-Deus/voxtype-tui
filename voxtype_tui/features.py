@@ -18,13 +18,15 @@ from __future__ import annotations
 import copy
 import json
 import os
-import tempfile
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # typing costs startup time in the per-dictation hooks
+    from typing import Any
 
 VERSION = 1
 
-DEFAULTS: dict[str, Any] = {
+DEFAULTS: "dict[str, Any]" = {
     "version": VERSION,
     "usage": {"enabled": True, "typing_wpm": 40},
     "history": {"enabled": True, "keep_days": 30},
@@ -52,8 +54,9 @@ def data_dir() -> Path:
 def runtime_dir() -> Path:
     base = os.environ.get("XDG_RUNTIME_DIR")
     if not base:
-        base = os.path.join(tempfile.gettempdir(), f"voxtype-tui-{os.getuid()}")
-        return Path(base)
+        import tempfile
+
+        return Path(tempfile.gettempdir()) / f"voxtype-tui-{os.getuid()}"
     return Path(base) / "voxtype-tui"
 
 
@@ -74,6 +77,8 @@ def ensure_private_dir(path: Path) -> Path:
 
 def atomic_write_text(path: Path, text: str) -> None:
     """Write ``text`` to ``path`` atomically with mode 0600."""
+    import tempfile
+
     ensure_private_dir(path.parent)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
     try:
