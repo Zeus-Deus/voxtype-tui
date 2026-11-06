@@ -366,7 +366,7 @@ def test_r1_same_letters_spelling_applies():
 def test_r1_fail_open_returns_original_input():
     L.compiled_path().parent.mkdir(parents=True, exist_ok=True)
     L.compiled_path().write_text(json.dumps({"aliases": {"omashi": ["Omarchy", "l_x"]},
-                                             "max_n": 1, "terms": [[None, 1]]}))
+                                             "max_n": 1, "terms": 5}))  # aliases ok, terms broken
     assert L.apply("on Omashi") == ("on Omashi", [])
 
 
@@ -390,3 +390,81 @@ def test_import_does_not_pull_write_only_modules():
             "import voxtype_tui.learned; print(sorted(set(sys.modules)-before))")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
     assert "tempfile" not in out and "secrets" not in out, out
+
+
+def test_many_user_phrases_stay_cheap():
+    import subprocess, sys
+    L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")
+    code = (
+        "import time; from voxtype_tui import learned as L\n"
+        "ph=['Term%03dX Labs' % i for i in range(200)] + ['Omashi Labs']\n"
+        "t=('today we are going to build something great with computers and the default dictation '"
+        "'option on Omashi is really quite good for writing ')*2\n"
+        "a=time.perf_counter(); out=L.apply(t, user_phrases=ph); print((time.perf_counter()-a)*1000)\n")
+    ms = float(subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                              check=True, env=dict(os.environ)).stdout.strip())
+    assert ms < 3.0, ms
+
+
+# ---------------------------------------------------------------- review r2 regressions
+
+def test_r2_correct_multiword_term_is_not_duplicated():
+    L.submit_correction(rec("I use Omashi OS daily"), "I use Omarchy OS daily", "fix", kind="spelling")
+    assert L.apply("I use Omarchy OS daily")[0] == "I use Omarchy OS daily"
+
+
+def test_r2_three_word_spelling_matches_whole_span():
+    out = L.submit_correction(rec("please open visual studio coat now for me today"),
+                              "please open Visual Studio Code now for me today", "fix", kind="spelling")
+    assert out["applied"], out
+    assert L.apply("open visual studio code now")[0] == "open Visual Studio Code now"
+
+
+def test_r2_no_wordlist_disables_fuzzy_but_keeps_same_letters(monkeypatch):
+    L.submit_correction(rec("I read Austin yesterday"), "I read Austen yesterday", "fix")
+    L.submit_correction(rec("we use code mux daily", "r2"), "we use Codemux daily", "fix")
+    monkeypatch.setattr(vocab_corrector, "_words", None)
+    monkeypatch.setattr(L, "_WORDS_FILE", Path("/nonexistent/words"))
+    assert L.apply("I flew to Austin today")[0] == "I flew to Austin today"
+    assert L.apply("I flew to Austun today")[0] == "I flew to Austun today"
+    assert L.apply("ship code mux")[0] == "ship Codemux"
+
+
+def test_r2_unicode_attached_text_is_kept():
+    L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")
+    assert L.apply("I use Omarchy\u4e2d\u6587 daily")[0] == "I use Omarchy\u4e2d\u6587 daily"
+    assert L.apply("I use Omachi\u4e2d daily")[0] == "I use Omachi\u4e2d daily"
+
+
+@pytest.mark.parametrize("text", ["https://example.org/search?q=hello+omashi", "x?q=omashi&y=1",
+                                  "~/omashi/notes", "./omashi.sh"])
+def test_r2_whole_urls_and_paths_are_protected(text):
+    L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")
+    assert L.apply(text)[0] == text
+
+
+def test_r2_question_mark_and_comma_still_apply():
+    L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")
+    assert L.apply("Is this Omashi? Omashi, please.")[0] == "Is this Omarchy? Omarchy, please."
+
+
+def test_r2_many_spelling_terms_stay_bounded():
+    import subprocess, sys
+    store = {"version": 1, "entries": []}
+    import random
+    random.seed(3)
+    for i in range(200):
+        w = "".join(random.choice("bcdfgklmnprstv") + random.choice("aeiou") for _ in range(4)).capitalize()
+        store["entries"].append({"id": f"l_{i:04x}", "kind": "spelling", "written": w, "heard": [w + "x"],
+                                 "aliases": [], "state": "active", "source": "fix", "count": 1, "hits": 0,
+                                 "first_seen": "2026-11-06T00:00:00Z", "last_seen": "2026-11-06T00:00:00Z",
+                                 "decided_at": None})
+    with L._locked():
+        L._save(store)
+    code = ("import time; from voxtype_tui import learned as L\n"
+            "t=('today we are going to build something great with computers and the default dictation '"
+            "'option on Bakemo is really quite good for writing letters to people we know ')*2\n"
+            "a=time.perf_counter(); L.apply(t); print((time.perf_counter()-a)*1000)\n")
+    runs = sorted(float(subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                                       check=True, env=dict(os.environ)).stdout) for _ in range(5))
+    assert runs[2] < 3.0, runs

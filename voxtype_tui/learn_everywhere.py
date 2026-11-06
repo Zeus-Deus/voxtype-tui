@@ -249,6 +249,10 @@ def _plan(enable: bool) -> list[dict]:
     else:
         for p, rec in st["files"].items():
             path = Path(p)
+            if path.is_symlink():
+                plan.append({"path": path, "action": "none", "old": None, "new": None, "rec": rec,
+                             "reason": f"now a symlink; remove the {FLAG} line yourself"})
+                continue
             curp = _read(path)
             if curp is None:
                 plan.append({"path": path, "action": "none", "old": None, "new": None,
@@ -319,18 +323,53 @@ def _set_bus_enabled(value: bool) -> None:
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def _manager_env() -> dict[str, str] | None:
+    try:
+        p = subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True,
+                           text=True, timeout=5, check=False)
+    except Exception:
+        return None
+    if p.returncode != 0:
+        return None
+    env = {}
+    for line in p.stdout.splitlines():
+        k, sep, v = line.partition("=")
+        if sep:
+            env[k] = v
+    return env
+
+
+def _systemctl(*args: str) -> None:
+    with contextlib.suppress(Exception):
+        subprocess.run(["systemctl", "--user", *args], timeout=5, check=False,
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+
+
 def _session_env(enable: bool, st: dict) -> None:
-    """Live-session convenience (not persisted). Records what it changed in
-    ``st`` so disable only undoes our own change."""
+    """Live-session convenience (not persisted). Records the previous values
+    in ``st`` and, on disable, restores only what is still our value."""
     if os.environ.get("VOXTYPE_TUI_SYSTEMCTL") == "0" or not _which("systemctl"):
         return
-    with contextlib.suppress(Exception):
-        if enable:
-            argv = ["systemctl", "--user", "set-environment"] + [f"{k}={v}" for k, v in ENV_VARS]
-        else:
-            argv = ["systemctl", "--user", "unset-environment"] + [k for k, _ in ENV_VARS]
-        subprocess.run(argv, timeout=5, check=False, stdin=subprocess.DEVNULL,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ours = dict(ENV_VARS)
+    if enable:
+        cur = _manager_env()
+        if cur is not None:
+            prev = st.get("session_env_prev")
+            if not isinstance(prev, dict):  # keep the first, pre-enable values
+                st["session_env_prev"] = {k: cur.get(k) for k in ours}
+            _systemctl("set-environment", *[f"{k}={v}" for k, v in ENV_VARS])
+    else:
+        prev = st.pop("session_env_prev", None)
+        cur = _manager_env() if isinstance(prev, dict) else None
+        if isinstance(prev, dict) and cur is not None:
+            unset = [k for k, v in ours.items() if cur.get(k) == v and prev.get(k) is None]
+            reset = [f"{k}={prev[k]}" for k, v in ours.items()
+                     if cur.get(k) == v and isinstance(prev.get(k), str)]
+            if unset:
+                _systemctl("unset-environment", *unset)
+            if reset:
+                _systemctl("set-environment", *reset)
     if not _which("busctl"):
         return
     if enable:

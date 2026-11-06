@@ -105,3 +105,14 @@ def test_on_post_output_binds_delivery_window(tmp_path, monkeypatch):
     W.on_post_output({"id": "r1", "final": "hello", "app": {"class": "old", "address": "0x9"}})
     assert seen["r"]["delivery_window"] == {"address": "0x1", "pid": 7, "class": "foot"}
     assert seen["r"]["app"]["class"] == "foot"
+
+
+def test_r2_hook_window_is_the_binding(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    monkeypatch.setattr(W, "active_window", lambda: {"class": "B", "pid": 8, "address": "0xb"})
+    seen = {}
+    monkeypatch.setattr(W, "watch", lambda final, window, record: seen.update(w=window, r=record) or {"ok": False})
+    W.on_post_output({"id": "r1", "final": "hello"}, window={"class": "A", "pid": 7, "address": "0xa"})
+    assert seen["r"]["delivery_window"]["address"] == "0xa"   # bound to the delivery window
+    assert seen["w"]["address"] == "0xb"   # watch() gets the current window and refuses (r1 test)

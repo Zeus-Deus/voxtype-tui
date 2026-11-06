@@ -39,6 +39,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -65,14 +66,13 @@ CONTEXT_CHARS = 60
 # fuzzy corrector costs ~40 us per term per 60 words, so only the best
 # ranked terms that could plausibly match the text are handed to it.
 MAX_ALIASES = 2000
-MAX_FUZZY_TERMS = 200        # active terms kept in the compiled file
+MAX_FUZZY_TERMS = 120        # active terms kept in the compiled file (ranked)
 MAX_FUZZY_PER_TEXT = 12      # terms actually passed to the corrector per text
 MAX_TEXT_CHARS = 50_000
 
-PASSWORD_MANAGER_CLASSES = re.compile(
+PASSWORD_MANAGER_PATTERN = (
     r"1password|bitwarden|keepass|keepassxc|enpass|lastpass|proton\s*pass|"
-    r"passwordsafe|gnome-keyring|seahorse|kwallet|pinentry",
-    re.IGNORECASE,
+    r"passwordsafe|gnome-keyring|seahorse|kwallet|pinentry"
 )
 
 _WORD = re.compile(r"[^\W_]+(?:['\u2019\-][^\W_]+)*", re.UNICODE)
@@ -277,7 +277,8 @@ def similarity(heard: str, written: str) -> float:
 
 
 def is_password_manager(app_class: object) -> bool:
-    return isinstance(app_class, str) and bool(PASSWORD_MANAGER_CLASSES.search(app_class))
+    return isinstance(app_class, str) and bool(
+        re.search(PASSWORD_MANAGER_PATTERN, app_class, re.IGNORECASE))
 
 
 # ---------------------------------------------------------------- diff
@@ -753,7 +754,8 @@ def _compile(store: dict) -> dict:
                     max_n = max(max_n, len(key.split()))
         if e["kind"] in ("sounds_like", "spelling") and len(terms) < MAX_FUZZY_TERMS:
             if e["written"].isascii() and len(squash(e["written"])) >= 4:
-                terms.append([e["written"], e["id"]])
+                w = e["written"]
+                terms.append([w, e["id"], squash(w), len(w.split()), _skeleton(w)])
     return {"version": 1, "aliases": aliases, "max_n": max_n, "terms": terms}
 
 
@@ -816,16 +818,29 @@ def _phrase_spans(text: str, phrases: Iterable[str]) -> list[tuple[int, int]]:
     must never rewrite inside them. Offsets are taken on ``text`` itself
     (lowercasing can change string length for some Unicode letters)."""
     spans = []
+    low = text.lower()
     for p in phrases:
         if not isinstance(p, str) or not p.strip():
             continue
-        for m in re.finditer(re.escape(p.strip()), text, re.IGNORECASE):
+        p = p.strip()
+        # cheap C-level pre-filter; only phrases that occur pay for a regex
+        if p.lower() not in low and p.casefold() not in text.casefold():
+            continue
+        for m in re.finditer(re.escape(p), text, re.IGNORECASE):
             i, j = m.start(), m.end()
             left = i == 0 or not text[i - 1].isalnum()
             right = j >= len(text) or not text[j].isalnum()
             if left and right:
                 spans.append((i, j))
     return spans
+
+
+# A whitespace-delimited chunk that is a URL, path, e-mail or query string is
+# protected as a whole ("https://x.org/s?q=hello+omashi", "~/omashi/x").
+_URLISH = re.compile(
+    r"\S*(?:://|www\.|\w[/\\@]\w|[?&]\w+=)\S*"   # URL, a/b path, e-mail, query
+    r"|(?<!\S)(?:~|\.{1,2})?/\S+"                  # /abs, ~/x, ./x
+)
 
 
 def _url_like(text: str, a: int, b: int) -> bool:
@@ -862,6 +877,7 @@ def apply(text: str, protected_spans: Iterable[tuple[int, int]] = (), *,
             return text, []
         prot = [(int(a), int(b)) for a, b in protected_spans]
         prot += _phrase_spans(text, user_phrases)
+        prot += [m.span() for m in _URLISH.finditer(text)]
         hits: list[str] = []
         text, prot = _apply_aliases(text, comp, prot, hits)
         text = _apply_terms(text, comp, prot, hits)
@@ -936,15 +952,19 @@ def _apply_aliases(text: str, comp: dict, prot: list[tuple[int, int]],
 _WORDS_FILE = Path("/usr/share/cracklib/cracklib-small")  # byte-sorted, lowercase
 
 
-def _english_word(w: str) -> bool:
-    """Is ``w`` an ordinary English word? Uses the corrector's wordlist when
-    this process already loaded it, else a binary search in the sorted
-    cracklib file (no ~9 ms load on the post-process path)."""
+def _english_word(w: str) -> bool | None:
+    """Is ``w`` an ordinary English word? ``None`` when no wordlist is
+    available. Uses the corrector's wordlist when this process already
+    loaded it, else a binary search in the sorted cracklib file (no ~9 ms
+    load on the post-process path)."""
     w = w.lower().strip("'\u2019")
     try:
         from . import vocab_corrector as vc
         if vc._words is not vc._UNLOADED:
-            return vc._words is not None and w in vc._words  # type: ignore[operator]
+            return None if vc._words is None else w in vc._words  # type: ignore[operator]
+        if not _WORDS_FILE.is_file():
+            words = _wordlist()
+            return None if words is None else w in words
         import mmap
         with open(_WORDS_FILE, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
             key = w.encode()
@@ -961,74 +981,126 @@ def _english_word(w: str) -> bool:
             le = mm.find(b"\n", lo)
             return mm[lo:(len(mm) if le < 0 else le)] == key
     except Exception:
-        words = _wordlist()
-        return bool(words) and w in words  # type: ignore[operator]
+        return None
+
+
+MAX_FUZZY_PAIRS = 150  # bound on similarity computations per dictation
 
 
 def _apply_terms(text: str, comp: dict, prot: list[tuple[int, int]], hits: list[str]) -> str:
-    """Fuzzy stage for learned spellings: the vocabulary corrector's rules,
-    restricted to spans of 1-2 tokens outside protected text."""
+    """Fuzzy stage for learned spellings: the vocabulary corrector's rules
+    (same thresholds, plural/hyphen/English guards, ASCII only), for spans of
+    the term's own width or one less (multi-word terms) / 1-2 tokens
+    (single words), outside protected text."""
     terms = comp.get("terms") or []
     if not terms:
         return text
     toks = list(_WORD.finditer(text))
     if not toks:
         return text
-    spans = []  # (a, b, squashed, n_tokens, [token texts])
+    clean = []
+    widths_needed = {1, 2}
+    for t in terms[:MAX_FUZZY_TERMS]:
+        if not isinstance(t, (list, tuple)) or not t or not isinstance(t[0], str):
+            continue
+        written, eid = t[0], t[1] if len(t) > 1 else None
+        if len(t) >= 5:
+            tq, n, tk = t[2], int(t[3]), t[4]
+        else:  # older compiled file
+            tq, n, tk = squash(written), len(written.split()), None
+        if not tq:
+            continue
+        clean.append((written, eid, tq, n, tk))
+        if n > 1:
+            widths_needed.update({n - 1, n})
+    if not clean:
+        return text
+    max_w = min(MAX_SPAN_TOKENS, max(widths_needed))
+    # spans bucketed by (first letter, squashed length)
+    buckets: dict[tuple[str, int], list[tuple]] = {}
     for i in range(len(toks)):
-        for w in (1, 2):
+        for w in range(1, max_w + 1):
             if i + w > len(toks):
                 break
             g = toks[i:i + w]
-            if w == 2 and not text[g[0].end():g[1].start()].isspace():
-                continue
+            if not all(text[g[k].end():g[k + 1].start()].isspace() for k in range(w - 1)):
+                break
             a, b = g[0].start(), g[-1].end()
+            span = text[a:b]
+            if not span.isascii():
+                break  # Unicode letters/marks: the ASCII matcher keeps out
+            nb = text[max(0, a - 1):a] + text[b:b + 1]
+            if any(not c.isascii() and (c.isalnum() or unicodedata.category(c).startswith("M"))
+                   for c in nb):
+                continue
             if _overlaps(a, b, prot) or _url_like(text, a, b):
                 continue
             words = [x.group(0) for x in g]
-            if w == 2 and (words[0].lower() in _STOP or words[1].lower() in _STOP):
+            if w >= 2 and (words[0].lower() in _STOP or words[-1].lower() in _STOP):
                 continue
-            sq = squash(text[a:b])
+            sq = squash(span)
             if sq:
-                spans.append((a, b, sq, w, words))
-    if not spans:
+                buckets.setdefault((sq[0], len(sq)), []).append((a, b, sq, w, words))
+    if not buckets:
         return text
-    by_first: dict[str, list[tuple]] = {}
-    for sp in spans:
-        by_first.setdefault(sp[2][0], []).append(sp)
     cands = []
-    for written, eid in terms[:MAX_FUZZY_TERMS]:
-        tq = squash(written)
-        if not tq:
-            continue
-        n = len(written.split())
+    budget = MAX_FUZZY_PAIRS
+    skel_cache: dict[str, str] = {}
+    picked = 0
+    for written, eid, tq, n, tk in clean:
+        widths = (n - 1, n) if n > 1 else (1, 2)
         tol = max(2, len(tq) // 3)
-        tk = None
-        for a, b, sq, w, words in by_first.get(tq[0], ()):
-            if w > max(2, n):
-                continue
-            if sq == tq:
-                if text[a:b] != written:
-                    cands.append((2, w, 2.0, a, b, written, eid))  # casing/spacing
-                continue
-            if sq in (tq + "s", tq + "es") or len(sq) < 5 or abs(len(sq) - len(tq)) > tol:
-                continue
-            if w == 1 and "-" in words[0]:
-                continue
-            sm = SequenceMatcher(None, sq, tq)
-            if sm.quick_ratio() < 0.6:
-                continue
-            r1 = sm.ratio()
-            tk = tk or _skeleton(written)
-            score = max(r1, 0.95 * SequenceMatcher(None, _skeleton(text[a:b]), tk).ratio())
-            need = 0.88 if len(tq) <= 6 else 0.80
-            if w > n:
-                need = max(need, 0.85)
-            if score < need:
-                continue
-            if all(_english_word(x) for x in words) and not (w >= 2 and n >= 2):
-                continue  # real English ("cloud", "preset") is never fuzzed
-            cands.append((1, w, score, a, b, written, eid))
+        f0 = tq[0]
+        sm = None
+        matched = False
+        lens = sorted({len(tq), *range(max(5, len(tq) - tol), len(tq) + tol + 1)})
+        for ln in lens:
+            for a, b, sq, w, words in buckets.get((f0, ln), ()):
+                if w not in widths:
+                    continue
+                if sq == tq:
+                    # same letters: fix casing/spacing, and reserve an already
+                    # correct span so a partial fuzzy match can't overwrite it
+                    cands.append((3 if text[a:b] == written else 2, w, 2.0, a, b, written, eid))
+                    matched = True
+                    continue
+                if len(sq) < 5 or sq in (tq + "s", tq + "es"):
+                    continue
+                if w == 1 and "-" in words[0]:
+                    continue
+                if budget <= 0:
+                    continue
+                budget -= 1
+                if sm is None:
+                    sm = SequenceMatcher(None, "", tq)  # seq2 analysis is cached
+                sm.set_seq1(sq)
+                if sm.real_quick_ratio() < 0.6 or sm.quick_ratio() < 0.6:
+                    continue
+                r1 = sm.ratio()
+                need = 0.88 if len(tq) <= 6 else 0.80
+                if w > n:
+                    need = max(need, 0.85)
+                score = r1
+                if r1 < need:
+                    tk = tk or _skeleton(written)
+                    sk = skel_cache.get(text[a:b])
+                    if sk is None:
+                        sk = skel_cache[text[a:b]] = _skeleton(text[a:b])
+                    score = max(r1, 0.95 * SequenceMatcher(None, sk, tk).ratio())
+                if score < need:
+                    continue
+                english = [_english_word(x) for x in words]
+                if any(e is None for e in english):
+                    continue  # no wordlist: only same-letter fixes are safe
+                if all(english) and not (w >= 2 and n >= 2):
+                    continue  # real English ("cloud", "preset") is never fuzzed
+                cands.append((1, w, score, a, b, written, eid))
+                matched = True
+        # exact (same-letter) spans are length-equal, so the loop above saw them
+        if matched:
+            picked += 1
+            if picked >= MAX_FUZZY_PER_TEXT:
+                break
     if not cands:
         return text
     taken: list[tuple[int, int]] = []
@@ -1037,7 +1109,8 @@ def _apply_terms(text: str, comp: dict, prot: list[tuple[int, int]], hits: list[
         if any(a < tb and ta < b for ta, tb in taken):
             continue
         taken.append((a, b))
-        edits.append((a, b, written, eid))
+        if text[a:b] != written:
+            edits.append((a, b, written, eid))
     for a, b, written, eid in sorted(edits, reverse=True):
         text = text[:a] + written + text[b:]
         hits.append(eid)

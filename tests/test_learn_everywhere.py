@@ -138,3 +138,49 @@ def test_r1_concurrent_enables_keep_ownership(cfg):
     LE.set_enabled(False)
     assert not (cfg / "environment.d" / LE.ENV_FILE_NAME).exists()
     assert not (cfg / "electron43-flags.conf").exists()
+
+
+def test_r2_disable_never_replaces_a_symlink(cfg, tmp_path):
+    (cfg / "chromium-flags.conf").write_text("--a\n")
+    LE.set_enabled(True)
+    real = tmp_path / "dotfiles-chromium.conf"
+    real.write_text((cfg / "chromium-flags.conf").read_text())
+    (cfg / "chromium-flags.conf").unlink()
+    (cfg / "chromium-flags.conf").symlink_to(real)
+    LE.set_enabled(False)
+    assert (cfg / "chromium-flags.conf").is_symlink()
+
+
+def test_r2_session_env_restores_previous_values(cfg, monkeypatch):
+    monkeypatch.setenv("VOXTYPE_TUI_SYSTEMCTL", "1")
+    env = {"QT_ACCESSIBILITY": "0"}  # the user's own value before
+    calls = []
+
+    def fake_run(argv, **k):
+        calls.append(argv)
+        class R:
+            returncode = 0
+            stdout = ""
+        r = R()
+        if argv[:3] == ["systemctl", "--user", "show-environment"]:
+            r.stdout = "".join(f"{a}={b}\n" for a, b in env.items())
+        elif argv[:3] == ["systemctl", "--user", "set-environment"]:
+            env.update(x.split("=", 1) for x in argv[3:])
+        elif argv[:3] == ["systemctl", "--user", "unset-environment"]:
+            for x in argv[3:]:
+                env.pop(x, None)
+        elif argv[:2] == ["busctl", "--user"]:
+            r.stdout = "b true"
+        return r
+    monkeypatch.setattr(LE.subprocess, "run", fake_run)
+    monkeypatch.setattr(LE, "_which", lambda n: True)
+    monkeypatch.setattr(LE, "flag_files", lambda: [])
+    LE.set_enabled(True)
+    assert env["QT_ACCESSIBILITY"] == "1" and env["ACCESSIBILITY_ENABLED"] == "1"
+    env["NO_AT_BRIDGE"] = "1"  # the user changed it meanwhile: not ours any more
+    LE.set_enabled(False)
+    assert env == {"QT_ACCESSIBILITY": "0", "NO_AT_BRIDGE": "1"}
+    # disable without a prior enable never touches the session
+    calls.clear()
+    LE.set_enabled(False)
+    assert not any("unset-environment" in c or "set-environment" in c for c in calls)

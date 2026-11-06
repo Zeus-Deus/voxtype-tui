@@ -536,13 +536,17 @@ def _latest_record() -> dict | None:
     return None
 
 
-def on_post_output(record: dict) -> dict | None:
+def on_post_output(record: dict, window: dict | None = None) -> dict | None:
     """Entry point for the post-output hook, which already runs in its own
     detached process: watch this record's correction window in-process.
-    Never raises."""
+
+    ``window`` is the active window captured by the hook right when it
+    started (the delivery window); without it the window is read now, which
+    is later when the hook did other work first. Never raises."""
     global _log_path
     try:
-        window = active_window()  # the window the text was just delivered to
+        if window is None:
+            window = active_window()  # the window the text was just delivered to
         from . import learned
         if not isinstance(record, dict) or not learned.is_enabled():
             return None
@@ -556,7 +560,7 @@ def on_post_output(record: dict) -> dict | None:
         if window is not None:
             rec["delivery_window"] = {k: window.get(k) for k in ("address", "pid", "class")}
             rec["app"] = {k: window.get(k) for k in ("class", "title", "pid", "address")}
-        res = watch(final, window=window, record=rec)
+        res = watch(final, window=active_window(), record=rec)
         log("result " + json.dumps(_safe_result(res)))
         return res
     except Exception as e:
