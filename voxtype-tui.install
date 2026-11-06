@@ -33,9 +33,11 @@ pre_remove() {
     local f owner home
     for f in /home/*/.config/voxtype-tui/features.json /root/.config/voxtype-tui/features.json; do
         [ -f "$f" ] || continue
-        grep -q '"managed_hooks": {[^}]' "$f" 2>/dev/null || grep -q 'voxtype-tui-hook' "$f" 2>/dev/null || continue
-        owner=$(stat -c %U "$f") || continue
+        grep -q 'voxtype-tui-hook' "$f" 2>/dev/null || continue
+        owner=$(stat -c %U -- "$f") || continue
         home=${f%/.config/voxtype-tui/features.json}
+        # A home's files are edited only as the user who owns them.
+        [ "$owner" = root ] && [ "$home" != /root ] && continue
         timeout 20 runuser -u "$owner" -- env HOME="$home" XDG_CONFIG_HOME="$home/.config" \
             voxtype-tui-hook --unwire >/dev/null 2>&1 \
             && echo "==> voxtype-tui: removed its voxtype hooks for $owner" \

@@ -509,3 +509,37 @@ def test_hook_entry_returns_fast_and_work_runs_detached(xdg):
     r = subprocess.run([sys.executable, "-m", "voxtype_tui.hook_main", "bogus"],
                        env=env, capture_output=True, timeout=10, cwd=str(repo))
     assert r.returncode == 0
+
+
+def test_enqueue_during_drain_is_not_lost(xdg, monkeypatch):
+    """maintain() holds the queue's own flock, so an append that arrives
+    while it drains waits and survives the truncate."""
+    import threading
+
+    history.enqueue(_rec(1))
+    orig = history._update_health
+    appended = {}
+
+    def slow_health(*a, **k):
+        t = threading.Thread(target=lambda: appended.setdefault("ok", history.enqueue(_rec(2))))
+        t.start()
+        time.sleep(0.3)
+        appended["alive_during_drain"] = t.is_alive()  # blocked on the queue flock
+        orig(*a, **k)
+        appended["thread"] = t
+    monkeypatch.setattr(history, "_update_health", slow_health)
+    history.maintain()
+    appended["thread"].join(5)
+    assert appended["alive_during_drain"] is True and appended["ok"] is True
+    monkeypatch.setattr(history, "_update_health", orig)
+    assert history.summary(30)["totals"]["dictations"] == 2
+
+
+def test_delete_queued_item_keeps_count_but_drops_text(xdg):
+    history.enqueue(_rec(1))
+    rid = json.loads(history.queue_path().read_text())["id"]
+    assert history.delete(rid) == 1
+    q = json.loads(history.queue_path().read_text())
+    assert "final" not in q and q["keep_text"] is False
+    assert history.summary(30)["totals"]["dictations"] == 1
+    assert history.list_items()["items"] == []

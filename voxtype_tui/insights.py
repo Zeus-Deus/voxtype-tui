@@ -49,10 +49,19 @@ def set_features(patch: dict, config_path: Path | None = None) -> dict:
     from . import hooks
 
     F.update(patch, wire=False)
-    wiring = hooks.sync_config(config_path=config_path)
+    error = None
+    try:
+        wiring = hooks.sync_config(config_path=config_path)
+    except Exception as e:  # e.g. voxtype rejected the config: switches are saved,
+        # wiring is retried on the next save/set; say so instead of failing.
+        history.note_failure("features.set", f"hook wiring: {e}")
+        wiring = {"changed": False}
+        error = f"could not update voxtype's config: {str(e).splitlines()[0][:120]}"
     out = get_features(config_path)
     out["restart_needed"] = bool(wiring["changed"])
     out["config_changed"] = bool(wiring["changed"])
+    if error:
+        out["wiring_error"] = error
     return out
 
 
