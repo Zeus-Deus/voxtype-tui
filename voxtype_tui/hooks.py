@@ -551,6 +551,10 @@ def on_post_output(entered_at: float | None = None) -> None:
     from . import history
 
     entered_at = time.time() if entered_at is None else entered_at
+    # The window the text was just delivered to, read before any slower work
+    # below, so the learning watcher binds to it and not to whatever has focus
+    # once maintenance and the archive are done.
+    delivery_window = _hypr_active_window()
     feats = F.load()
     rec = history.latest()
     if rec is not None and not _claim(rec.get("id")):
@@ -584,7 +588,10 @@ def on_post_output(entered_at: float | None = None) -> None:
             try:
                 from . import learn_watch  # type: ignore[attr-defined]
 
-                learn_watch.on_post_output(rec)
+                try:
+                    learn_watch.on_post_output(rec, window=delivery_window)
+                except TypeError:  # an older learn_watch without the parameter
+                    learn_watch.on_post_output(rec)
             except ImportError:
                 pass
             except Exception as e:
