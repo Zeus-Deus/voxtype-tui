@@ -345,7 +345,10 @@ def _set_feature(enabled: bool) -> None:
     with contextlib.suppress(Exception):
         import importlib
         features = importlib.import_module("voxtype_tui.features")
-        features.update({"learning": {"everywhere": enabled}})
+        try:  # no hook rewiring: "everywhere" needs no Voxtype setting
+            features.update({"learning": {"everywhere": enabled}}, wire=False)
+        except TypeError:
+            features.update({"learning": {"everywhere": enabled}})
 
 
 @contextlib.contextmanager

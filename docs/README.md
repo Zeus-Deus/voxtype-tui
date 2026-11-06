@@ -25,3 +25,7 @@ Short, topic-focused notes on what each setting does and when you'd want to touc
 3. **Settings → Audio** — pick your microphone from the Device dropdown.
 4. **Settings → Output** — `type` mode inserts the transcription where your cursor is. Turn on `auto_submit` if you're dictating into chat windows a lot.
 5. Only after that: Vocabulary for proper nouns you care about, Dictionary for shortcuts.
+
+## Learning from corrections
+
+- [Auto-learn](./auto-learn.md) — how Voxtype learns from your fixes, what it never touches, "Learn everywhere", files and API.
