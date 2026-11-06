@@ -36,6 +36,11 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     shutil.copy(FIXTURES / "stock.toml", cfg)
     monkeypatch.setattr(config, "CONFIG_PATH", cfg)
     monkeypatch.setattr(sidecar, "SIDECAR_PATH", side)
+    # The live config would get the insights hooks wired on load (dirty);
+    # these tests are about Qwen3 refusals, so keep the capture switches off.
+    from voxtype_tui import features as _features
+    _features.update({k: {"enabled": False} for k in ("usage", "history", "archive", "learning")},
+                     wire=False)
     md = tmp_path / "models"
     md.mkdir()
     for f in ("ggml-base.en.bin", "ggml-large-v3-turbo-q5_0.bin", "qwen3-asr-0.6b-q4_k.gguf"):

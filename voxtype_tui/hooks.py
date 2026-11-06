@@ -124,7 +124,7 @@ def availability(doc: Any, feats: dict, foreign: dict[str, str] | None = None) -
         for key in (PRE_RECORDING, POST_OUTPUT):
             cur = _get(doc, key)
             if cur is not None and str(cur) and str(cur) not in (
-                OUR_COMMANDS[key], (feats.get(F.MANAGED_HOOKS_KEY) or {}).get(key),
+                (OUR_COMMANDS[key],) + F.owned_hook_strings(feats, key)
             ):
                 foreign[key] = str(cur)
     reasons: dict[str, str] = {}
@@ -161,14 +161,13 @@ def reconcile(doc: Any, feats: dict) -> Plan:
     want = needed(feats)
     for key in (PRE_RECORDING, POST_OUTPUT):
         ours = OUR_COMMANDS[key]
-        recorded = plan.managed.get(key)
         cur = _get(doc, key)
         cur_s = None if cur is None else str(cur)
-        # A3: we only ever modify or remove a value equal to the string we
-        # recorded writing. An unrecorded value that happens to be exactly
-        # our command is adopted when wanted (no edit needed) and otherwise
-        # left alone.
-        owned = recorded is not None and cur_s == recorded
+        # A3: we only ever modify or remove a value equal to a string we
+        # recorded writing (committed or pending). An unrecorded value that
+        # happens to be exactly our command is adopted when wanted (no edit
+        # needed) and otherwise left alone.
+        owned = cur_s is not None and cur_s in F.owned_hook_strings(feats, key)
         if want[key]:
             if cur_s is None or cur_s == "" or owned:
                 if cur_s != ours:
@@ -230,15 +229,29 @@ def sync_config(config_path: Path | None = None, features_file: Path | None = No
     doc = config.load(path)
     old = dict(feats.get(F.MANAGED_HOOKS_KEY) or {})
     plan = reconcile(doc, feats)
+    record_intent(feats, plan, features_file)
     if plan.changed:
-        # Record intent BEFORE writing config.toml, so a crash in between
-        # never leaves a hook of ours that we don't know we own.
-        F.set_managed_hooks({**old, **plan.managed}, features_file)
-        config.safe_save(doc, path)
-    if plan.managed != F.load(features_file).get(F.MANAGED_HOOKS_KEY):
-        F.set_managed_hooks(plan.managed, features_file)
+        config.safe_save(doc, path)  # on failure the pending record keeps both strings ours
+    commit_ownership(plan, features_file)
+    _ = old
     return {"changed": plan.changed, "wired": plan.wired, "unwired": plan.unwired,
             "unavailable": plan.unavailable}
+
+
+def record_intent(feats: dict, plan: "Plan", features_file: Path | None = None) -> None:
+    """Before config.toml is written: record the hook strings about to be
+    ours as *pending*, keeping the committed record intact (DESIGN A3)."""
+    old = dict(feats.get(F.MANAGED_HOOKS_KEY) or {})
+    intent = {k: v for k, v in plan.managed.items() if old.get(k) != v}
+    if intent:
+        F.set_managed_hooks(old, features_file, pending=intent)
+
+
+def commit_ownership(plan: "Plan", features_file: Path | None = None) -> None:
+    """After config.toml was written: the plan's strings are the record."""
+    cur = F.load(features_file)
+    if (cur.get(F.MANAGED_HOOKS_KEY) != plan.managed) or cur.get(F.PENDING_HOOKS_KEY):
+        F.set_managed_hooks(plan.managed, features_file, pending={})
 
 
 def unwire_all(config_path: Path | None = None, features_file: Path | None = None) -> dict:
@@ -253,13 +266,13 @@ def unwire_all(config_path: Path | None = None, features_file: Path | None = Non
         doc = config.load(path)
         for key in (PRE_RECORDING, POST_OUTPUT):
             cur = _get(doc, key)
-            if cur is not None and key in managed and str(cur) == managed[key]:
+            if cur is not None and str(cur) in F.owned_hook_strings(feats, key):
                 _del_output(doc, key)
                 changed = True
         if changed:
             config.safe_save(doc, path, validate=False)
-    if managed:
-        F.set_managed_hooks({}, features_file)
+    if managed or feats.get(F.PENDING_HOOKS_KEY):
+        F.set_managed_hooks({}, features_file, pending={})
     return {"changed": changed}
 
 
@@ -312,7 +325,7 @@ def _recorder_argv(binary: str, device: str, wav: str) -> list[str]:
 def _purge_stale(rt: Path, keep: str | None = None) -> None:
     """Scratch of cancelled / no-speech recordings (no post-output ran)."""
     now = time.time()
-    for pattern in ("rec/*.wav", "rec-used-*.json"):
+    for pattern in ("rec/*.wav", "rec-used-*.json", "rec-discard-*.json"):
         try:
             for p in rt.glob(pattern):
                 if str(p) != keep and now - p.stat().st_mtime > 600:
@@ -321,11 +334,14 @@ def _purge_stale(rt: Path, keep: str | None = None) -> None:
             pass
 
 
-def resolve_source(device: str) -> tuple[str | None, str]:
+def resolve_source(device: str) -> tuple:
     """Map voxtype's ``audio.device`` to a PipeWire/Pulse source name.
-    Returns (target or None for the default source, note). Voxtype accepts
-    partial device names; pw-record needs a node name, so we match the
-    configured string against the source list ourselves."""
+
+    Returns ``(target, note)``: ``None`` = the default source; ``False`` =
+    the configured device was not found (the archive then saves no audio
+    rather than recording a different microphone). Matching order: exact
+    name, case-insensitive exact, then a unique case-insensitive substring
+    among capture (non-monitor) sources."""
     import subprocess
 
     if not device or device == "default":
@@ -336,14 +352,18 @@ def resolve_source(device: str) -> tuple[str | None, str]:
     except (OSError, subprocess.SubprocessError):
         out = ""
     names = [line.split("\t")[1] for line in out.splitlines() if line.count("\t") >= 1]
-    names = [n for n in names if not n.endswith(".monitor")] or names
     if device in names:
         return device, "configured device"
     low = device.lower()
     for n in names:
-        if low in n.lower():
-            return n, f"matched configured device {device!r}"
-    return None, f"configured device {device!r} not found; recorded the default source"
+        if n.lower() == low:
+            return n, "configured device"
+    partial = [n for n in names if low in n.lower() and not n.endswith(".monitor")]
+    if len(partial) == 1:
+        return partial[0], f"matched configured device {device!r}"
+    if partial:
+        return False, f"configured device {device!r} matches several sources"
+    return False, f"configured device {device!r} not found"
 
 
 def _supervise(proc, cap_s: float) -> None:
@@ -388,18 +408,24 @@ def on_pre_recording() -> None:
         return
     info["app"] = _hypr_active_window()
     rt = F.ensure_private_dir(F.runtime_dir())
+    _purge_stale(rt)
     if archive["enabled"] and archive["save_audio"]:
         binary = recorder_binary()
         if binary:
             cfg = capture.config_info()
             rec_dir = F.ensure_private_dir(rt / "rec")
             wav = str(rec_dir / f"{int(start * 1000)}.wav")
-            _purge_stale(rt, keep=wav)
             target, note = resolve_source(str(cfg.get("device", "default")))
+            if target is False:
+                from . import history
+
+                history.note_failure("archive", f"audio not saved: {note}")
+                F.atomic_write_text(rt / "rec-start.json", json.dumps(info))
+                return
             old_umask = os.umask(0o077)
             try:
                 proc = subprocess.Popen(
-                    _recorder_argv(binary, target or "default", wav),
+                    _recorder_argv(binary, target or "default", wav),  # None = default
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True,
                 )
@@ -453,9 +479,11 @@ def _claim(record_id: object) -> bool:
     return True
 
 
-def _discard_unconsumed_recording() -> None:
+def _discard_unconsumed_recording(entered_at: float) -> None:
     """A rec-start.json still present at post-output was never claimed by a
-    transcription (cancel / no speech): stop its recorder, delete its WAV."""
+    transcription (cancel / no speech): stop its recorder, delete its WAV.
+    Only a recording that started before this hook ran is touched; a newer
+    one (the user already started the next dictation) is left alone."""
     from . import capture
 
     p = capture.rec_start_path()
@@ -463,11 +491,34 @@ def _discard_unconsumed_recording() -> None:
         info = json.loads(p.read_text())
     except (OSError, ValueError):
         return
+    if not isinstance(info, dict):
+        return
+    start = info.get("start")
+    state, _ = capture.read_state()
+    if not isinstance(start, (int, float)) or start >= entered_at or state == "recording":
+        return
+    # Claim atomically, then make sure we claimed the generation we checked.
+    claimed = p.with_name(f"rec-discard-{os.getpid()}.json")
     try:
-        p.unlink()
+        os.rename(p, claimed)
+        mine = json.loads(claimed.read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(mine, dict) or mine.get("start") != start:
+        try:
+            os.link(claimed, p)  # put a newer recording's hand-off back (never clobbers)
+        except OSError:
+            pass
+        try:
+            claimed.unlink()
+        except OSError:
+            pass
+        return
+    try:
+        claimed.unlink()
     except OSError:
         pass
-    pid = int(info.get("recorder_pid") or 0) if isinstance(info, dict) else 0
+    pid = int(info.get("recorder_pid") or 0)
     for _ in range(60):  # the supervisor stops it once voxtype leaves `recording`
         if not pid:
             break
@@ -476,7 +527,7 @@ def _discard_unconsumed_recording() -> None:
         except OSError:
             break
         time.sleep(0.05)
-    wav = info.get("wav") if isinstance(info, dict) else None
+    wav = info.get("wav")
     if isinstance(wav, str) and wav.startswith(str(F.runtime_dir())):
         try:
             os.unlink(wav)
@@ -489,6 +540,7 @@ def on_post_output() -> None:
     hook before it goes idle, so nothing here may run in the hook itself."""
     from . import history
 
+    entered_at = time.time()
     feats = F.load()
     rec = history.latest()
     if rec is not None and not _claim(rec.get("id")):
@@ -498,7 +550,7 @@ def on_post_output() -> None:
         # twice; drop the cancelled recording's scratch audio instead.
         rec = None
     if rec is None:
-        _discard_unconsumed_recording()
+        _discard_unconsumed_recording(entered_at)
     try:
         try:
             history.maintain(feats=feats)

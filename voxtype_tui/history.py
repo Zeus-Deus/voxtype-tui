@@ -65,16 +65,13 @@ def last_record_path() -> Path:
 # --- locking ---
 
 class _Lock:
-    """Exclusive lock for maintenance/edits (``.lock``). With ``queue=True``
-    it also takes the queue file's own ``flock`` — the one :func:`enqueue`
-    takes — for short in-place queue edits (delete/clear)."""
+    """Exclusive lock for maintenance and edits (``.lock``). The queue
+    file's own flock (taken by :func:`enqueue`) is only ever held for
+    microseconds by these writers (a rename, or a small in-place edit)."""
 
-    def __init__(self, data_dir: Path | None = None, *, queue: bool = False):
+    def __init__(self, data_dir: Path | None = None):
         self.path = _dir(data_dir) / ".lock"
-        self.queue = queue_path(data_dir)
-        self.want_queue = queue
         self.fd = -1
-        self.qfd = -1
 
     def __enter__(self):
         import fcntl
@@ -82,31 +79,12 @@ class _Lock:
         F.ensure_private_dir(self.path.parent)
         self.fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(self.fd, fcntl.LOCK_EX)
-        if not self.want_queue:
-            return self
-        try:
-            self.qfd = os.open(str(self.queue), os.O_RDWR)
-        except FileNotFoundError:
-            self.qfd = -1
-        if self.qfd >= 0:
-            fcntl.flock(self.qfd, fcntl.LOCK_EX)
         return self
-
-    def rewrite_queue(self, items: list[dict]) -> None:
-        """Replace the queue content in place (same inode, still locked)."""
-        if self.qfd < 0:
-            return
-        os.ftruncate(self.qfd, 0)
-        data = "".join(json.dumps(i, ensure_ascii=False, separators=(",", ":")) + "\n" for i in items)
-        if data:
-            os.pwrite(self.qfd, data.encode(), 0)
 
     def __exit__(self, *exc):
         import fcntl
 
         try:
-            if self.qfd >= 0:
-                os.close(self.qfd)
             fcntl.flock(self.fd, fcntl.LOCK_UN)
         finally:
             os.close(self.fd)
@@ -321,21 +299,25 @@ def maintain(data_dir: Path | None = None, feats: dict | None = None, now: float
     which the next run finishes; ids are deduped). Never blocks enqueue
     for longer than a rename. Returns a small report."""
     feats = feats or F.load()
+    with _Lock(data_dir):
+        return _maintain_locked(data_dir, feats, now)
+
+
+def _maintain_locked(data_dir: Path | None, feats: dict, now: float | None = None) -> dict:
     report = {"drained": 0, "pruned": 0}
     hp = history_path(data_dir)
-    with _Lock(data_dir):
-        dp = _draining_path(data_dir)
-        for claim in (False, True):
-            if claim:
-                _claim_queue(data_dir)
-            if not dp.exists():
-                continue
-            records = list(_read_jsonl(dp))
-            if records:
-                _drain(records, data_dir, feats, hp)
-                report["drained"] += len(records)
-            dp.unlink()
-        report["pruned"] = _prune(hp, feats["history"]["keep_days"], now)
+    dp = _draining_path(data_dir)
+    for claim in (False, True):
+        if claim:
+            _claim_queue(data_dir)
+        if not dp.exists():
+            continue
+        records = list(_read_jsonl(dp))
+        if records:
+            _drain(records, data_dir, feats, hp)
+            report["drained"] += len(records)
+        dp.unlink()
+    report["pruned"] = _prune(hp, feats["history"]["keep_days"], now)
     return report
 
 
@@ -547,9 +529,41 @@ def latest(max_age_s: float = 120.0) -> dict | None:
     return rec
 
 
+def _strip_queue_text(data_dir: Path | None, record_id: str | None) -> int:
+    """Drop text from queued (not yet drained) records, in place, holding
+    the queue's flock only for this short edit. ``None`` = every record."""
+    import fcntl
+
+    try:
+        qfd = os.open(str(queue_path(data_dir)), os.O_RDWR)
+    except FileNotFoundError:
+        return 0
+    try:
+        fcntl.flock(qfd, fcntl.LOCK_EX)
+        with os.fdopen(os.dup(qfd), "r", encoding="utf-8") as f:
+            items = []
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(obj, dict):
+                    items.append(obj)
+        hit = [i for i in items if "final" in i and (record_id is None or i.get("id") == record_id)]
+        if not hit:
+            return 0
+        out = [_strip_text(i) if i in hit else i for i in items]
+        data = "".join(json.dumps(i, ensure_ascii=False, separators=(",", ":")) + "\n" for i in out)
+        os.ftruncate(qfd, 0)
+        os.pwrite(qfd, data.encode(), 0)
+        return len(hit)
+    finally:
+        os.close(qfd)
+
+
 def delete(record_id: str, data_dir: Path | None = None) -> int:
-    maintain(data_dir)  # nothing left in queue.draining.jsonl afterwards
-    with _Lock(data_dir, queue=True) as lock:
+    with _Lock(data_dir):
+        _maintain_locked(data_dir, F.load())  # no draining batch is left behind
         removed = 0
         hp = history_path(data_dir)
         items = list(_read_jsonl(hp))
@@ -557,12 +571,8 @@ def delete(record_id: str, data_dir: Path | None = None) -> int:
         if len(keep) != len(items):
             _write_jsonl(hp, keep)
             removed = 1
-        if lock.qfd >= 0:
-            q = list(_read_jsonl(queue_path(data_dir)))
-            if any(i.get("id") == record_id and "final" in i for i in q):
-                # keep the usage count, drop only the text
-                lock.rewrite_queue([_strip_text(i) if i.get("id") == record_id else i for i in q])
-                removed = 1
+        if _strip_queue_text(data_dir, record_id):
+            removed = 1  # enqueued meanwhile: keep its count, drop its text
         last = _read_last()
         if last and last.get("id") == record_id:
             try:
@@ -579,19 +589,15 @@ def _strip_text(rec: dict) -> dict:
 
 
 def clear(data_dir: Path | None = None) -> int:
-    maintain(data_dir)
-    with _Lock(data_dir, queue=True) as lock:
+    with _Lock(data_dir):
+        _maintain_locked(data_dir, F.load())
         hp = history_path(data_dir)
         n = sum(1 for _ in _read_jsonl(hp))
-        if lock.qfd >= 0:
-            q = list(_read_jsonl(queue_path(data_dir)))
-            n += sum(1 for i in q if "final" in i)
-            if any("final" in i for i in q):
-                lock.rewrite_queue([_strip_text(i) for i in q])
         try:
             hp.unlink()
         except FileNotFoundError:
             pass
+        n += _strip_queue_text(data_dir, None)
         try:
             last_record_path().unlink()
         except OSError:

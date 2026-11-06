@@ -247,10 +247,14 @@ def _capture(raw: str, final: str, changed_by: list[str], hits: list[str]) -> No
     cfg = capture.config_info()
     start_info = capture.read_rec_start()
     if start_info is not None:
-        # Hand the recording's start info to exactly this record (the
-        # archive finalizer claims rec-used-<id>.json); never reused.
+        # Consume the recording's start info (never reused). Only the
+        # archive needs it after output: hand it to exactly this record
+        # (rec-used-<id>.json, claimed by the finalizer); else delete it.
         try:
-            os.replace(capture.rec_start_path(), capture.rec_used_path(rid))
+            if arch_on and start_info.get("wav"):
+                os.replace(capture.rec_start_path(), capture.rec_used_path(rid))
+            else:
+                os.unlink(capture.rec_start_path())
         except OSError:
             pass
     started, duration = capture.measure_duration(start_info, cfg.get("max_duration_secs") or 60)

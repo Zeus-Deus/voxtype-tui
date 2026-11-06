@@ -57,9 +57,11 @@ def _reconcile_hooks(doc: TOMLDocument, path: Path, *, record_intent: bool = Fal
 
         feats = features.load()
         plan = hooks.reconcile(doc, feats)
-        if record_intent and plan.changed:
-            old = dict(feats.get(features.MANAGED_HOOKS_KEY) or {})
-            features.set_managed_hooks({**old, **plan.managed})
+        if record_intent:
+            # Covers hooks wired earlier in memory too (upgrade load,
+            # --apply-migrations): anything about to be written is recorded
+            # as pending before the save, committed after it.
+            hooks.record_intent(feats, plan)
         return plan.changed
     except Exception as e:  # pragma: no cover - defensive
         _logger.warning("insights hook reconcile failed: %s", e)
@@ -67,14 +69,12 @@ def _reconcile_hooks(doc: TOMLDocument, path: Path, *, record_intent: bool = Fal
 
 
 def _record_managed_hooks(doc: TOMLDocument) -> None:
-    """After a successful config save, persist which hook strings are ours."""
+    """After a successful config save, commit which hook strings are ours."""
     try:
         from . import features, hooks
 
-        feats = features.load()
-        plan = hooks.reconcile(tomlkit.parse(tomlkit.dumps(doc)), feats)
-        if plan.managed != (feats.get(features.MANAGED_HOOKS_KEY) or {}):
-            features.set_managed_hooks(plan.managed)
+        plan = hooks.reconcile(tomlkit.parse(tomlkit.dumps(doc)), features.load())
+        hooks.commit_ownership(plan)
     except Exception as e:  # pragma: no cover - defensive
         _logger.warning("could not record managed hooks: %s", e)
 
@@ -136,14 +136,16 @@ class AppState:
         # the sync bundle uses the migrated config shape.
         migration_result = migrations.run_pending(doc, sc)
         config_dirty_from_migrations = migration_result.touches_config
-        # v4 (insights): wire the hooks the enabled features need, on the
-        # live config only, never touching a user's own hook. Upgrades get
-        # it here (dirty + stale, like every config migration); fresh
-        # installs (no metadata.json → no migrations) get it at their first
-        # save or features change, which reconcile again (DESIGN A4).
-        if raw_sc.version < 4 <= sc.version and _reconcile_hooks(doc, config_path):
+        # Insights hook wiring (DESIGN A4): reconciled on every load of the
+        # live config — upgrades, fresh installs without metadata.json (no
+        # migration runs) and installs whose hooks went missing alike. Only
+        # absent or recorded-as-ours values change; a change marks the
+        # config dirty + stale like any migration, and the next save writes
+        # it. Alternate configs are never rewired.
+        if _reconcile_hooks(doc, config_path):
             config_dirty_from_migrations = True
-            migration_result.applied.append("insights-wire-hooks")
+            if "insights-wire-hooks" not in migration_result.applied:
+                migration_result.applied.append("insights-wire-hooks")
         sidecar_dirty_from_migrations = migration_result.new_version != raw_sc.version
 
         # If reconcile changed the sidecar, mark it dirty so the next save

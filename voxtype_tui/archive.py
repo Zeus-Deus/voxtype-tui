@@ -115,6 +115,8 @@ def finalize(rec: dict, feats: dict, timeout: float = 15.0) -> dict | None:
             meta["audio_info"] = {
                 "note": AUDIO_NOTE,
                 "device": info.get("device", "default"),
+                "source": info.get("source"),
+                "source_note": info.get("source_note"),
                 "recorder": info.get("recorder"),
                 "sample_rate": rate,
                 "seconds": round(frames / rate, 3),

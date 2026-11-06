@@ -37,6 +37,10 @@ DEFAULTS: "dict[str, Any]" = {
 KEEP_DAYS_CHOICES: tuple[int | None, ...] = (7, 30, 90, 365, None)
 DEFAULT_ARCHIVE_DIR = "~/Documents/Voxtype"
 MANAGED_HOOKS_KEY = "managed_hooks"
+# Hook strings we are about to write (recorded before config.toml is saved,
+# cleared once the save committed). Also ours, so a crash or a failed save
+# between the two never turns our own hook into a "foreign" one.
+PENDING_HOOKS_KEY = "managed_hooks_pending"
 
 
 # --- paths (resolved at call time so HOME/XDG overrides always apply) ---
@@ -123,11 +127,12 @@ def _sanitize(d: dict) -> dict:
             except ValueError:
                 out[section][key] = copy.deepcopy(dv)
     out["version"] = VERSION
-    mh = out.get(MANAGED_HOOKS_KEY)
-    if not isinstance(mh, dict) or not all(
-        isinstance(k, str) and isinstance(v, str) for k, v in mh.items()
-    ):
-        out[MANAGED_HOOKS_KEY] = {}
+    for key in (MANAGED_HOOKS_KEY, PENDING_HOOKS_KEY):
+        mh = out.get(key)
+        if not isinstance(mh, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in mh.items()
+        ):
+            out[key] = {}
     return out
 
 
@@ -222,7 +227,8 @@ def update(
     Returns the new features (as :func:`load` would)."""
     if not isinstance(patch, dict):
         raise ValueError("patch must be an object")
-    patch = {k: v for k, v in patch.items() if k not in ("version", MANAGED_HOOKS_KEY)}
+    patch = {k: v for k, v in patch.items()
+             if k not in ("version", MANAGED_HOOKS_KEY, PENDING_HOOKS_KEY)}
     path = path or features_path()
     fd = _locked(path)
     try:
@@ -249,23 +255,42 @@ def update(
     return load(path)
 
 
-def set_managed_hooks(managed: dict[str, str], path: Path | None = None) -> None:
-    """Replace the ownership record (hooks module only)."""
+def set_managed_hooks(managed: dict[str, str], path: Path | None = None,
+                      pending: dict[str, str] | None = None) -> None:
+    """Replace the ownership record (hooks/state modules only). ``pending``
+    = strings about to be written; ``{}``/``None`` clears it."""
     path = path or features_path()
+    pending = dict(pending or {})
     fd = _locked(path)
     try:
         raw = _read_raw(path)
-        if raw.get(MANAGED_HOOKS_KEY, {}) == managed and raw:
-            return
-        if not raw and not managed:
+        if not raw and not managed and not pending:
             return  # keep "missing file = defaults" until something is recorded
+        if (raw.get(MANAGED_HOOKS_KEY, {}) == managed
+                and (raw.get(PENDING_HOOKS_KEY) or {}) == pending and raw):
+            return
         raw[MANAGED_HOOKS_KEY] = dict(managed)
+        if pending:
+            raw[PENDING_HOOKS_KEY] = pending
+        else:
+            raw.pop(PENDING_HOOKS_KEY, None)
         raw.setdefault("version", VERSION)
         _write(raw, path)
     finally:
         _unlock(fd)
 
 
+def owned_hook_strings(feats: dict, key: str) -> tuple[str, ...]:
+    """Every string for hook ``key`` we recorded (committed or pending)."""
+    out = []
+    for k in (MANAGED_HOOKS_KEY, PENDING_HOOKS_KEY):
+        v = (feats.get(k) or {}).get(key)
+        if isinstance(v, str):
+            out.append(v)
+    return tuple(out)
+
+
 def public(feats: dict) -> dict:
     """Features without internal bookkeeping (for the UI)."""
-    return {k: copy.deepcopy(v) for k, v in feats.items() if k != MANAGED_HOOKS_KEY}
+    return {k: copy.deepcopy(v) for k, v in feats.items()
+            if k not in (MANAGED_HOOKS_KEY, PENDING_HOOKS_KEY)}

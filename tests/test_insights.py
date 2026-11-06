@@ -471,9 +471,11 @@ def test_learned_stage_guarded_and_spans_protect_rules(xdg, monkeypatch, tmp_pat
 
 # --- migration / state -------------------------------------------------------
 
-def test_fresh_install_without_metadata_gets_wired_at_first_save(live_config):
+def test_fresh_install_without_metadata_gets_wired_on_load(live_config):
     st = AppState.load(config.CONFIG_PATH, sidecar.SIDECAR_PATH)
-    assert not st.config_dirty  # loading alone never dirties a fresh install
+    assert st.config_dirty and st.daemon_stale  # A4: reconciled on every live load
+    assert "insights-wire-hooks" in st.migrations_applied
+    assert "voxtype-tui-hook" not in live_config.read_text()  # nothing written by a load
     st.save()
     text = live_config.read_text()
     assert "voxtype-tui-hook pre-recording" in text
@@ -712,17 +714,24 @@ def test_apply_migrations_wires_a_fresh_install(live_config):
 
 
 def test_resolve_source_matches_partial_device_names(monkeypatch):
-    """review r1 #10: voxtype accepts partial device names; pw-record needs
-    the node name."""
+    """review r1 #10 / r2 #7: voxtype accepts partial device names; pw-record
+    needs the node name. Exact (incl. monitors) > case-insensitive exact >
+    unique substring; anything else saves no audio rather than another mic."""
     import subprocess as sp
 
     out = ("50\talsa_output.pci-0000_00_1f.3.analog-stereo.monitor\tPipeWire\ts32le 2ch 48000Hz\tIDLE\n"
-           "51\talsa_input.pci-0000_00_1f.3.analog-stereo\tPipeWire\ts32le 2ch 48000Hz\tIDLE\n")
+           "51\talsa_input.pci-0000_00_1f.3.analog-stereo\tPipeWire\ts32le 2ch 48000Hz\tIDLE\n"
+           "52\talsa_input.usb-mic\tPipeWire\ts16le 1ch 48000Hz\tIDLE\n"
+           "53\talsa_input.usb-mic-extra\tPipeWire\ts16le 1ch 48000Hz\tIDLE\n")
     monkeypatch.setattr(sp, "run", lambda *a, **k: sp.CompletedProcess(a, 0, out, ""))
     assert hooks.resolve_source("default") == (None, "default source")
     assert hooks.resolve_source("analog-stereo")[0] == "alsa_input.pci-0000_00_1f.3.analog-stereo"
-    target, note = hooks.resolve_source("usb-mic")
-    assert target is None and "not found" in note
+    mon = "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor"
+    assert hooks.resolve_source(mon)[0] == mon
+    assert hooks.resolve_source("ALSA_INPUT.USB-MIC")[0] == "alsa_input.usb-mic"
+    assert hooks.resolve_source("usb")[0] is False  # ambiguous
+    target, note = hooks.resolve_source("webcam")
+    assert target is False and "not found" in note
 
 
 def test_post_output_after_cancel_drops_scratch_audio_and_keeps_archive(xdg, tmp_path, monkeypatch):
@@ -741,3 +750,109 @@ def test_post_output_after_cancel_drops_scratch_audio_and_keeps_archive(xdg, tmp
     assert not wav.exists() and not capture.rec_start_path().exists()
     assert called == []
     _ = feats
+
+
+
+def test_delete_and_clear_never_hold_the_queue_lock_during_history_work(xdg, monkeypatch):
+    """review r2 #1: a dictation's enqueue must not wait on History edits."""
+    for i in range(3):
+        history.enqueue(_rec(i))
+    rid = history.list_items()["items"][0]["id"]
+    history.enqueue(_rec(5))  # a dictation that is still queued during the edit
+    real_claim = history._claim_queue
+    monkeypatch.setattr(history, "_claim_queue", lambda data_dir: None)
+    real = history._write_jsonl
+    seen = {}
+
+    def write_and_enqueue(path, items):
+        t = time.perf_counter()
+        seen["ok"] = history.enqueue(_rec(7))  # same process: deadlocks if locked
+        seen["ms"] = (time.perf_counter() - t) * 1000
+        return real(path, items)
+    monkeypatch.setattr(history, "_write_jsonl", write_and_enqueue)
+    assert history.delete(rid) == 1
+    assert seen["ok"] is True and seen["ms"] < 50
+    monkeypatch.setattr(history, "_write_jsonl", real)
+    monkeypatch.setattr(history, "_claim_queue", real_claim)
+    assert history.clear() >= 2
+    assert history.summary(30)["totals"]["dictations"] == 5
+
+
+def test_clear_finishes_a_leftover_draining_batch(xdg):
+    """review r2 #5: a crashed drain's batch is cleared too."""
+    history.enqueue(_rec(1))
+    history._claim_queue(None)  # a maintainer claimed it, then died
+    assert history._draining_path(None).exists()
+    history.clear()
+    assert history.list_items()["items"] == []
+    assert not history._draining_path(None).exists()
+
+
+def test_cancel_cleanup_never_touches_a_newer_recording(xdg, monkeypatch):
+    """review r2 #2: B started after A's post-output began -> keep B's files."""
+    rt = features.ensure_private_dir(features.runtime_dir() / "rec")
+    wav = rt / "b.wav"
+    wav.write_bytes(b"RIFF")
+    entered = time.time()
+    features.atomic_write_text(capture.rec_start_path(), json.dumps(
+        {"start": entered + 0.5, "wav": str(wav), "recorder_pid": 0}))
+    monkeypatch.setattr(capture, "read_state", lambda: ("idle", None))
+    hooks._discard_unconsumed_recording(entered)
+    assert wav.exists() and capture.rec_start_path().exists()
+    monkeypatch.setattr(capture, "read_state", lambda: ("recording", None))
+    hooks._discard_unconsumed_recording(entered + 10)
+    assert wav.exists() and capture.rec_start_path().exists()
+    monkeypatch.setattr(capture, "read_state", lambda: ("idle", None))
+    hooks._discard_unconsumed_recording(entered + 10)  # older than the hook: A's
+    assert not wav.exists() and not capture.rec_start_path().exists()
+
+
+def test_failed_save_keeps_old_and_new_hook_strings_ours(live_config, monkeypatch):
+    """review r2 #3/#4: pending intent survives a failed or crashed save."""
+    old = "voxtype-tui-hook pre-recording"
+    live_config.write_text(f'[output]\npre_recording_command = "{old}"\n')
+    features.set_managed_hooks({hooks.PRE_RECORDING: old})
+
+    real_save = config.safe_save
+
+    def boom(*a, **k):
+        raise config.ValidationError("rejected")
+    monkeypatch.setattr(config, "safe_save", boom)
+    with pytest.raises(config.ValidationError):
+        hooks.sync_config()
+    f = features.load()
+    assert f["managed_hooks"][hooks.PRE_RECORDING] == old
+    assert f["managed_hooks_pending"][hooks.PRE_RECORDING] == hooks.OUR_COMMANDS[hooks.PRE_RECORDING]
+    plan = hooks.reconcile(tomlkit.parse(live_config.read_text()), f)
+    assert hooks.PRE_RECORDING not in plan.foreign
+    monkeypatch.setattr(config, "safe_save", real_save)  # never undo(): it would drop the CONFIG_PATH patch
+    assert hooks.sync_config()["changed"] is True
+    f = features.load()
+    assert f["managed_hooks_pending"] == {}
+    assert f["managed_hooks"][hooks.PRE_RECORDING] == hooks.OUR_COMMANDS[hooks.PRE_RECORDING]
+
+
+def test_save_records_intent_for_hooks_wired_earlier_in_memory(live_config, monkeypatch):
+    """review r2 #3: load-time wiring is recorded as pending before the save."""
+    st = AppState.load(config.CONFIG_PATH, sidecar.SIDECAR_PATH)
+    seen = {}
+    real = config.safe_save
+
+    def spy(doc, path, **k):
+        seen["pending"] = features.load()["managed_hooks_pending"]
+        return real(doc, path, **k)
+    monkeypatch.setattr(config, "safe_save", spy)
+    st.save()
+    assert seen["pending"].get(hooks.PRE_RECORDING) == hooks.OUR_COMMANDS[hooks.PRE_RECORDING]
+    assert features.load()["managed_hooks_pending"] == {}
+
+
+def test_start_info_is_not_kept_when_the_archive_is_off(xdg, monkeypatch, tmp_path):
+    """review r2 #8."""
+    monkeypatch.setattr(cli_postprocess, "SIDECAR_PATH", tmp_path / "none.json")
+    for _ in range(3):
+        features.ensure_private_dir(features.runtime_dir())
+        features.atomic_write_text(capture.rec_start_path(), json.dumps(
+            {"start": time.time() - 3, "app": {"class": "foot"}}))
+        _run_main(monkeypatch, "words here")
+    assert not list(features.runtime_dir().glob("rec-*.json"))
