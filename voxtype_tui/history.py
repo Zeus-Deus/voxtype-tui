@@ -22,9 +22,11 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # keep the post-process import cost minimal
+    from typing import Any, Iterator
 
 from . import features as F
 
@@ -93,14 +95,14 @@ def new_id(now: float | None = None) -> str:
 
 
 def iso(ts: float) -> str:
-    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + (
-        f"{int((ts % 1) * 1000):03d}Z"
-    )
+    return time.strftime("%Y-%m-%dT%H:%M:%S.", time.gmtime(ts)) + f"{int((ts % 1) * 1000):03d}Z"
 
 
 def parse_ts(value: Any) -> float | None:
     if not isinstance(value, str) or not value:
         return None
+    from datetime import datetime
+
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
     except ValueError:
@@ -363,6 +365,8 @@ def summary(days: int = 365, data_dir: Path | None = None, feats: dict | None = 
         maintain(data_dir, feats, now)
     except Exception as e:
         note_failure("usage.summary", f"maintain: {e}", data_dir)
+    from datetime import date, timedelta
+
     days = max(1, min(int(days), 3660))
     u = _load_usage(data_dir)
     today = date.fromtimestamp(time.time() if now is None else now)
