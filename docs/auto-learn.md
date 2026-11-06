@@ -113,8 +113,11 @@ None of them are in `sync.json`. Debugging with text in the log:
 
 ## Cost
 
-- Post-processing: the learned stage takes 0.2–0.3 ms per dictation (500
-  learned entries, 60 words: p95 0.31 ms) and loads no word list.
+- Post-processing: with a typical handful of learned words the stage takes
+  about 0.2 ms per dictation (measured in an Omarchy VM on a real dictation).
+  Worst case measured: 500 learned entries, 60 words, a fresh process each
+  time (as Voxtype runs it): import + apply p95 2.5 ms. It never loads the
+  50k-word list.
 - The watcher exists only after a dictation, for at most 30 s (plus up to
   10 s for the Undo click), and costs ~0.2 % of one core and ~32 MB while
   armed. Nothing runs while you are not dictating.
@@ -136,7 +139,7 @@ learned.record_hits(hit_ids)             # off the critical path
 learn_everywhere.preview(enable=None)   # {"files": [{path, action, diff}], "needs_relogin"}
 learn_everywhere.set_enabled(bool)
 
-learn_watch.on_post_output(record)      # called by the post-output hook (already detached)
+learn_watch.on_post_output(record, window=None)  # post-output hook (already detached); window = delivery window
 python3 -m voxtype_tui.learn_watch --text "…" -v   # run one watch by hand
 ```
 
