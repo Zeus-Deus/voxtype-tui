@@ -1,7 +1,7 @@
 """Voxtype hook wiring + the ``voxtype-tui-hook <event>`` entry point.
 
-Wiring (DESIGN A3–A5)
----------------------
+Wiring
+------
 We only ever touch ``[output] pre_recording_command`` and
 ``post_output_command``, and only when the value is absent or exactly one
 we wrote (the string recorded in ``features.json → managed_hooks`` or our
@@ -163,7 +163,7 @@ def reconcile(doc: Any, feats: dict) -> Plan:
         ours = OUR_COMMANDS[key]
         cur = _get(doc, key)
         cur_s = None if cur is None else str(cur)
-        # A3: we only ever modify or remove a value equal to a string we
+        # We only ever modify or remove a value equal to a string we
         # recorded writing (committed or pending). An unrecorded value that
         # happens to be exactly our command is adopted when wanted (no edit
         # needed) and otherwise left alone.
@@ -240,7 +240,7 @@ def sync_config(config_path: Path | None = None, features_file: Path | None = No
 
 def record_intent(feats: dict, plan: "Plan", features_file: Path | None = None) -> None:
     """Before config.toml is written: record the hook strings about to be
-    ours as *pending*, keeping the committed record intact (DESIGN A3)."""
+    ours as *pending*, keeping the committed record intact."""
     old = dict(feats.get(F.MANAGED_HOOKS_KEY) or {})
     pending = {k: list(v) for k, v in (feats.get(F.PENDING_HOOKS_KEY) or {}).items()}
     changed = False

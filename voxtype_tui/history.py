@@ -1,6 +1,6 @@
 """Usage counters, recent history and capture health.
 
-Data flow (DESIGN A5, A13):
+Data flow:
 
 * ``voxtype-tui-postprocess`` (critical path) builds one record per
   dictation and calls :func:`enqueue`: a single ``O_APPEND`` line in

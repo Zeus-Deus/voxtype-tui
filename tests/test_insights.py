@@ -1,5 +1,5 @@
 """Insights data layer: features.json, usage/history queue, hook wiring,
-post-process capture, v4 migration (DESIGN A3–A13)."""
+post-process capture, v4 migration."""
 from __future__ import annotations
 
 import io
@@ -32,8 +32,8 @@ def xdg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture(autouse=True)
 def _no_learning_watcher(monkeypatch: pytest.MonkeyPatch):
-    """Tests decide whether L2's watcher module exists (it changes whether
-    post_output is wired for learning)."""
+    """Tests decide whether the learning watcher module exists (it changes
+    whether post_output is wired for learning)."""
     real = hooks._module_exists
     monkeypatch.setattr(hooks, "_module_exists",
                         lambda name: False if name == "voxtype_tui.learn_watch" else real(name))
@@ -382,7 +382,7 @@ def test_features_update_rewires_config(live_config):
 
 def test_unwired_upgrade_reports_not_connected_instead_of_zero(live_config):
     """Right after an upgrade nothing has saved the config: usage is on, but
-    voxtype never calls us. The summary says so (A10) and writes nothing."""
+    voxtype never calls us. The summary says so and writes nothing."""
     before = live_config.read_text()
     health = insights.usage_summary(30)["health"]
     assert health["pending_wiring"] == ["capture", "duration"]
@@ -503,8 +503,8 @@ def test_learned_stage_guarded_and_spans_protect_rules(xdg, monkeypatch, tmp_pat
 
 def test_fresh_install_without_metadata_gets_wired_on_load(live_config):
     st = AppState.load(config.CONFIG_PATH, sidecar.SIDECAR_PATH)
-    assert st.config_dirty  # A4: reconciled on every live load
-    # review r3 #3: nothing was written, so quitting without saving must not
+    assert st.config_dirty  # reconciled on every live load
+    # Nothing was written, so quitting without saving must not
     # restart the daemon (the exit hook restarts only when stale).
     assert not st.daemon_stale
     assert "insights-wire-hooks" in st.migrations_applied
@@ -586,7 +586,7 @@ def test_hook_entry_returns_fast_and_work_runs_detached(xdg):
 def test_enqueue_during_drain_never_waits_and_is_not_lost(xdg, monkeypatch):
     """maintain() renames the queue away under its flock (microseconds) and
     drains the renamed copy, so a dictation's enqueue never waits on a
-    drain and is never truncated away (review r1 #1)."""
+    drain and is never truncated away."""
     history.enqueue(_rec(1))
     orig = history._update_health
     seen = {}
@@ -635,7 +635,7 @@ def test_delete_queued_item_keeps_count_but_drops_text(xdg):
 
 
 def test_archive_only_without_text_keeps_no_text_anywhere(xdg, monkeypatch, tmp_path):
-    """review r1 #2: archive on, save_text off, history/learning off."""
+    """Archive on, save_text off, history/learning off."""
     monkeypatch.setattr(cli_postprocess, "SIDECAR_PATH", tmp_path / "none.json")
     features.update({"usage": {"enabled": False}, "history": {"enabled": False},
                      "learning": {"enabled": False},
@@ -656,7 +656,7 @@ def _fake_recorder(tmp_path: Path) -> str:
 
 
 def test_recorder_is_stopped_when_handoff_fails(xdg, monkeypatch, tmp_path):
-    """review r1 #3: a recorder must never outlive a failed setup."""
+    """A recorder must never outlive a failed setup."""
     import subprocess as sp
 
     features.update({"archive": {"enabled": True, "dir": str(tmp_path / "a")}}, wire=False)
@@ -683,7 +683,7 @@ def test_recorder_is_stopped_when_handoff_fails(xdg, monkeypatch, tmp_path):
 
 
 def test_archive_claims_each_record_once_with_its_own_handoff(xdg, tmp_path):
-    """review r1 #4/#5: finalizer A never touches B's handoff, and a second
+    """Finalizer A never touches B's handoff, and a second
     post-output for an old record never overwrites its archive entry."""
     import wave as wv
 
@@ -717,7 +717,7 @@ def test_archive_claims_each_record_once_with_its_own_handoff(xdg, tmp_path):
 
 
 def test_unrecorded_copy_of_our_command_is_never_removed(xdg):
-    """review r1 #7 (A3): modify/remove only the recorded string."""
+    """Modify or remove only the recorded string."""
     ours = hooks.OUR_COMMANDS[hooks.PRE_RECORDING]
     doc = _doc(f'[output]\npre_recording_command = "{ours}"\n')
     off = features.load()
@@ -748,7 +748,7 @@ def test_apply_migrations_wires_a_fresh_install(live_config):
 
 
 def test_resolve_source_matches_partial_device_names(monkeypatch):
-    """review r1 #10 / r2 #7: voxtype accepts partial device names; pw-record
+    """Voxtype accepts partial device names; pw-record
     needs the node name. Exact (incl. monitors) > case-insensitive exact >
     unique substring; anything else saves no audio rather than another mic."""
     import subprocess as sp
@@ -788,7 +788,7 @@ def test_post_output_after_cancel_drops_scratch_audio_and_keeps_archive(xdg, tmp
 
 
 def test_delete_and_clear_never_hold_the_queue_lock_during_history_work(xdg, monkeypatch):
-    """review r2 #1: a dictation's enqueue must not wait on History edits."""
+    """A dictation's enqueue must not wait on History edits."""
     for i in range(3):
         history.enqueue(_rec(i))
     rid = history.list_items()["items"][0]["id"]
@@ -813,7 +813,7 @@ def test_delete_and_clear_never_hold_the_queue_lock_during_history_work(xdg, mon
 
 
 def test_clear_finishes_a_leftover_draining_batch(xdg):
-    """review r2 #5: a crashed drain's batch is cleared too."""
+    """A crashed drain's batch is cleared too."""
     history.enqueue(_rec(1))
     history._claim_queue(None)  # a maintainer claimed it, then died
     assert history._draining_path(None).exists()
@@ -823,7 +823,7 @@ def test_clear_finishes_a_leftover_draining_batch(xdg):
 
 
 def test_cancel_cleanup_never_touches_a_newer_recording(xdg, monkeypatch):
-    """review r2 #2: B started after A's post-output began -> keep B's files."""
+    """B started after A's post-output began -> keep B's files."""
     rt = features.ensure_private_dir(features.runtime_dir() / "rec")
     wav = rt / "b.wav"
     wav.write_bytes(b"RIFF")
@@ -842,7 +842,7 @@ def test_cancel_cleanup_never_touches_a_newer_recording(xdg, monkeypatch):
 
 
 def test_failed_save_keeps_old_and_new_hook_strings_ours(live_config, monkeypatch):
-    """review r2 #3/#4: pending intent survives a failed or crashed save."""
+    """Pending intent survives a failed or crashed save."""
     old = "voxtype-tui-hook pre-recording"
     live_config.write_text(f'[output]\npre_recording_command = "{old}"\n')
     features.set_managed_hooks({hooks.PRE_RECORDING: old})
@@ -867,7 +867,7 @@ def test_failed_save_keeps_old_and_new_hook_strings_ours(live_config, monkeypatc
 
 
 def test_save_records_intent_for_hooks_wired_earlier_in_memory(live_config, monkeypatch):
-    """review r2 #3: load-time wiring is recorded as pending before the save."""
+    """Load-time wiring is recorded as pending before the save."""
     st = AppState.load(config.CONFIG_PATH, sidecar.SIDECAR_PATH)
     seen = {}
     real = config.safe_save
@@ -882,7 +882,7 @@ def test_save_records_intent_for_hooks_wired_earlier_in_memory(live_config, monk
 
 
 def test_start_info_is_not_kept_when_the_archive_is_off(xdg, monkeypatch, tmp_path):
-    """review r2 #8."""
+    """With the archive off, no recording-start info is kept."""
     monkeypatch.setattr(cli_postprocess, "SIDECAR_PATH", tmp_path / "none.json")
     for _ in range(3):
         features.ensure_private_dir(features.runtime_dir())
@@ -894,7 +894,7 @@ def test_start_info_is_not_kept_when_the_archive_is_off(xdg, monkeypatch, tmp_pa
 
 
 def test_record_intent_keeps_earlier_pending_strings(xdg):
-    """review r3 #4: a string pending from a crashed/failed save stays ours
+    """A string pending from a crashed/failed save stays ours
     until a save commits, even when the next plan removes that hook."""
     old_pending = "voxtype-tui-hook pre-recording --v2"
     features.set_managed_hooks({}, pending={hooks.PRE_RECORDING: [old_pending]})
@@ -910,7 +910,7 @@ def test_record_intent_keeps_earlier_pending_strings(xdg):
 
 
 def test_hook_entry_passes_its_start_time_to_the_worker(xdg, monkeypatch):
-    """review r3 #2: the generation boundary is taken before the fork."""
+    """The generation boundary is taken before the fork."""
     from voxtype_tui import hook_main
 
     seen = {}

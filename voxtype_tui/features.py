@@ -2,7 +2,7 @@
 
 Stored in ``$XDG_CONFIG_HOME/voxtype-tui/features.json`` (0600, dir 0700).
 A missing file means "all defaults". Unknown keys are preserved on write so a
-newer voxtype-tui (or L2's learning module) can add sections without an older
+newer voxtype-tui (or its learning module) can add sections without an older
 one dropping them.
 
 ``managed_hooks`` is the durable ownership record for the voxtype hook

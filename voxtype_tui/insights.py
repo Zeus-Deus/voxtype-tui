@@ -89,7 +89,7 @@ def usage_summary(days: int = 365, config_path: Path | None = None) -> dict:
         pass
     # Right after an upgrade nothing has saved the config yet: the switches
     # are on but voxtype does not call us. Say so instead of showing zero
-    # usage (A10). Re-saving any switch connects it.
+    # usage. Re-saving any switch connects it.
     pending = _pending_wiring(feats, config_path)
     for feature in pending:
         unavailable.append({"feature": feature, "reason": "not connected to Voxtype yet"})

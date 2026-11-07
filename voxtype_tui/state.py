@@ -47,8 +47,8 @@ def _is_live_config(path: Path) -> bool:
 def _reconcile_hooks(doc: TOMLDocument, path: Path, *, record_intent: bool = False) -> bool:
     """Apply :func:`hooks.reconcile` to ``doc``; True when it changed.
     With ``record_intent`` (right before a save) the hook strings about to
-    be written are recorded as ours first (DESIGN A3: never a hook of ours
-    we don't know we own). Fail-open: a broken features file must never
+    be written are recorded as ours first (never a hook of ours we don't
+    know we own). Fail-open: a broken features file must never
     block loading/saving."""
     if not _is_live_config(path):
         return False
@@ -136,7 +136,7 @@ class AppState:
         # the sync bundle uses the migrated config shape.
         migration_result = migrations.run_pending(doc, sc)
         config_dirty_from_migrations = migration_result.touches_config
-        # Insights hook wiring (DESIGN A4): reconciled on every load of the
+        # Insights hook wiring: reconciled on every load of the
         # live config — upgrades, fresh installs without metadata.json (no
         # migration runs) and installs whose hooks went missing alike. Only
         # absent or recorded-as-ours values change; a change marks the

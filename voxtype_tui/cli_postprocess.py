@@ -137,7 +137,7 @@ def _passthrough_note() -> None:
 
 def _protected_spans(text: str, rules: list[Rule]) -> list[tuple[int, int]]:
     """Spans of ``text`` that equal a dictionary rule's output. Learned
-    aliases must never rewrite inside them (user rules win, DESIGN A2).
+    aliases must never rewrite inside them (user rules win).
     Over-approximates (any occurrence, fired or not), which only protects
     more text."""
     spans: list[tuple[int, int]] = []
@@ -154,7 +154,7 @@ def _protected_spans(text: str, rules: list[Rule]) -> list[tuple[int, int]]:
 
 
 def _learned_module():
-    """L2's learned-words stage, when installed (guarded: absent → no-op)."""
+    """The learned-words stage (auto-learn), when installed (guarded: absent → no-op)."""
     try:
         from . import learned  # type: ignore[attr-defined]
     except Exception:
@@ -227,7 +227,7 @@ def process(
 
 
 def _capture(raw: str, final: str, changed_by: list[str], hits: list[str]) -> None:
-    """Queue one record for usage/history/archive/learning (DESIGN A5/A13).
+    """Queue one record for usage/history/archive/learning.
 
     Critical path: one features read, a few stats, one O_APPEND line (and
     one small tmpfs file when the archive or learning needs the text after

@@ -131,9 +131,8 @@ def _insights_wire_hooks(doc: TOMLDocument, sc: sidecar.Sidecar) -> bool:
     on every load of the live config; ``AppState.save``, ``features.update``
     and ``--apply-migrations`` reconcile too, so a fresh install without
     metadata.json — where no migration ever runs — is wired as well
-    (DESIGN A4). This entry versions the schema and is the anchor L2's
-    ``learned-*`` migration is appended after. Returns False: it changes
-    nothing by itself.
+    This entry versions the schema. Returns False: it changes nothing by
+    itself.
     """
     return False
 
