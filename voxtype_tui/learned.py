@@ -392,7 +392,7 @@ def find_record(record_id: str) -> dict | None:
     """Look a dictation record up by id (history.jsonl, newest first)."""
     try:
         import importlib
-        history = importlib.import_module("voxtype_tui.history")  # L1, optional
+        history = importlib.import_module("voxtype_tui.history")  # insights, optional
         get = getattr(history, "get", None)
         if callable(get):
             rec = get(record_id)

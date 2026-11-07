@@ -316,7 +316,7 @@ def test_notification_text_and_disabled_notify(tmp_path, monkeypatch):
     assert called == []
 
 
-# ---------------------------------------------------------------- review r1 regressions
+# ---------------------------------------------------------------- regressions
 
 def test_r1_english_heard_form_never_becomes_alias_after_merge():
     L.submit_correction(rec("I read Austin yesterday"), "I read Austen yesterday", "fix")
@@ -408,7 +408,7 @@ def test_many_user_phrases_stay_cheap():
     assert ms < 3.0, ms
 
 
-# ---------------------------------------------------------------- review r2 regressions
+# ---------------------------------------------------------------- more regressions
 
 def test_r2_correct_multiword_term_is_not_duplicated():
     L.submit_correction(rec("I use Omashi OS daily"), "I use Omarchy OS daily", "fix", kind="spelling")
