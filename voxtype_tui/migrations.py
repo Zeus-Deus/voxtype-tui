@@ -160,8 +160,6 @@ MIGRATIONS: list[Migration] = [
         apply=_insights_wire_hooks,
         touches_config=True,
     ),
-    # TODO(auto-learn): L2's `learned-*` migration is appended here, after
-    # insights-wire-hooks, and bumps sidecar.SCHEMA_VERSION in the merge.
 ]
 
 
