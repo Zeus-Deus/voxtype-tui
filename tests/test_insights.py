@@ -380,6 +380,34 @@ def test_features_update_rewires_config(live_config):
     assert out["available"]["usage"] is True
 
 
+def test_unwired_upgrade_reports_not_connected_instead_of_zero(live_config):
+    """Right after an upgrade nothing has saved the config: usage is on, but
+    voxtype never calls us. The summary says so (A10) and writes nothing."""
+    before = live_config.read_text()
+    health = insights.usage_summary(30)["health"]
+    assert health["pending_wiring"] == ["capture", "duration"]
+    assert {"feature": "capture", "reason": "not connected to Voxtype yet"} in health["unavailable"]
+    assert live_config.read_text() == before
+    # Re-saving a switch (what the panel's Connect does) wires it.
+    insights.set_features({"usage": {"enabled": True}})
+    assert insights.usage_summary(30)["health"]["pending_wiring"] == []
+
+
+def test_upgrade_with_bare_postprocess_still_counts(live_config):
+    """A 0.1.x user with vocabulary already has the bare post-process name,
+    which runs the new capture: only the duration hook is pending."""
+    live_config.write_text(live_config.read_text()
+                           + '\n[output.post_process]\ncommand = "voxtype-tui-postprocess"\n')
+    health = insights.usage_summary(30)["health"]
+    assert health["pending_wiring"] == ["duration"]
+    assert all(u["feature"] != "capture" for u in health["unavailable"])
+
+
+def test_nothing_pending_when_capture_is_off(live_config):
+    insights.set_features({"usage": {"enabled": False}, "history": {"enabled": False}})
+    assert insights.usage_summary(30)["health"]["pending_wiring"] == []
+
+
 # --- post-process capture ----------------------------------------------------
 
 def _run_main(monkeypatch, text: str) -> str:

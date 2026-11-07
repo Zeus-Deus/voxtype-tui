@@ -87,7 +87,40 @@ def usage_summary(days: int = 365, config_path: Path | None = None) -> dict:
                                 "reason": "your own pre_recording_command is set"})
     except (OSError, ValueError):
         pass
+    # Right after an upgrade nothing has saved the config yet: the switches
+    # are on but voxtype does not call us. Say so instead of showing zero
+    # usage (A10). Re-saving any switch connects it.
+    pending = _pending_wiring(feats, config_path)
+    for feature in pending:
+        unavailable.append({"feature": feature, "reason": "not connected to Voxtype yet"})
     out["health"]["unavailable"] = unavailable
+    out["health"]["pending_wiring"] = pending
+    return out
+
+
+def _pending_wiring(feats: dict, config_path: Path | None = None) -> list[str]:
+    """Features whose hook voxtype's config does not have yet: "capture"
+    (no post-process tap, so nothing is counted), "duration" (no
+    pre-recording hook) or "learning" (no post-output hook). A dry run of
+    :func:`hooks.reconcile` on a private copy; nothing is written."""
+    from . import config, hooks
+
+    path = config_path or config.CONFIG_PATH
+    try:
+        if not path.exists():
+            return []
+        doc = config.load(path)
+        tapped = config.is_our_post_process_command(config.get_post_process(doc).get("command"))
+        wired = hooks.reconcile(doc, feats).wired
+    except Exception:  # unreadable config: availability reports it elsewhere
+        return []
+    out = []
+    if "output.post_process.command" in wired and not tapped:
+        out.append("capture")
+    if hooks.PRE_RECORDING in wired:
+        out.append("duration")
+    if hooks.POST_OUTPUT in wired:
+        out.append("learning")
     return out
 
 

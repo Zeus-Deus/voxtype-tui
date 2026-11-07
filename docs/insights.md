@@ -113,6 +113,13 @@ insights.history_clear()              # {removed}
 at `usage.typing_wpm` (default 40) would have taken, minus the time you spent
 speaking. Both are `null` until something has been measured.
 
+`health` = `{last_capture_ts, dropped, failures, unavailable:[{feature, reason}],
+pending_wiring}`. `pending_wiring` lists the features whose hook is not in
+voxtype's config yet (`capture`, `duration`, `learning`), e.g. right after an
+upgrade before anything saved the config; each also appears in `unavailable`
+as "not connected to Voxtype yet". Re-saving any switch with `set_features`
+wires them; the daemon then needs a restart.
+
 A record:
 
 ```json
