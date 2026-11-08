@@ -30,6 +30,10 @@ KeePassXC, …) are never watched.
 | spelling | `Austin → Austen` | A hint only: close misspellings are fixed, but the real word "Austin" is left alone. |
 | replace | `cloud → Claude` | Every "cloud" becomes "Claude". Only from an explicit choice in History › Fix. |
 
+Telling "sounds like" from "spelling" needs the English word list
+(cracklib or `/usr/share/dict/words`). Without one every correction is learned as a
+spelling, unless you pick the kind yourself in History › Fix.
+
 A correction is ignored when it does not look like a mishearing:
 
 - more than 3 words changed, or more than 30 % of the words (50 % for an

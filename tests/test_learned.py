@@ -480,3 +480,19 @@ def test_exact_alias_never_rewrites_next_to_a_combining_mark(text):
     L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")
     assert L.apply("on Omashi today")[0] == "on Omarchy today"  # control
     assert L.apply(text)[0] == text
+
+
+def test_no_wordlist_explicit_fix_defaults_to_spelling(monkeypatch):
+    monkeypatch.setattr(vocab_corrector, "_words", None)
+    monkeypatch.setattr(L, "_WORDS_FILE", Path("/nonexistent/words"))
+    out = L.submit_correction(rec("I read Austin yesterday"), "I read Austen yesterday", "fix")
+    e = out["applied"][0]
+    assert e["kind"] == "spelling" and e["aliases"] == []
+    assert L.apply("I flew to Austin today")[0] == "I flew to Austin today"
+
+
+def test_no_wordlist_explicit_kind_is_still_honoured(monkeypatch):
+    monkeypatch.setattr(vocab_corrector, "_words", None)
+    out = L.submit_correction(rec("on Omashi"), "on Omarchy", "fix", kind="sounds_like")
+    assert out["applied"][0]["kind"] == "sounds_like"
+    assert L.apply("on Omashi")[0] == "on Omarchy"

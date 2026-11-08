@@ -375,9 +375,10 @@ def classify(heard: str, written: str, *, user_vocab: Iterable[str] = (),
         return None, "the words are too different (a different word, not a mishearing)"
     if kind in ("spelling", "sounds_like"):
         k = kind
-    elif words is None and passive:
+    elif words is None:
         # Without a wordlist we cannot tell "Austin" (a word) from "Omashi"
-        # (a mishearing): a passive capture never creates an exact alias then.
+        # (a mishearing): never create an exact alias unless the user chose
+        # the kind themselves.
         k = "spelling"
     else:
         k = "spelling" if _is_english(h, words) else "sounds_like"
