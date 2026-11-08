@@ -59,6 +59,9 @@ suggestion confirmed by its second fix, or a new misheard form confirmed
 for a word you already have) you get a notification, "Vocabulary learned —
 Added "Omarchy" from your correction." Click it within 10 s to undo that
 step: the entry goes back to how it was before (a new entry is removed).
+The Undo is bound to the step the notification announced, so it still
+works if the same correction is picked up again before you click it (a
+repeat that changes nothing is not a step of its own).
 
 ## Your words always win
 
@@ -70,7 +73,9 @@ needs no restart and is fully reversible.
 
 To make a learned word one of your own, **promote** it: a spelling becomes a
 vocabulary word, a sounds-like/replace entry becomes a dictionary
-replacement. From then on it is yours and learning leaves it alone.
+replacement. Promoting confirms the entry: misheard forms that were still
+waiting for a second fix become dictionary replacements too. From then on
+it is yours and learning leaves it alone.
 Promotions run one at a time (under the learned-words lock), so promoting
 several words at once never loses one.
 
@@ -99,7 +104,18 @@ deleted. Symlinked flag files are left alone (add the flag yourself).
 Each file is checked again right before it is written or removed; if you
 (or another program) changed it, or replaced it with a symlink, in the
 meantime, nothing is written to it and the switch reports the file so you
-can try again.
+can try again. No path is ever replaced while you might be saving it:
+
+- Turning it on appends the two lines to an existing file in place, through
+  the file it just checked (opened without following symlinks; same file,
+  same bytes). A save that lands at that moment is kept: a program
+  appending in place keeps both, an editor that saves by renaming wins and
+  the switch reports the file.
+- Turning it off moves the file aside in one step, checks the moved file
+  is the one it read (same file, same bytes; otherwise it is put back
+  untouched), and publishes the cleaned copy only if the name is still
+  free. If you saved a new copy in that instant, yours stays and the old
+  one is kept beside it as `<name>.voxtype-tui-kept`.
 
 Cost, measured in an Omarchy VM: Chromium idle CPU unchanged (0.20 vs 0.23 %
 of one core over 20 s); Chromium memory about 190 MB higher (all processes,
@@ -149,9 +165,11 @@ from voxtype_tui import learned, learn_everywhere, learn_watch
 learned.submit_correction(record_or_id, edited_text, source="fix", kind=None)
 #   -> {"ok", "candidates": [{heard, written, kind}], "applied": [entry],
 #       "skipped": [{heard, written, reason}], "reason"?}
-#   each applied entry has "activated": true when this call turned it on
+#   each applied entry has "activated": true when this call turned it on,
+#   and "step": the id of this learning step (None when it changed nothing)
 learned.list_entries()      # {"enabled", "everywhere", "entries", "counts"}
-learned.accept(id) / reject(id) / forget(id) / undo(id) / reset()
+learned.accept(id) / reject(id) / forget(id) / reset()
+learned.undo(id, record_id=None, step=None)  # step = applied[i]["step"]: undo exactly that step
 learned.promote(id, add_to_user=None)   # -> {"ok", "entry", "added": {vocab, rules}}
 learned.apply(text, protected_spans=(), user_phrases=())  # -> (text, hit_ids); never raises
 learned.record_hits(hit_ids)             # off the critical path
