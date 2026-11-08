@@ -94,9 +94,14 @@ def newest_handoff(rt: str, max_age_s: float = HANDOFF_MAX_AGE_S) -> "str | None
     try:
         with os.scandir(d) as it:
             for e in it:
-                if not e.name.endswith(".json") or not e.is_file(follow_symlinks=False):
+                try:
+                    if not e.name.endswith(".json") or not e.is_file(follow_symlinks=False):
+                        continue
+                    key = (e.stat(follow_symlinks=False).st_mtime_ns, e.name)
+                except OSError:
+                    # Removed while we scan (an older record's worker just
+                    # finished): skip it, the others still count.
                     continue
-                key = (e.stat(follow_symlinks=False).st_mtime_ns, e.name)
                 if best is None or key > best[0]:
                     best = (key, e.name)
     except OSError:
@@ -124,8 +129,11 @@ def prune(rt: str, now: float, keep_s: float, sub: str) -> None:
             return
         with os.scandir(d) as it:
             for e in it:
-                if (e.is_file(follow_symlinks=False)
-                        and now - e.stat(follow_symlinks=False).st_mtime > keep_s):
-                    os.unlink(e.path)
+                try:
+                    if (e.is_file(follow_symlinks=False)
+                            and now - e.stat(follow_symlinks=False).st_mtime > keep_s):
+                        os.unlink(e.path)
+                except OSError:
+                    continue  # gone already (or not ours to remove): keep going
     except OSError:
         pass

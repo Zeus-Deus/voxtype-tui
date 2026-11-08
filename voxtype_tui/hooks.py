@@ -354,10 +354,13 @@ def _purge_stale(rt: Path, keep: str | None = None) -> None:
                     if not (e.name.startswith(prefix) and e.name.endswith(suffix)):
                         continue
                     # lstat: a symlink is never followed (nor unlinked as data)
-                    if not e.is_file(follow_symlinks=False) or e.path == keep:
-                        continue
-                    if now - e.stat(follow_symlinks=False).st_mtime > 600:
-                        os.unlink(e.path)
+                    try:
+                        if not e.is_file(follow_symlinks=False) or e.path == keep:
+                            continue
+                        if now - e.stat(follow_symlinks=False).st_mtime > 600:
+                            os.unlink(e.path)
+                    except OSError:
+                        continue  # removed meanwhile: the rest still gets purged
         except OSError:
             pass
 

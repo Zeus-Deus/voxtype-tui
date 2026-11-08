@@ -1312,3 +1312,60 @@ def test_learned_never_rewrites_dictionary_output_the_vocab_stage_changed(xdg, m
         "project", sidecar_path=side, config_path=tmp_path / "none.toml")
     assert text == "Codemux Omashi"
     assert changed_by == ["dictionary", "vocab"]
+
+
+# --- critical-path robustness ---------------------------------------------
+
+def test_newest_handoff_skips_an_entry_removed_during_the_scan(xdg, monkeypatch):
+    """An older handoff removed by its worker while the next post-output
+    hook scans must not hide the current one."""
+    from voxtype_tui import rtdir
+
+    rt = rtdir.runtime_path()
+    now = time.time()
+    for rid, age in (("old-a", 5), ("new-b", 1)):
+        p = Path(rtdir.handoff_file(rt, rid))
+        features.atomic_write_text(p, json.dumps({"id": rid}))
+        os.utime(p, (now - age, now - age))
+    real_scandir = os.scandir
+
+    class _Racing:
+        def __init__(self, path):
+            self._it = real_scandir(path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._it.close()
+
+        def __iter__(self):
+            for e in self._it:
+                if e.name == "old-a.json":
+                    os.unlink(e.path)  # A's worker finished just now
+                yield e
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(rtdir.os, "scandir", _Racing)
+        assert rtdir.newest_handoff(rt) == "new-b"
+    # pruning keeps going past a vanished entry too
+    p = Path(rtdir.handoff_file(rt, "old-c"))
+    features.atomic_write_text(p, "{}")
+    os.utime(p, (now - 900, now - 900))
+    q = Path(rtdir.handoff_file(rt, "old-d"))
+    features.atomic_write_text(q, "{}")
+    os.utime(q, (now - 900, now - 900))
+
+    class _RacingPrune(_Racing):
+        def __iter__(self):
+            gone = False
+            for e in self._it:
+                if not gone and e.name.startswith("old-"):
+                    os.unlink(e.path)  # the first old entry vanishes mid-scan
+                    gone = True
+                yield e
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(rtdir.os, "scandir", _RacingPrune)
+        rtdir.prune(rt, now, 600, "handoff")
+    assert sorted(os.listdir(Path(rt) / "handoff")) == ["new-b.json"]
