@@ -706,3 +706,30 @@ def test_a_duplicate_submit_returns_no_step_of_its_own():
     again = L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")["applied"][0]
     assert first["step"] and again["step"] is None and again["activated"] is False
     assert "steps" not in again and "last_step" not in again
+
+
+def test_undo_of_an_older_activation_keeps_a_later_explicit_fix():
+    o = "today we are going to build on Omarion with computers"
+    e = "today we are going to build on Omarchy with computers"
+    L.submit_correction(rec(o, "w1"), e, "atspi")
+    second = L.submit_correction(rec(o, "w2"), e, "atspi")["applied"][0]
+    assert second["activated"] is True and second["step"]
+    # while that notification is still open, History > Fix adds another alias
+    L.submit_correction(rec("on Omashi", "f1"), "on Omarchy", "fix")
+    assert L.apply("on Omashi")[0] == "on Omarchy"
+    assert L.undo(second["id"], "w2", step=second["step"])
+    ent = L.load()["entries"][0]
+    assert ent["aliases"] == ["Omashi"] and ent["state"] == "active"
+    assert L.apply("on Omashi")[0] == "on Omarchy"      # the later explicit fix still works
+    assert L.apply("on Omarion")[0] == "on Omarion"     # the undone step's alias is gone
+
+
+def test_undo_of_an_older_activation_without_later_decisions_still_reverts():
+    o = "today we are going to build on Omarion with computers"
+    e = "today we are going to build on Omarchy with computers"
+    L.submit_correction(rec(o, "w1"), e, "atspi")
+    second = L.submit_correction(rec(o, "w2"), e, "atspi")["applied"][0]
+    L.submit_correction(rec(o, "w3"), e, "atspi")  # a later passive repeat, nothing new
+    assert L.undo(second["id"], "w2", step=second["step"])
+    ent = L.load()["entries"][0]
+    assert ent["state"] == "suggested" and L.apply("on Omarion")[0] == "on Omarion"

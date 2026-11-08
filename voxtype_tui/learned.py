@@ -584,7 +584,7 @@ def submit_correction(record: dict | str, edited_text: str, source: str = "fix",
                 step = steps[e["id"]] = {"id": _new_id().replace("l_", "s_", 1), "record": rec_id,
                                          "new": is_new, "prev_state": e["state"],
                                          "counted": not duplicate, "at": _iso(now),
-                                         "aliases": [], "pending": {}}
+                                         "aliases": [], "pending": {}, "explicit": not passive}
             hl = p["heard"].lower()
             if hl not in step["pending"]:
                 snap = (e.get("pending_aliases") or {}).get(hl)
@@ -796,10 +796,11 @@ def undo(entry_id: str, record_id: str | None = None, step: str | None = None) -
                 target = next((s for s in reversed(steps)
                                if record_id is None or s.get("record") == record_id), None)
             if target is not None:
-                latest = target is steps[-1]
+                i = steps.index(target)
+                later = steps[i + 1:]
                 e["steps"] = [s for s in steps if s is not target]
                 e.pop("last_step", None)
-                _undo_step(store, e, target, latest=latest)
+                _undo_step(store, e, target, later=later)
             elif int(e.get("count", 0)) <= 1:
                 store["entries"].remove(e)
             else:
@@ -823,7 +824,16 @@ def _drop_one(seq: list, value: object) -> None:
             return
 
 
-def _undo_step(store: dict, e: dict, step: dict, *, latest: bool = True) -> None:
+def _keeps_active(step: dict) -> bool:
+    """A learning step that turned the entry on by itself: an explicit fix
+    (History > Fix always activates) or one that confirmed an alias."""
+    return bool(step.get("explicit") or step.get("aliases"))
+
+
+def _undo_step(store: dict, e: dict, step: dict, *, later: list[dict] = ()) -> None:
+    """Take back ``step``. ``later`` are the steps recorded after it, which
+    stay: the state is derived from them rather than restored blindly."""
+    latest = not later
     if step.get("new"):
         store["entries"].remove(e)  # everything after a first sighting builds on it
         return
@@ -853,7 +863,10 @@ def _undo_step(store: dict, e: dict, step: dict, *, latest: bool = True) -> None
         if rid and rid in e.get("records", []):
             e["records"].remove(rid)
     if step.get("prev_state") in STATES:
-        e["state"] = step["prev_state"]
+        if e.get("state") == "active" and any(_keeps_active(s) for s in later):
+            pass  # a later correction (e.g. an explicit fix) keeps it on on its own
+        else:
+            e["state"] = step["prev_state"]
 
 
 def reset() -> int:
