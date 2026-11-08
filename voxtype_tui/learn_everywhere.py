@@ -185,11 +185,14 @@ def _ident(path: Path) -> list[int] | None:
 
 class _Conflict(Exception):
     """A target changed between planning and writing it. ``kept`` names
-    where the claimed file was preserved if it could not go back."""
+    where the claimed file was preserved if it could not go back;
+    ``written`` is True when it changed after the cleaned copy was already
+    in place (so ``path`` holds ours and ``kept`` holds theirs)."""
 
-    def __init__(self, path: str, kept: str | None = None):
+    def __init__(self, path: str, kept: str | None = None, written: bool = False):
         super().__init__(path)
         self.kept = kept
+        self.written = written
 
 
 def _expect(path: Path, item: dict) -> None:
@@ -205,7 +208,8 @@ def _race_hook(stage: str, path: Path) -> None:
     """Does nothing. Tests replace it to save a file at an exact moment
     ("append": right before our bytes are written; "claim": right before
     the target is moved aside; "publish": right before the edited copy is
-    linked into place)."""
+    linked into place; "discard": right before the claimed original is
+    deleted)."""
 
 
 def _same_file(st: os.stat_result, ident: list[int] | None) -> bool:
@@ -302,6 +306,19 @@ def _put_back(tmpdir: str, aside: Path, path: Path) -> str | None:
             os.rmdir(tmpdir)
 
 
+def _claimed_unchanged(aside: Path, st: os.stat_result, item: dict) -> bool:
+    """The claimed file is still exactly what was claimed. A program that
+    opened it before the move can still write to it through that open
+    descriptor; that write must not be thrown away."""
+    try:
+        now = os.lstat(aside)
+    except OSError:
+        return False
+    return (_same_file(now, item.get("ident")) and now.st_size == st.st_size
+            and now.st_mtime_ns == st.st_mtime_ns
+            and _read_nofollow(aside) == item["old"].encode("utf-8"))
+
+
 def _claim(path: Path, item: dict) -> tuple[str, Path, os.stat_result]:
     """Move ``path`` into a private directory beside it (one atomic rename,
     which moves a symlink itself, never its target) and check that what
@@ -344,16 +361,30 @@ def _replace_if_unchanged(path: Path, item: dict) -> None:
             f.flush()
             os.fsync(f.fileno())
         _race_hook("publish", path)
+        if not _claimed_unchanged(aside, st, item):
+            raise _Conflict(str(path))
         os.link(tmp, path)
     except BaseException as e:
         if tmp is not None:
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
         kept = _put_back(tmpdir, aside, path)
-        if isinstance(e, FileExistsError):
+        if isinstance(e, (FileExistsError, _Conflict)):
             raise _Conflict(str(path), kept) from None
         raise
     os.unlink(tmp)
+    _discard_claimed(tmpdir, aside, st, path, item, written=True)
+
+
+def _discard_claimed(tmpdir: str, aside: Path, st: os.stat_result, path: Path, item: dict,
+                     *, written: bool) -> None:
+    """Delete the claimed original, unless it was written to since the
+    claim: then it goes back to ``path`` (or, if ``path`` holds a file
+    again, is kept beside it) and :class:`_Conflict` is raised."""
+    _race_hook("discard", path)
+    if not _claimed_unchanged(aside, st, item):
+        kept = _put_back(tmpdir, aside, path)
+        raise _Conflict(str(path), kept, written=written and kept is not None)
     os.unlink(aside)
     with contextlib.suppress(OSError):
         os.rmdir(tmpdir)
@@ -361,10 +392,8 @@ def _replace_if_unchanged(path: Path, item: dict) -> None:
 
 def _remove_if_unchanged(path: Path, item: dict) -> None:
     """Delete ``path`` only if it still holds what the plan saw."""
-    tmpdir, aside, _st = _claim(path, item)
-    os.unlink(aside)
-    with contextlib.suppress(OSError):
-        os.rmdir(tmpdir)
+    tmpdir, aside, st = _claim(path, item)
+    _discard_claimed(tmpdir, aside, st, path, item, written=False)
 
 
 # ------------------------------------------------------------------ edits
@@ -656,7 +685,12 @@ def _set_enabled_locked(enabled: bool) -> dict:
                 out = {"ok": False, "conflict": str(path), "files": done,
                        "error": f"{path} changed while Learn everywhere was updating it; "
                                 "nothing was written to it. Try again."}
-                if kept:
+                if kept and getattr(e, "written", False):
+                    out["kept"] = kept
+                    out["error"] = (f"{path} was written to while Learn everywhere was updating "
+                                    f"it; {path} now has our lines removed and the file with "
+                                    f"your change is at {kept}.")
+                elif kept:
                     out["kept"] = kept
                     out["error"] = (f"{path} was saved again while Learn everywhere was updating "
                                     f"it; your new file was kept and the previous one is at {kept}.")

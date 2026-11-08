@@ -468,3 +468,66 @@ def test_disable_remove_keeps_a_created_file_edited_just_before_the_move(cfg, mo
     r = LE.set_enabled(False)
     assert fired and r["ok"] is False and p.read_text() == edited
     assert _leftovers(cfg) == []
+
+
+# ------------------------------- writes through a descriptor opened before disabling
+
+def _open_writer(p):
+    """A settings writer that opened the file before Learn everywhere was
+    turned off and appends through that same descriptor later."""
+    f = open(p, "a")
+
+    def write():
+        f.write("--other\n")
+        f.flush()
+    return f, write
+
+
+def test_disable_edit_keeps_a_write_through_an_open_descriptor_before_publish(cfg, monkeypatch):
+    p = cfg / "chromium-flags.conf"
+    p.write_text("--a\n")
+    assert LE.set_enabled(True)["ok"]
+    ours = p.read_text()
+    f, write = _open_writer(p)
+    try:
+        fired = _at(monkeypatch, "publish", p, write)
+        r = LE.set_enabled(False)
+    finally:
+        f.close()
+    assert fired and r["ok"] is False and r["conflict"] == str(p)
+    assert p.read_text() == ours + "--other\n"   # the changed original is back in place
+    assert _leftovers(cfg) == []
+    assert str(p) in LE._load_state()["files"]
+
+
+def test_disable_edit_keeps_a_write_through_an_open_descriptor_after_publish(cfg, monkeypatch):
+    p = cfg / "chromium-flags.conf"
+    p.write_text("--a\n")
+    assert LE.set_enabled(True)["ok"]
+    ours = p.read_text()
+    f, write = _open_writer(p)
+    try:
+        fired = _at(monkeypatch, "discard", p, write)
+        r = LE.set_enabled(False)
+    finally:
+        f.close()
+    assert fired and r["ok"] is False and r["conflict"] == str(p)
+    assert Path(r["kept"]).read_text() == ours + "--other\n"   # nothing is lost
+    assert Path(r["kept"]).name == "chromium-flags.conf.voxtype-tui-kept"
+    assert str(p) in r["error"] and r["kept"] in r["error"]
+    assert [x for x in _leftovers(cfg) if not x.endswith("-kept")] == []
+
+
+def test_disable_remove_keeps_a_write_through_an_open_descriptor(cfg, monkeypatch):
+    LE.set_enabled(True)
+    p = cfg / "electron43-flags.conf"
+    ours = p.read_text()
+    f, write = _open_writer(p)
+    try:
+        fired = _at(monkeypatch, "discard", p, write)
+        r = LE.set_enabled(False)
+    finally:
+        f.close()
+    assert fired and r["ok"] is False and r["conflict"] == str(p)
+    assert p.read_text() == ours + "--other\n"
+    assert _leftovers(cfg) == []
