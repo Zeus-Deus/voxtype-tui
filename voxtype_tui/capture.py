@@ -127,7 +127,9 @@ def config_info(cfg: Path | None = None) -> dict:
         }
         try:
             if cache is not None:
-                F.atomic_write_text(cache, json.dumps({"key": key, "path": str(cfg), "info": info}))
+                # A disposable cache on the dictation path: no fsync.
+                F.atomic_write_text(cache, json.dumps({"key": key, "path": str(cfg), "info": info}),
+                                    durable=False)
         except OSError:
             pass
     out = dict(info)
