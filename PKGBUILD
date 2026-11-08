@@ -27,7 +27,7 @@ optdepends=(
 )
 install=voxtype-tui.install
 source=("$pkgname-$pkgver.tar.gz::https://github.com/Zeus-Deus/voxtype-tui/archive/v$pkgver.tar.gz")
-sha256sums=('2a86e05807035a9f532f1b6a7ce8f16ca91fbf1f02305ae31381101389cf67f9')
+sha256sums=('be7a6a99a17d6f1e95e25be55bc0557170f3bdb98e10692d9b780d82830737e7')
 
 build() {
     cd "$pkgname-$pkgver"

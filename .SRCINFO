@@ -20,6 +20,6 @@ pkgbase = voxtype-tui
 	optdepends = at-spi2-core: learn corrections typed in other apps (AT-SPI)
 	optdepends = libnotify: "Vocabulary learned" notifications
 	source = voxtype-tui-0.2.0.tar.gz::https://github.com/Zeus-Deus/voxtype-tui/archive/v0.2.0.tar.gz
-	sha256sums = 2a86e05807035a9f532f1b6a7ce8f16ca91fbf1f02305ae31381101389cf67f9
+	sha256sums = be7a6a99a17d6f1e95e25be55bc0557170f3bdb98e10692d9b780d82830737e7
 
 pkgname = voxtype-tui
