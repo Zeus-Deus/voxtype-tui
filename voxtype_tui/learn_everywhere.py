@@ -35,9 +35,11 @@ from __future__ import annotations
 
 import contextlib
 import difflib
+import errno
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -182,7 +184,12 @@ def _ident(path: Path) -> list[int] | None:
 
 
 class _Conflict(Exception):
-    """A target changed between planning and writing it."""
+    """A target changed between planning and writing it. ``kept`` names
+    where the claimed file was preserved if it could not go back."""
+
+    def __init__(self, path: str, kept: str | None = None):
+        super().__init__(path)
+        self.kept = kept
 
 
 def _expect(path: Path, item: dict) -> None:
@@ -194,25 +201,170 @@ def _expect(path: Path, item: dict) -> None:
         raise _Conflict(str(path))
 
 
-def _remove_if_unchanged(path: Path, item: dict) -> None:
-    """Delete ``path`` only if it still holds what the plan saw: move it
-    aside first (atomic), verify the moved file, then delete it or put it
-    back."""
+def _race_hook(stage: str, path: Path) -> None:
+    """Does nothing. Tests replace it to save a file at an exact moment
+    ("append": right before our bytes are written; "claim": right before
+    the target is moved aside; "publish": right before the edited copy is
+    linked into place)."""
+
+
+def _same_file(st: os.stat_result, ident: list[int] | None) -> bool:
+    return (ident is not None and stat.S_ISREG(st.st_mode)
+            and [st.st_dev, st.st_ino] == list(ident[:2]))
+
+
+def _read_fd(fd: int) -> bytes:
+    chunks, off = [], 0
+    while True:
+        b = os.pread(fd, 65536, off)
+        if not b:
+            return b"".join(chunks)
+        chunks.append(b)
+        off += len(b)
+
+
+def _read_nofollow(path: Path) -> bytes | None:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        return _read_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def _append_if_unchanged(path: Path, item: dict) -> None:
+    """Add our block to an existing file in place, never by replacing it.
+
+    The file is opened without following symlinks and in append mode, then
+    checked through that same descriptor: it must be the very file the plan
+    read (same device and inode) with the same bytes. A save landing after
+    that check is never lost: an in-place write keeps both, a save by
+    rename leaves the new file alone (our bytes went to the old copy) and is
+    reported as a conflict."""
+    old, new = item["old"], item["new"]
+    if not isinstance(old, str) or not new.startswith(old):
+        raise _Conflict(str(path))
     _expect(path, item)
-    aside = path.with_name(f".{path.name}.voxtype-tui-remove.{os.getpid()}")
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENOENT, errno.ENXIO, errno.EISDIR):
+            raise _Conflict(str(path)) from None
+        raise
+    try:
+        st = os.fstat(fd)
+        if not _same_file(st, item.get("ident")) or _read_fd(fd) != old.encode("utf-8"):
+            raise _Conflict(str(path))
+        _race_hook("append", path)
+        data = new[len(old):].encode("utf-8")
+        while data:
+            data = data[os.write(fd, data):]
+        os.fsync(fd)
+        try:
+            now = os.lstat(path)
+        except FileNotFoundError:
+            now = None
+        if now is None or (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+            raise _Conflict(str(path))  # renamed over meanwhile: the live file is theirs
+    finally:
+        os.close(fd)
+
+
+def _put_back(tmpdir: str, aside: Path, path: Path) -> str | None:
+    """Return a claimed entry to ``path`` untouched (a symlink stays a
+    symlink). If ``path`` was recreated meanwhile, the newer file stays and
+    the claimed one is kept next to it as ``<name>.voxtype-tui-kept``;
+    returns that path."""
+    try:
+        try:
+            os.link(aside, path, follow_symlinks=False)
+            os.unlink(aside)
+            return None
+        except FileExistsError:
+            pass
+        except PermissionError:  # a directory cannot be hard-linked
+            if not os.path.lexists(path):
+                os.rename(aside, path)
+                return None
+        for n in range(100):
+            kept = path.with_name(f"{path.name}.voxtype-tui-kept" + (f".{n}" if n else ""))
+            try:
+                os.link(aside, kept, follow_symlinks=False)
+                os.unlink(aside)
+                return str(kept)
+            except FileExistsError:
+                continue
+        return str(aside)
+    finally:
+        with contextlib.suppress(OSError):
+            os.rmdir(tmpdir)
+
+
+def _claim(path: Path, item: dict) -> tuple[str, Path, os.stat_result]:
+    """Move ``path`` into a private directory beside it (one atomic rename,
+    which moves a symlink itself, never its target) and check that what
+    moved is the file the plan read: same inode, same bytes. Otherwise it
+    is put back untouched and :class:`_Conflict` raised."""
+    _expect(path, item)
+    _race_hook("claim", path)
+    tmpdir = tempfile.mkdtemp(prefix=f".{path.name}.voxtype-tui.", dir=str(path.parent))
+    aside = Path(tmpdir) / path.name
     try:
         os.rename(path, aside)
-    except FileNotFoundError:
-        return
-    if not aside.is_symlink() and _read(aside) == item["old"]:
-        aside.unlink()
-        return
-    try:  # changed in the last instant: put it back, never over a newer file
-        os.link(aside, path)
-        aside.unlink()
-    except OSError:
-        pass
-    raise _Conflict(str(path))
+    except BaseException as e:
+        with contextlib.suppress(OSError):
+            os.rmdir(tmpdir)
+        if isinstance(e, FileNotFoundError):
+            raise _Conflict(str(path)) from None
+        raise
+    try:
+        st = os.lstat(aside)
+        ok = _same_file(st, item.get("ident")) and _read_nofollow(aside) == item["old"].encode("utf-8")
+    except BaseException:
+        _put_back(tmpdir, aside, path)
+        raise
+    if not ok:
+        raise _Conflict(str(path), _put_back(tmpdir, aside, path))
+    return tmpdir, aside, st
+
+
+def _replace_if_unchanged(path: Path, item: dict) -> None:
+    """Swap in the cleaned content: claim the target, write the new copy,
+    publish it with link() (fails if the name was recreated meanwhile, in
+    which case the newer file wins and ours is kept beside it)."""
+    tmpdir, aside, st = _claim(path, item)
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".new.", dir=tmpdir)
+        os.fchmod(fd, st.st_mode & 0o7777)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(item["new"])
+            f.flush()
+            os.fsync(f.fileno())
+        _race_hook("publish", path)
+        os.link(tmp, path)
+    except BaseException as e:
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+        kept = _put_back(tmpdir, aside, path)
+        if isinstance(e, FileExistsError):
+            raise _Conflict(str(path), kept) from None
+        raise
+    os.unlink(tmp)
+    os.unlink(aside)
+    with contextlib.suppress(OSError):
+        os.rmdir(tmpdir)
+
+
+def _remove_if_unchanged(path: Path, item: dict) -> None:
+    """Delete ``path`` only if it still holds what the plan saw."""
+    tmpdir, aside, _st = _claim(path, item)
+    os.unlink(aside)
+    with contextlib.suppress(OSError):
+        os.rmdir(tmpdir)
 
 
 # ------------------------------------------------------------------ edits
@@ -490,17 +642,25 @@ def _set_enabled_locked(enabled: bool) -> dict:
                 if it["action"] == "create":
                     _atomic_write(path, it["new"], check=lambda p=path, i=it: _expect(p, i),
                                   exclusive=True)
-                elif it["action"] in ("append", "edit"):
-                    _atomic_write(path, it["new"], check=lambda p=path, i=it: _expect(p, i))
+                elif it["action"] == "append":
+                    _append_if_unchanged(path, it)
+                elif it["action"] == "edit":
+                    _replace_if_unchanged(path, it)
                 elif it["action"] == "remove":
                     _remove_if_unchanged(path, it)
-            except (_Conflict, FileExistsError):
+            except (_Conflict, FileExistsError) as e:
                 if recorded:
                     st["files"].pop(str(path), None)
                 _save_state(st)
-                return {"ok": False, "conflict": str(path), "files": done,
-                        "error": f"{path} changed while Learn everywhere was updating it; "
-                                 "nothing was written to it. Try again."}
+                kept = getattr(e, "kept", None)
+                out = {"ok": False, "conflict": str(path), "files": done,
+                       "error": f"{path} changed while Learn everywhere was updating it; "
+                                "nothing was written to it. Try again."}
+                if kept:
+                    out["kept"] = kept
+                    out["error"] = (f"{path} was saved again while Learn everywhere was updating "
+                                    f"it; your new file was kept and the previous one is at {kept}.")
+                return out
             if not enabled and it["action"] in ("edit", "remove", "none"):
                 st["files"].pop(str(path), None)
             done.append({"path": str(path), "action": it["action"]})

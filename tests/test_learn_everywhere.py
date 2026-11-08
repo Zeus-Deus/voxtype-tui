@@ -257,3 +257,214 @@ def test_a_file_turned_into_a_symlink_meanwhile_is_left_alone(cfg, tmp_path, mon
     _after_plan(monkeypatch, swap)
     r = LE.set_enabled(True)
     assert p.is_symlink() and real.read_text() == "--a\n" and r["ok"] is False
+
+
+# ------------------------------------------------- saves between the last check and the write
+
+def _after_check(monkeypatch, path, fn):
+    """Run ``fn`` once, right after the final pre-write check of ``path``
+    passed (an editor saving in the last instant)."""
+    real = LE._expect
+    fired = []
+
+    def expect(p, item):
+        real(p, item)
+        if Path(p) == path and not fired:
+            fired.append(1)
+            fn()
+    monkeypatch.setattr(LE, "_expect", expect)
+    return lambda: monkeypatch.setattr(LE, "_expect", real)
+
+
+def _editor_save(p, text):
+    """What most editors do: write a new file, rename it over the old one."""
+    tmp = p.with_name(p.name + ".editor-tmp")
+    tmp.write_text(text)
+    os.replace(tmp, p)
+
+
+def test_enable_keeps_an_editor_save_made_after_the_last_check(cfg, monkeypatch):
+    p = cfg / "chromium-flags.conf"
+    p.write_text("--a\n")
+    stop = _after_check(monkeypatch, p, lambda: _editor_save(p, "--a\n--saved-late\n"))
+    r = LE.set_enabled(True)
+    assert p.read_text() == "--a\n--saved-late\n"
+    assert r["ok"] is False and r["conflict"] == str(p)
+    assert str(p) not in LE._load_state()["files"]
+    stop()
+    assert LE.set_enabled(True)["ok"]
+    assert p.read_text() == "--a\n--saved-late\n" + LE.MARKER + "\n" + LE.FLAG + "\n"
+
+
+def test_enable_keeps_an_in_place_save_made_after_the_last_check(cfg, monkeypatch):
+    p = cfg / "chromium-flags.conf"
+    p.write_text("--a\n")
+    _after_check(monkeypatch, p, lambda: p.write_text("--b\n"))
+    r = LE.set_enabled(True)
+    assert p.read_text() == "--b\n" and r["ok"] is False
+
+
+def test_enable_never_replaces_a_symlink_made_after_the_last_check(cfg, tmp_path, monkeypatch):
+    p = cfg / "chromium-flags.conf"
+    p.write_text("--a\n")
+    real = tmp_path / "dotfiles-chromium.conf"
+
+    def swap():
+        real.write_text("--a\n")
+        p.unlink()
+        p.symlink_to(real)
+    _after_check(monkeypatch, p, swap)
+    r = LE.set_enabled(True)
+    assert p.is_symlink() and os.readlink(p) == str(real)
+    assert real.read_text() == "--a\n" and r["ok"] is False
+
+
+def test_disable_keeps_an_editor_save_made_after_the_last_check(cfg, monkeypatch):
+    p = cfg / "chromium-flags.conf"
+    p.write_text("--a\n")
+    assert LE.set_enabled(True)["ok"]
+    edited = p.read_text() + "--saved-late\n"
+    stop = _after_check(monkeypatch, p, lambda: _editor_save(p, edited))
+    r = LE.set_enabled(False)
+    assert p.read_text() == edited and r["ok"] is False and r["conflict"] == str(p)
+    assert str(p) in LE._load_state()["files"]
+    assert sorted(x.name for x in cfg.iterdir() if x.name.startswith(".chromium")) == []
+    stop()
+    assert LE.set_enabled(False)["ok"]
+    assert p.read_text() == "--a\n--saved-late\n"
+
+
+def test_disable_never_replaces_a_symlink_made_after_the_last_check(cfg, tmp_path, monkeypatch):
+    p = cfg / "chromium-flags.conf"
+    p.write_text("--a\n")
+    assert LE.set_enabled(True)["ok"]
+    real = tmp_path / "dotfiles-chromium.conf"
+    ours = p.read_text()
+
+    def swap():
+        real.write_text(ours)
+        p.unlink()
+        p.symlink_to(real)
+    _after_check(monkeypatch, p, swap)
+    r = LE.set_enabled(False)
+    assert p.is_symlink() and os.readlink(p) == str(real)
+    assert real.read_text() == ours and r["ok"] is False
+
+
+# ------------------------------------------- saves inside the write itself (exact moments)
+
+def _at(monkeypatch, stage, path, fn):
+    fired = []
+
+    def hook(st, p):
+        if st == stage and Path(p) == path and not fired:
+            fired.append(1)
+            fn()
+    monkeypatch.setattr(LE, "_race_hook", hook)
+    return fired
+
+
+def _leftovers(d):
+    return sorted(x.name for x in d.iterdir() if ".voxtype-tui" in x.name)
+
+
+def test_enable_append_keeps_an_in_place_write_racing_it(cfg, monkeypatch):
+    p = cfg / "chromium-flags.conf"
+    p.write_text("--a\n")
+
+    def other_writer():
+        with open(p, "a") as f:
+            f.write("--other\n")
+    assert _at(monkeypatch, "append", p, other_writer) is not None
+    r = LE.set_enabled(True)
+    assert r["ok"] is True
+    assert p.read_text() == "--a\n--other\n" + LE.MARKER + "\n" + LE.FLAG + "\n"
+
+
+def test_enable_append_reports_a_rename_save_racing_it(cfg, monkeypatch):
+    p = cfg / "chromium-flags.conf"
+    p.write_text("--a\n")
+    fired = _at(monkeypatch, "append", p, lambda: _editor_save(p, "--saved\n"))
+    r = LE.set_enabled(True)
+    assert fired and p.read_text() == "--saved\n"
+    assert r["ok"] is False and r["conflict"] == str(p)
+    assert str(p) not in LE._load_state()["files"]
+
+
+def test_enable_append_never_follows_a_symlink_racing_it(cfg, tmp_path, monkeypatch):
+    p = cfg / "chromium-flags.conf"
+    p.write_text("--a\n")
+    real = tmp_path / "dotfiles.conf"
+
+    def swap():
+        real.write_text("--a\n")
+        p.unlink()
+        p.symlink_to(real)
+    fired = _at(monkeypatch, "append", p, swap)
+    r = LE.set_enabled(True)
+    assert fired and r["ok"] is False
+    assert p.is_symlink() and real.read_text() == "--a\n"
+
+
+def test_disable_claim_puts_back_a_file_saved_just_before_the_move(cfg, monkeypatch):
+    p = cfg / "chromium-flags.conf"
+    p.write_text("--a\n")
+    assert LE.set_enabled(True)["ok"]
+    edited = p.read_text() + "--late\n"
+    fired = _at(monkeypatch, "claim", p, lambda: _editor_save(p, edited))
+    r = LE.set_enabled(False)
+    assert fired and r["ok"] is False and r["conflict"] == str(p) and "kept" not in r
+    assert p.read_text() == edited and not p.is_symlink()
+    assert _leftovers(cfg) == []
+    assert str(p) in LE._load_state()["files"]
+
+
+def test_disable_claim_puts_back_a_symlink_made_just_before_the_move(cfg, tmp_path, monkeypatch):
+    p = cfg / "chromium-flags.conf"
+    p.write_text("--a\n")
+    assert LE.set_enabled(True)["ok"]
+    ours = p.read_text()
+    real = tmp_path / "dotfiles.conf"
+
+    def swap():
+        real.write_text(ours)
+        p.unlink()
+        p.symlink_to(real)
+    fired = _at(monkeypatch, "claim", p, swap)
+    r = LE.set_enabled(False)
+    assert fired and r["ok"] is False
+    assert p.is_symlink() and os.readlink(p) == str(real) and real.read_text() == ours
+    assert _leftovers(cfg) == []
+
+
+def test_disable_publish_keeps_a_file_recreated_meanwhile(cfg, monkeypatch):
+    p = cfg / "chromium-flags.conf"
+    p.write_text("--a\n")
+    assert LE.set_enabled(True)["ok"]
+    ours = p.read_text()
+    fired = _at(monkeypatch, "publish", p, lambda: p.write_text("--brand-new\n"))
+    r = LE.set_enabled(False)
+    assert fired and r["ok"] is False and r["conflict"] == str(p)
+    assert p.read_text() == "--brand-new\n"            # the newer file wins
+    assert Path(r["kept"]).read_text() == ours         # and nothing is lost
+    assert Path(r["kept"]).name == "chromium-flags.conf.voxtype-tui-kept"
+    assert [x for x in _leftovers(cfg) if not x.endswith("-kept")] == []
+
+
+def test_disable_edit_keeps_the_file_mode(cfg):
+    p = cfg / "chromium-flags.conf"
+    p.write_text("--a\n")
+    p.chmod(0o600)
+    assert LE.set_enabled(True)["ok"] and LE.set_enabled(False)["ok"]
+    assert p.read_text() == "--a\n" and (p.stat().st_mode & 0o777) == 0o600
+    assert _leftovers(cfg) == []
+
+
+def test_disable_remove_keeps_a_created_file_edited_just_before_the_move(cfg, monkeypatch):
+    LE.set_enabled(True)
+    p = cfg / "electron43-flags.conf"
+    edited = p.read_text() + "--mine\n"
+    fired = _at(monkeypatch, "claim", p, lambda: _editor_save(p, edited))
+    r = LE.set_enabled(False)
+    assert fired and r["ok"] is False and p.read_text() == edited
+    assert _leftovers(cfg) == []
