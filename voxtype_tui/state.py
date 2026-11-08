@@ -70,6 +70,51 @@ def _reconcile_hooks(doc: TOMLDocument, path: Path, *, record_intent: bool = Fal
         return False
 
 
+# Every config field voxtype runs a command from. A TUI save takes the
+# disk's value of any of them that changed outside while the TUI was open.
+HOOK_FIELDS = (
+    "output.pre_recording_command",
+    "output.pre_output_command",
+    "output.post_output_command",
+    "output.post_process",  # the whole table: command + timeout_ms
+)
+
+
+def _plain(v: object) -> object:
+    return v.unwrap() if hasattr(v, "unwrap") else v
+
+
+def _hook_field(doc: object, key: str) -> object:
+    """Plain value of a :data:`HOOK_FIELDS` entry (``None`` = absent)."""
+    node = doc
+    for part in key.split("."):
+        if node is None or not hasattr(node, "get"):
+            return None
+        node = node.get(part)
+    if node is not None and hasattr(node, "items"):
+        return {str(k): _plain(v) for k, v in node.items()}
+    return _plain(node)
+
+
+def _set_hook_field(doc: TOMLDocument, key: str, value: object) -> None:
+    name = key.split(".", 1)[1]
+    out = doc.get("output")
+    if value is None:
+        if out is not None and name in out:
+            del out[name]
+        return
+    if out is None:
+        doc["output"] = tomlkit.table()
+        out = doc["output"]
+    if isinstance(value, dict):
+        table = tomlkit.table()
+        for k, v in value.items():
+            table[k] = v
+        out[name] = table
+    else:
+        out[name] = value
+
+
 def _record_managed_hooks(doc: TOMLDocument) -> None:
     """After a successful config save, commit which hook strings are ours."""
     try:
@@ -403,12 +448,19 @@ class AppState:
         that didn't commit locally, which another Syncthing peer could
         then pull as truth.
         """
-        self._ensure_post_process_enabled()
+        baseline_doc = tomlkit.parse(self.loaded_dump)
         live = _is_live_config(self.config_path)
-        expect = self._adopt_external_hooks() if live else config.UNCHECKED
+        # Hook fields the user changed in the TUI this session; any other
+        # hook field changed on disk meanwhile is taken from disk. Measured
+        # before the automatic wiring below, which is not a user change.
+        tui_hooks = {
+            key for key in HOOK_FIELDS
+            if _hook_field(self.doc, key) != _hook_field(baseline_doc, key)
+        }
+        expect = self._adopt_external_hooks(tui_hooks) if live else config.UNCHECKED
+        self._ensure_post_process_enabled()
         if _reconcile_hooks(self.doc, self.config_path, record_intent=True):
             self.config_dirty = True
-        baseline_doc = tomlkit.parse(self.loaded_dump)
         # Capture whether this save carries any config.toml mutation.
         # Used below to gate the broad `daemon_stale` flag — any config
         # change requires a daemon restart because Voxtype reads its
@@ -430,7 +482,8 @@ class AppState:
                 # disk again and re-check ownership before retrying.
                 if attempt == SAVE_ATTEMPTS - 1:
                     raise
-                expect = self._adopt_external_hooks()
+                expect = self._adopt_external_hooks(tui_hooks)
+                self._ensure_post_process_enabled()
                 if _reconcile_hooks(self.doc, self.config_path, record_intent=True):
                     self.config_dirty = True
                 config_touched = config_touched or self.config_dirty
@@ -467,15 +520,14 @@ class AppState:
         self.sidecar_dirty = False
         return restart_fields
 
-    def _adopt_external_hooks(self) -> "bytes | None":
-        """Re-read config.toml. A hook command that changed there since we
-        last read or wrote the file (the user set their own, or removed
-        one) is taken into ``doc`` before hook reconcile, so the save never
-        overwrites it. Returns the bytes read (``None`` = no file), the
-        content the save expects to replace. Other keys keep the usual
-        rule: the TUI's state is saved."""
-        from . import hooks
-
+    def _adopt_external_hooks(self, tui_hooks: "set[str] | frozenset[str]" = frozenset()) -> "bytes | None":
+        """Re-read config.toml. A hook field (:data:`HOOK_FIELDS`) that
+        changed there since we last read or wrote the file (the user set
+        their own command, or removed one) is taken into ``doc`` before hook
+        reconcile, so the save never overwrites it, unless the TUI changed
+        that field itself this session (``tui_hooks``). Returns the bytes
+        read (``None`` = no file), the content the save expects to replace.
+        Other keys keep the usual rule: the TUI's state is saved."""
         try:
             disk_doc, raw = config.read_snapshot(self.config_path)
         except FileNotFoundError:
@@ -491,18 +543,13 @@ class AppState:
                 base = tomlkit.parse(self.disk_bytes.decode("utf-8"))
             except Exception:
                 base = {}
-
-            def s(doc: object, key: str) -> "str | None":
-                v = hooks._get(doc, key)
-                return None if v is None else str(v)
-            for key in (hooks.PRE_RECORDING, hooks.POST_OUTPUT):
-                on_disk = s(disk_doc, key)
-                if on_disk in (s(base, key), s(self.doc, key)):
+            for key in HOOK_FIELDS:
+                if key in tui_hooks:
+                    continue
+                on_disk = _hook_field(disk_doc, key)
+                if on_disk in (_hook_field(base, key), _hook_field(self.doc, key)):
                     continue  # not changed outside, or already the same here
-                if on_disk is None:
-                    hooks._del_output(self.doc, key)
-                else:
-                    hooks._set_output(self.doc, key, on_disk)
+                _set_hook_field(self.doc, key, on_disk)
                 self.config_dirty = True
         self.disk_bytes = raw
         return raw

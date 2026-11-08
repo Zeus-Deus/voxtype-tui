@@ -1485,3 +1485,101 @@ def test_app_save_keeps_a_hook_the_user_added_during_the_save(live_config, monke
     assert doc["output"]["post_output_command"] == USER_HOOK
     assert hooks.POST_OUTPUT not in features.load()["managed_hooks"]
     assert len(calls) >= 2
+
+
+USER_PP = "/usr/local/bin/my-cleanup"
+
+
+def _edit_output(cfg: Path, **kv) -> None:
+    doc = tomlkit.parse(cfg.read_text())
+    for k, v in kv.items():
+        if k == "post_process":
+            t = tomlkit.table()
+            for pk, pv in v.items():
+                t[pk] = pv
+            doc["output"]["post_process"] = t
+        else:
+            doc["output"][k] = v
+    cfg.write_text(tomlkit.dumps(doc))
+
+
+def test_app_save_keeps_a_post_process_command_the_user_set_after_load(live_config):
+    """The user points [output.post_process] at their own script while the
+    TUI is open; an unrelated TUI save keeps their command and timeout."""
+    st = AppState.load(config.CONFIG_PATH, sidecar.SIDECAR_PATH)
+    st.save()  # our wiring is on disk now
+    assert config.is_our_post_process(tomlkit.parse(live_config.read_text()))
+    _edit_output(live_config, post_process={"command": USER_PP, "timeout_ms": 30000})
+    st.set_setting("output.mode", "clipboard")
+    st.save()
+    doc = tomlkit.parse(live_config.read_text())
+    assert doc["output"]["mode"] == "clipboard"
+    assert doc["output"]["post_process"]["command"] == USER_PP
+    assert doc["output"]["post_process"]["timeout_ms"] == 30000
+    assert st.doc["output"]["post_process"]["command"] == USER_PP
+    why = "your own post-processing command is set"
+    health = insights.usage_summary(30)["health"]
+    assert {"feature": "usage", "reason": why} in health["unavailable"]
+    assert {"feature": "history", "reason": why} in health["unavailable"]
+
+
+def test_app_save_keeps_a_pre_output_command_the_user_added_after_load(live_config):
+    st = AppState.load(config.CONFIG_PATH, sidecar.SIDECAR_PATH)
+    st.save()
+    _edit_output(live_config, pre_output_command="my-pre-output")
+    st.set_setting("output.mode", "clipboard")
+    st.save()
+    doc = tomlkit.parse(live_config.read_text())
+    assert doc["output"]["pre_output_command"] == "my-pre-output"
+    assert doc["output"]["mode"] == "clipboard"
+
+
+def test_app_save_keeps_a_removal_of_a_user_hook_made_after_load(live_config):
+    _edit_output(live_config, pre_output_command="my-pre-output")
+    st = AppState.load(config.CONFIG_PATH, sidecar.SIDECAR_PATH)
+    st.save()
+    doc = tomlkit.parse(live_config.read_text())
+    del doc["output"]["pre_output_command"]
+    live_config.write_text(tomlkit.dumps(doc))
+    st.set_setting("output.mode", "clipboard")
+    st.save()
+    assert "pre_output_command" not in tomlkit.parse(live_config.read_text())["output"]
+
+
+def test_app_save_writes_a_post_process_command_the_tui_changed(live_config):
+    """A field the TUI itself changed this session is still saved, even
+    when another hook changed on disk meanwhile."""
+    st = AppState.load(config.CONFIG_PATH, sidecar.SIDECAR_PATH)
+    st.save()
+    st.set_setting("output.post_process.command", "tui-chosen")
+    st.set_setting("output.post_process.timeout_ms", 7000)
+    _edit_output(live_config, post_output_command=USER_HOOK)
+    st.save()
+    doc = tomlkit.parse(live_config.read_text())
+    assert doc["output"]["post_process"]["command"] == "tui-chosen"
+    assert doc["output"]["post_process"]["timeout_ms"] == 7000
+    assert doc["output"]["post_output_command"] == USER_HOOK
+
+
+def test_postprocess_cold_config_cache_never_waits_for_fsync(xdg, monkeypatch, tmp_path):
+    """A cache miss parses config.toml and writes the disposable cache
+    without fsync: a slow disk must not delay the post-process exit."""
+    monkeypatch.setattr(cli_postprocess, "SIDECAR_PATH", tmp_path / "none.json")
+    cfg = Path(os.environ["XDG_CONFIG_HOME"]) / "voxtype" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text('[whisper]\nmodel = "base.en"\n')
+    cache = features.runtime_dir() / "config-cache.json"
+    assert not cache.exists()
+    real_fsync = os.fsync
+    calls = []
+
+    def slow_fsync(fd):
+        calls.append(fd)
+        time.sleep(0.5)
+        real_fsync(fd)
+    monkeypatch.setattr(os, "fsync", slow_fsync)
+    t0 = time.monotonic()
+    assert _run_main(monkeypatch, "hello cold cache") == "hello cold cache"
+    assert time.monotonic() - t0 < 0.4
+    assert calls == []
+    assert json.loads(cache.read_text())["info"]["model"] == "base.en"

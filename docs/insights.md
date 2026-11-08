@@ -99,7 +99,11 @@ If you already have your own `pre_recording_command` or `post_output_command`,
 voxtype-tui leaves it alone. That holds when you set it while voxtype-tui is
 saving, or while the TUI is open: a save checks that `config.toml` is still
 what it read, and when it is not, it reloads the file, keeps your hook
-commands and checks again before writing. The feature that needs it shows as unavailable,
+commands and checks again before writing. This covers every command Voxtype
+runs: `pre_recording_command`, `pre_output_command`, `post_output_command` and
+the whole `[output.post_process]` table (command and `timeout_ms`). A TUI save
+writes one of them over your edit only when you changed that same field in the
+TUI. The feature that needs it shows as unavailable,
 with the reason. Usage and history keep working with your own
 `post_output_command`: once the queue passes 256 KiB, the post-process starts
 one background drain (at most once a minute), so the queue never fills up and
