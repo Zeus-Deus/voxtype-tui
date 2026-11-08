@@ -1256,3 +1256,59 @@ def test_disabled_state_file_reports_why_durations_are_missing(live_config):
     live_config.write_text('state_file = "disabled"\n' + live_config.read_text())
     health = insights.usage_summary(30)["health"]
     assert {"feature": "duration", "reason": "Voxtype's state_file is disabled"} in health["unavailable"]
+
+
+# --- learned words never rewrite text a user rule produced ------------------
+
+class _SpanHonouringLearned:
+    """Like learned.apply: Omashi -> Omarchy, never inside protected spans
+    or occurrences of the user's phrases."""
+    seen: dict = {}
+
+    @classmethod
+    def apply(cls, text, spans, user_phrases=()):
+        import re
+
+        cls.seen["spans"] = list(spans)
+        prot = list(spans)
+        for p in user_phrases:
+            prot += [m.span() for m in re.finditer(re.escape(p), text)]
+        out, hits, pos = [], [], 0
+        for m in re.finditer(r"\bOmashi\b", text):
+            if any(a < m.end() and m.start() < b for a, b in prot):
+                continue
+            out.append(text[pos:m.start()] + "Omarchy")
+            pos = m.end()
+            hits.append("l_omashi")
+        out.append(text[pos:])
+        return "".join(out), hits
+
+
+def _sidecar(tmp_path, reps, vocab=()):
+    side = tmp_path / "metadata.json"
+    side.write_text(json.dumps({"version": 4, "vocabulary": [{"phrase": v} for v in vocab],
+                                "replacements": [
+        {"from_text": f, "to_text": t, "category": c} for f, t, c in reps]}))
+    return side
+
+
+def test_learned_never_rewrites_composed_dictionary_output(xdg, monkeypatch, tmp_path):
+    """replacement `project -> code mux Omashi`, then capitalization
+    `code mux -> Codemux`: `Codemux Omashi` is the user's text."""
+    side = _sidecar(tmp_path, [("project", "code mux Omashi", "Replacement"),
+                               ("code mux", "Codemux", "Capitalization")])
+    monkeypatch.setattr(cli_postprocess, "_learned_module", lambda: _SpanHonouringLearned)
+    text, changed_by, hits = cli_postprocess.process_detailed(
+        "open the project and Omashi", sidecar_path=side, config_path=tmp_path / "none.toml")
+    assert text == "open the Codemux Omashi and Omarchy"
+    assert hits == ["l_omashi"] and changed_by == ["dictionary", "learned"]
+    assert (9, 23) in _SpanHonouringLearned.seen["spans"]
+
+
+def test_learned_never_rewrites_dictionary_output_the_vocab_stage_changed(xdg, monkeypatch, tmp_path):
+    side = _sidecar(tmp_path, [("project", "code mux Omashi", "Replacement")], vocab=["Codemux"])
+    monkeypatch.setattr(cli_postprocess, "_learned_module", lambda: _SpanHonouringLearned)
+    text, changed_by, _ = cli_postprocess.process_detailed(
+        "project", sidecar_path=side, config_path=tmp_path / "none.toml")
+    assert text == "Codemux Omashi"
+    assert changed_by == ["dictionary", "vocab"]

@@ -187,3 +187,23 @@ def test_engine_is_reusable() -> None:
     eng = DictionaryEngine([Rule("cloud code", "Claude Code", REPLACEMENT)])
     for _ in range(50):
         assert eng.process("cloud code") == "Claude Code"
+
+
+def test_remap_spans_grows_over_and_shifts_past_edits():
+    from voxtype_tui.dictionary_engine import remap_spans
+
+    # "aa XXXX bb" with span over "XXXX bb" (3, 10)
+    assert remap_spans([(3, 10)], [(3, 7, "Y")]) == [(3, 7)]       # edit at span start
+    assert remap_spans([(3, 10)], [(0, 2, "zzzz")], protect_new=False) == [(5, 12)]  # shift
+    assert remap_spans([(0, 2)], [(3, 7, "Y")]) == [(0, 2), (3, 4)]  # edit after: unchanged
+    assert remap_spans([(3, 6)], [(5, 9, "QQ")]) == [(3, 7)]       # overlapping end: grow
+    assert remap_spans([(3, 6)], [(5, 9, "QQ")], protect_new=False) == [(3, 7)]
+    assert remap_spans([(4, 6)], [(0, 2, "")], protect_new=False) == [(2, 4)]
+
+
+def test_process_spans_cover_composed_rule_output():
+    rules = [Rule("project", "code mux Omashi", REPLACEMENT),
+             Rule("code mux", "Codemux", CAPITALIZATION)]
+    text, spans = DictionaryEngine(rules).process_spans("the project now")
+    assert text == "the Codemux Omashi now"
+    assert spans == [(4, 18)] and text[4:18] == "Codemux Omashi"

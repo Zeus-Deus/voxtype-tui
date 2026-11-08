@@ -43,6 +43,7 @@ from .dictionary_engine import (
     REPLACEMENT,
     DictionaryEngine,
     Rule,
+    remap_spans,
 )
 
 SIDECAR_PATH = Path.home() / ".config" / "voxtype-tui" / "metadata.json"
@@ -135,24 +136,6 @@ def _passthrough_note() -> None:
         sys.stderr.write("voxtype-tui-postprocess: passthrough on error\n")
 
 
-def _protected_spans(text: str, rules: list[Rule]) -> list[tuple[int, int]]:
-    """Spans of ``text`` that equal a dictionary rule's output. Learned
-    aliases must never rewrite inside them (user rules win).
-    Over-approximates (any occurrence, fired or not), which only protects
-    more text."""
-    spans: list[tuple[int, int]] = []
-    for r in rules:
-        out = r.replacement
-        if not out:
-            continue
-        i = text.find(out)
-        while i != -1:
-            spans.append((i, i + len(out)))
-            i = text.find(out, i + 1)
-    spans.sort()
-    return spans
-
-
 def _learned_module():
     """The learned-words stage (auto-learn), when installed (guarded: absent → no-op)."""
     try:
@@ -176,11 +159,16 @@ def process_detailed(
     sc_data = _read_sidecar(sidecar_path)
     rules: list[Rule] = []
     vocab: list[str] = []
+    # Character spans of ``text`` that the user's rules and vocabulary
+    # produced, carried through every later edit: learned words never
+    # rewrite inside them (user rules win), even after a later rule
+    # changed part of an earlier rule's output.
+    spans: list[tuple[int, int]] = []
     try:
         rules = _load_rules(sidecar_path, config_path, sc_data=sc_data)
         if rules:
             before = text
-            text = DictionaryEngine(rules).process(text)
+            text, spans = DictionaryEngine(rules).process_spans(text)
             if text != before:
                 changed_by.append("dictionary")
     except Exception:  # fail-open — never drop a user's transcript
@@ -189,7 +177,9 @@ def process_detailed(
         vocab = _load_vocab(sc_data)
         if vocab:
             before = text
-            text = vocab_corrector.correct(text, vocab)
+            new_text, edits = vocab_corrector.correct_with_edits(text, vocab)
+            spans = remap_spans(spans, edits)
+            text = new_text
             if text != before:
                 changed_by.append("vocab")
     except Exception:
@@ -198,7 +188,6 @@ def process_detailed(
     learned = _learned_module()
     if learned is not None:
         try:
-            spans = _protected_spans(text, rules)
             new_text, hits = learned.apply(
                 text, spans, user_phrases=[r.replacement for r in rules] + vocab,
             )
