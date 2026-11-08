@@ -82,10 +82,13 @@ def config_info(cfg: Path | None = None) -> dict:
         return {"engine": None, "model": None, "language": None,
                 "max_duration_secs": DEFAULT_MAX_DURATION, "model_uncertain": True}
     key = f"{st.st_mtime_ns}:{st.st_size}:{st.st_ino}"
-    cache = F.runtime_dir() / "config-cache.json"
     info = None
     try:
-        c = json.loads(cache.read_text())
+        cache = F.runtime_dir() / "config-cache.json"  # may be refused as unsafe
+    except OSError:
+        cache = None
+    try:
+        c = json.loads(cache.read_text()) if cache is not None else {}
         if c.get("key") == key and c.get("path") == str(cfg):
             info = c["info"]
     except (OSError, ValueError, KeyError, TypeError):
@@ -106,7 +109,8 @@ def config_info(cfg: Path | None = None) -> dict:
             "device": str(audio.get("device") or "default"),
         }
         try:
-            F.atomic_write_text(cache, json.dumps({"key": key, "path": str(cfg), "info": info}))
+            if cache is not None:
+                F.atomic_write_text(cache, json.dumps({"key": key, "path": str(cfg), "info": info}))
         except OSError:
             pass
     out = dict(info)

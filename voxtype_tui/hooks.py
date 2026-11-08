@@ -332,12 +332,24 @@ def _recorder_argv(binary: str, device: str, wav: str) -> list[str]:
 
 def _purge_stale(rt: Path, keep: str | None = None) -> None:
     """Scratch of cancelled / no-speech recordings (no post-output ran)."""
+    import stat
+
     now = time.time()
-    for pattern in ("rec/*.wav", "rec-used-*.json", "rec-discard-*.json"):
+    for sub, prefix, suffix in (("rec", "", ".wav"), ("", "rec-used-", ".json"),
+                                ("", "rec-discard-", ".json")):
+        d = rt / sub if sub else rt
         try:
-            for p in rt.glob(pattern):
-                if str(p) != keep and now - p.stat().st_mtime > 600:
-                    p.unlink()
+            if not stat.S_ISDIR(os.lstat(d).st_mode):
+                continue  # never follow a symlinked scratch dir
+            with os.scandir(d) as it:
+                for e in it:
+                    if not (e.name.startswith(prefix) and e.name.endswith(suffix)):
+                        continue
+                    # lstat: a symlink is never followed (nor unlinked as data)
+                    if not e.is_file(follow_symlinks=False) or e.path == keep:
+                        continue
+                    if now - e.stat(follow_symlinks=False).st_mtime > 600:
+                        os.unlink(e.path)
         except OSError:
             pass
 

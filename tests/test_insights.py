@@ -987,3 +987,79 @@ def test_history_edits_never_parse_the_queue_under_its_lock(xdg, monkeypatch):
     monkeypatch.setattr(history, "_maintain_locked", real_maintain)
     assert history.list_items()["items"] == []
     assert history.summary(30)["totals"]["dictations"] == 4
+
+
+# --- runtime dir fallback (no XDG_RUNTIME_DIR) ------------------------------
+
+def _fallback_runtime(xdg, monkeypatch) -> tuple[Path, Path]:
+    """Point the /tmp fallback at a private dir; return (fallback, victim wav)."""
+    import tempfile
+
+    tmp = xdg / "tmp"
+    tmp.mkdir(mode=0o700)
+    monkeypatch.delenv("XDG_RUNTIME_DIR")
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp))
+    victim = xdg / "victim"
+    victim.mkdir()
+    wav = victim / "old.wav"
+    wav.write_bytes(b"RIFF")
+    old = time.time() - 3600
+    os.utime(wav, (old, old))
+    return tmp / f"voxtype-tui-{os.getuid()}", wav
+
+
+def test_fallback_runtime_dir_refuses_a_writable_planted_dir(xdg, monkeypatch):
+    """Another user could pre-create /tmp/voxtype-tui-<uid> writable and
+    plant a `rec` symlink: the stale-scratch purge must never follow it."""
+    rt, wav = _fallback_runtime(xdg, monkeypatch)
+    rt.mkdir()
+    os.chmod(rt, 0o777)
+    (rt / "rec").symlink_to(wav.parent)
+    hooks.main(["pre-recording"])
+    assert wav.exists()
+    with pytest.raises(OSError):
+        features.runtime_dir()
+
+
+def test_fallback_runtime_dir_refuses_a_symlink(xdg, monkeypatch):
+    rt, wav = _fallback_runtime(xdg, monkeypatch)
+    target = xdg / "elsewhere"
+    target.mkdir(mode=0o700)
+    (target / "rec").symlink_to(wav.parent)
+    rt.symlink_to(target)
+    hooks.main(["pre-recording"])
+    assert wav.exists()
+    with pytest.raises(OSError):
+        features.runtime_dir()
+
+
+def test_fallback_runtime_dir_is_created_private(xdg, monkeypatch):
+    rt, _ = _fallback_runtime(xdg, monkeypatch)
+    assert features.runtime_dir() == rt
+    st = os.lstat(rt)
+    assert stat.S_ISDIR(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o700
+
+
+def test_stale_scratch_purge_never_follows_symlinks(xdg):
+    rt = features.runtime_dir()
+    features.ensure_private_dir(rt)
+    victim = xdg / "victim2"
+    victim.mkdir()
+    wav = victim / "old.wav"
+    wav.write_bytes(b"RIFF")
+    old = time.time() - 3600
+    os.utime(wav, (old, old))
+    (rt / "rec").symlink_to(victim)
+    (rt / "rec-used-x.json").symlink_to(wav)
+    hooks._purge_stale(rt)
+    assert wav.exists()
+
+
+def test_unsafe_runtime_dir_still_passes_text_and_counts(xdg, monkeypatch, tmp_path):
+    rt, _ = _fallback_runtime(xdg, monkeypatch)
+    rt.mkdir()
+    os.chmod(rt, 0o777)
+    monkeypatch.setattr(cli_postprocess, "SIDECAR_PATH", tmp_path / "none.json")
+    assert _run_main(monkeypatch, "keep these words") == "keep these words"
+    assert history.summary(30)["totals"]["dictations"] == 1
+    assert not any(p.name != "rec" for p in rt.iterdir())  # nothing written into it

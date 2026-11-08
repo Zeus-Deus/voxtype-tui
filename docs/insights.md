@@ -49,6 +49,13 @@ When a recording is cancelled, or VAD finds no speech, nothing is archived.
 
 The files are created 0600 in 0700 directories. None of them are in `sync.json` or in Export.
 
+Without `XDG_RUNTIME_DIR` the scratch dir is `/tmp/voxtype-tui-<uid>`. Because
+another user could create that name first, it is used only when it is a real
+directory (not a symlink) owned by you and not writable by anyone else;
+otherwise the archive and the learning watcher skip that dictation and the
+problem is listed in `health.failures` (usage still counts it). Cleaning old
+scratch never follows symlinks.
+
 ## How it hooks into Voxtype
 
 voxtype-tui sets these Voxtype settings only when a switch needs them, and only

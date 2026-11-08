@@ -18,6 +18,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import stat as _stat  # already loaded by os: free
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -55,13 +56,37 @@ def data_dir() -> Path:
     return Path(base) / "voxtype-tui"
 
 
+class UnsafeRuntimeDir(OSError):
+    """The runtime dir exists but someone else could control its contents."""
+
+
 def runtime_dir() -> Path:
+    """Per-dictation scratch dir: ``$XDG_RUNTIME_DIR/voxtype-tui``, else
+    ``<tmp>/voxtype-tui-<uid>``. Created 0700 when missing. In a shared
+    /tmp another user may have created it first, so it is refused
+    (:class:`UnsafeRuntimeDir`) unless it is a real directory (not a
+    symlink) owned by us and not writable by group or others. Callers on
+    dictation paths treat that like any other I/O error."""
     base = os.environ.get("XDG_RUNTIME_DIR")
     if not base:
         import tempfile
 
-        return Path(tempfile.gettempdir()) / f"voxtype-tui-{os.getuid()}"
-    return Path(base) / "voxtype-tui"
+        path = Path(tempfile.gettempdir()) / f"voxtype-tui-{os.getuid()}"
+    else:
+        path = Path(base) / "voxtype-tui"
+        if not os.path.isdir(base):
+            os.makedirs(base, mode=0o700, exist_ok=True)
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(path)
+    if (not _stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid()
+            or st.st_mode & 0o022):
+        raise UnsafeRuntimeDir(f"refusing unsafe runtime dir {path}")
+    if st.st_mode & 0o077:
+        os.chmod(path, 0o700)  # ours and never writable by others: just tighten
+    return path
 
 
 def features_path() -> Path:
