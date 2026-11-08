@@ -54,8 +54,11 @@ applied after you make it twice (or accept the entry), because it is not
 close enough to count the first time. Typing more text after the dictation is fine; only the
 dictated words are compared.
 
-When a word is learned you get a notification, "Vocabulary learned — Added
-"Omarchy" from your correction." Click it within 10 s to undo.
+Whenever an in-app correction turns a word on (learned at once, a
+suggestion confirmed by its second fix, or a new misheard form confirmed
+for a word you already have) you get a notification, "Vocabulary learned —
+Added "Omarchy" from your correction." Click it within 10 s to undo that
+step: the entry goes back to how it was before (a new entry is removed).
 
 ## Your words always win
 
@@ -139,6 +142,7 @@ from voxtype_tui import learned, learn_everywhere, learn_watch
 learned.submit_correction(record_or_id, edited_text, source="fix", kind=None)
 #   -> {"ok", "candidates": [{heard, written, kind}], "applied": [entry],
 #       "skipped": [{heard, written, reason}], "reason"?}
+#   each applied entry has "activated": true when this call turned it on
 learned.list_entries()      # {"enabled", "everywhere", "entries", "counts"}
 learned.accept(id) / reject(id) / forget(id) / undo(id) / reset()
 learned.promote(id, add_to_user=None)   # -> {"ok", "entry", "added": {vocab, rules}}

@@ -550,6 +550,7 @@ def submit_correction(record: dict | str, edited_text: str, source: str = "fix",
     with _locked():
         store = load()
         changed = False
+        steps: dict[str, dict] = {}  # entry id -> what this call did (for Undo)
         for p in pairs:
             k, why = classify(p["heard"], p["written"], user_vocab=uv, user_triggers=ut,
                               kind=kind, words=words, passive=passive)
@@ -563,6 +564,7 @@ def submit_correction(record: dict | str, edited_text: str, source: str = "fix",
                                        "reason": "you rejected this before" if e["state"] == "rejected"
                                        else "already one of your own words"})
                 continue
+            is_new = e is None
             if e is None:
                 e = {
                     "id": _new_id(), "kind": k, "written": p["written"], "heard": [],
@@ -577,14 +579,23 @@ def submit_correction(record: dict | str, edited_text: str, source: str = "fix",
             if p["heard"].lower() not in {h.lower() for h in e["heard"]}:
                 e["heard"].append(p["heard"])
             duplicate = rec_id is not None and rec_id in e.get("records", [])
+            step = steps.get(e["id"])
+            if step is None:
+                step = steps[e["id"]] = {"record": rec_id, "new": is_new, "prev_state": e["state"],
+                                         "counted": not duplicate, "aliases": [], "pending": {}}
+            hl = p["heard"].lower()
+            if hl not in step["pending"]:
+                snap = (e.get("pending_aliases") or {}).get(hl)
+                step["pending"][hl] = json.loads(json.dumps(snap)) if snap is not None else None
             # Exact aliases are decided per heard form: "Auston" may be an
             # alias of "Austen" while the English "Austin" never is. A
             # passive sighting confirms a heard/written pair on its own
             # terms (first-sighting or two-sighting rule), whatever state
             # the entry is in; until then it waits in pending_aliases.
-            if k in ("sounds_like", "replace"):
-                _note_alias(e, p["heard"], p["written"], k, passive=passive,
-                            pair_count=len(pairs), rec_id=rec_id, now=now)
+            if k in ("sounds_like", "replace") and \
+                    _note_alias(e, p["heard"], p["written"], k, passive=passive,
+                                pair_count=len(pairs), rec_id=rec_id, now=now):
+                step["aliases"].append(p["heard"])
             if not duplicate:
                 e["count"] = int(e.get("count", 0)) + 1
                 e.setdefault("seen", []).append(_iso(now))
@@ -606,8 +617,21 @@ def submit_correction(record: dict | str, edited_text: str, source: str = "fix",
             out["applied"].append(e)
             changed = True
         if changed:
+            for e in store["entries"]:
+                if e["id"] in steps:
+                    e["last_step"] = steps[e["id"]]
             _save(store)
-    out["applied"] = [_public(e) for e in out["applied"]]
+    pub = []
+    for e in out["applied"]:
+        # "activated": this call turned new rewriting on (the entry became
+        # active, or an active entry gained a confirmed alias). That is what
+        # the "Vocabulary learned" notification and its Undo are for.
+        st = steps.get(e["id"]) or {}
+        row = _public(e)
+        row["activated"] = e["state"] == "active" and (
+            st.get("prev_state") != "active" or bool(st.get("aliases")))
+        pub.append(row)
+    out["applied"] = pub
     return out
 
 
@@ -678,6 +702,7 @@ def _mutate(entry_id: str, fn: Callable[[dict, dict], None]) -> dict | None:
 
 def accept(entry_id: str) -> dict | None:
     def f(_s, e):
+        e.pop("last_step", None)
         if e["state"] in ("suggested", "dormant", "rejected", "active"):
             if e["state"] != "active":
                 e["state"] = "active"
@@ -690,6 +715,7 @@ def accept(entry_id: str) -> dict | None:
 def reject(entry_id: str) -> dict | None:
     """Tombstone: stop applying it and never learn it again."""
     def f(_s, e):
+        e.pop("last_step", None)
         if e["state"] != "promoted":
             e["state"] = "rejected"
             e["decided_at"] = _iso(_now())
@@ -710,13 +736,17 @@ def forget(entry_id: str) -> bool:
 
 def undo(entry_id: str, record_id: str | None = None) -> bool:
     """Undo the last learning step for an entry (notification Undo): a
-    first-time entry is forgotten, otherwise its count goes back by one."""
+    first-time entry is forgotten; otherwise that step's sighting, the
+    aliases it confirmed and the state before it are restored."""
     with _locked():
         store = load()
         for e in store["entries"]:
             if e["id"] != entry_id:
                 continue
-            if int(e.get("count", 0)) <= 1:
+            step = e.pop("last_step", None)
+            if isinstance(step, dict) and (record_id is None or step.get("record") == record_id):
+                _undo_step(store, e, step)
+            elif int(e.get("count", 0)) <= 1:
                 store["entries"].remove(e)
             else:
                 e["count"] = int(e["count"]) - 1
@@ -729,6 +759,29 @@ def undo(entry_id: str, record_id: str | None = None) -> bool:
             _save(store)
             return True
     return False
+
+
+def _undo_step(store: dict, e: dict, step: dict) -> None:
+    if step.get("new"):
+        store["entries"].remove(e)
+        return
+    undone = {h.lower() for h in step.get("aliases") or [] if isinstance(h, str)}
+    e["aliases"] = [h for h in e.get("aliases") or [] if h.lower() not in undone]
+    pending = e.setdefault("pending_aliases", {})
+    for hl, snap in (step.get("pending") or {}).items():
+        if snap is None:
+            pending.pop(hl, None)
+        else:
+            pending[hl] = snap
+    if step.get("counted"):
+        e["count"] = max(0, int(e.get("count", 0)) - 1)
+        if e.get("seen"):
+            e["seen"].pop()
+        rid = step.get("record")
+        if rid and rid in e.get("records", []):
+            e["records"].remove(rid)
+    if step.get("prev_state") in STATES:
+        e["state"] = step["prev_state"]
 
 
 def reset() -> int:
@@ -767,6 +820,7 @@ def promote(entry_id: str, *, add_to_user: Callable[[dict], dict] | None = None,
         added = add(dict(entry))
 
         def f(_s, e):
+            e.pop("last_step", None)
             e["state"] = "promoted"
             e["decided_at"] = _iso(_now())
         pub = _mutate(entry_id, f)  # re-reads: the callback may have changed the store
@@ -850,7 +904,7 @@ def _compile(store: dict) -> dict:
 
 
 def _public(e: dict) -> dict:
-    out = {k: v for k, v in e.items() if k not in ("seen", "pending_aliases")}
+    out = {k: v for k, v in e.items() if k not in ("seen", "pending_aliases", "last_step")}
     out["score"] = round(score(e), 2)
     return out
 

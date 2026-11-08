@@ -610,3 +610,31 @@ def test_accept_confirms_pending_aliases():
     eid = L.submit_correction(rec("on Omarion", "w1"), "on Omarchy", "atspi")["applied"][0]["id"]
     L.accept(eid)
     assert L.apply("on Omarion")[0] == "on Omarchy"
+
+
+def test_submit_marks_every_transition_into_active():
+    o, e = "I read Austin yesterday", "I read Austen yesterday"
+    assert L.submit_correction(rec(o, "a1"), e, "atspi")["applied"][0]["activated"] is False
+    second = L.submit_correction(rec(o, "a2"), e, "atspi")["applied"][0]
+    assert second["state"] == "active" and second["activated"] is True
+    assert L.submit_correction(rec(o, "a3"), e, "atspi")["applied"][0]["activated"] is False
+
+
+def test_undo_of_second_sighting_activation_goes_back_to_suggested():
+    o, e = "I read Austin yesterday", "I read Austen yesterday"
+    L.submit_correction(rec(o, "a1"), e, "atspi")
+    eid = L.submit_correction(rec(o, "a2"), e, "atspi")["applied"][0]["id"]
+    assert L.undo(eid, "a2")
+    ent = L.load()["entries"][0]
+    assert ent["state"] == "suggested" and ent["count"] == 1 and ent["records"] == ["a1"]
+
+
+def test_undo_of_a_new_alias_keeps_the_active_entry():
+    eid = L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")["applied"][0]["id"]
+    L.submit_correction(rec("on Omarion", "w1"), "on Omarchy", "atspi")
+    out = L.submit_correction(rec("on Omarion", "w2"), "on Omarchy", "atspi")["applied"][0]
+    assert out["activated"] is True and L.apply("on Omarion")[0] == "on Omarchy"
+    assert L.undo(eid, "w2")
+    assert L.apply("on Omarion")[0] == "on Omarion"
+    assert L.apply("on Omashi")[0] == "on Omarchy"
+    assert L.load()["entries"][0]["state"] == "active"

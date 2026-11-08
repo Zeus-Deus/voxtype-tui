@@ -496,7 +496,13 @@ def watch(final: str, *, window: dict | None, record: dict | None, window_s: flo
     res["reason"] = out.get("reason")
     log(f"submit: learned={[e['id'] for e in res['learned']]} skipped={len(res['skipped'])} "
         f"reason={res['reason'] if _debug_text() else bool(res['reason'])}")
-    fresh = [e for e in out.get("applied", []) if e["state"] == "active" and e.get("count") == 1]
+    # Every transition into active (first sighting, second sighting, a new
+    # confirmed alias) gets the notification and its Undo.
+    fresh, ids = [], set()
+    for e in out.get("applied", []):
+        if e.get("activated") and e["id"] not in ids:
+            ids.add(e["id"])
+            fresh.append(e)
     if fresh:
         undone = learned.notify_learned(fresh, record_id=rec.get("id"),
                                         wait_for_undo_s=UNDO_WAIT_S)

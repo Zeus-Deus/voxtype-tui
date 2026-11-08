@@ -116,3 +116,104 @@ def test_r2_hook_window_is_the_binding(tmp_path, monkeypatch):
     W.on_post_output({"id": "r1", "final": "hello"}, window={"class": "A", "pid": 7, "address": "0xa"})
     assert seen["r"]["delivery_window"]["address"] == "0xa"   # bound to the delivery window
     assert seen["w"]["address"] == "0xb"   # watch() gets the current window and refuses (r1 test)
+
+
+# ---------------------------------------------------------------- notify on activation
+
+def _learning_home(tmp_path, monkeypatch):
+    from pathlib import Path
+    from voxtype_tui import cli_postprocess, vocab_corrector
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    monkeypatch.setattr(cli_postprocess, "SIDECAR_PATH", Path(tmp_path / "config" / "voxtype-tui" / "metadata.json"))
+    monkeypatch.setattr(vocab_corrector, "_words", frozenset("i read austin yesterday on the".split()))
+
+
+def _drive_watch(monkeypatch, final, edited, rid):
+    """Run the real watch() against a fake text field: the dictated text
+    appears, the user edits it, then focus leaves."""
+    import sys
+    import types
+
+    class StateType:
+        DEFUNCT, FOCUSED = "defunct", "focused"
+
+    class FakeAtspi:
+        pass
+    FakeAtspi.StateType = StateType
+
+    class Node:
+        def get_role_name(self):
+            return "text"
+
+        def get_process_id(self):
+            return 5
+
+    class Loop:
+        def __init__(self):
+            self.done = False
+
+        def run(self):
+            while not self.done and calls:
+                if calls[0]() is False:
+                    break
+
+        def quit(self):
+            self.done = True
+    calls = []
+    glib = types.SimpleNamespace(MainLoop=Loop, PRIORITY_HIGH=0,
+                                 timeout_add=lambda ms, fn: calls.append(fn),
+                                 unix_signal_add=lambda *a: None)
+    repo = types.ModuleType("gi.repository")
+    repo.GLib = glib
+    gi = types.ModuleType("gi")
+    gi.repository = repo
+    monkeypatch.setitem(sys.modules, "gi", gi)
+    monkeypatch.setitem(sys.modules, "gi.repository", repo)
+    reads = {"n": 0}
+
+    def read_text(node):
+        reads["n"] += 1
+        return final if reads["n"] == 1 else edited
+
+    def states(Atspi, node):
+        return {StateType.FOCUSED} if reads["n"] < 3 else set()
+    window = {"class": "org.gnome.TextEditor", "pid": 5, "address": "0xa"}
+    monkeypatch.setattr(W, "_atspi", lambda: FakeAtspi)
+    monkeypatch.setattr(W, "_pid_tree", lambda pid: {pid})
+    monkeypatch.setattr(W, "find_apps", lambda Atspi, pids: [object()])
+    monkeypatch.setattr(W, "find_focused_text", lambda Atspi, apps: Node())
+    monkeypatch.setattr(W, "is_password", lambda Atspi, node: False)
+    monkeypatch.setattr(W, "active_window", lambda: window)
+    monkeypatch.setattr(W, "_states", states)
+    monkeypatch.setattr(W, "read_text", read_text)
+    monkeypatch.setattr(W, "caret", lambda node: 0)
+    return W.watch(final, window=window, record={"id": rid, "final": final}, window_s=5)
+
+
+def test_second_sighting_activation_notifies_with_undo(tmp_path, monkeypatch):
+    from voxtype_tui import learned
+    _learning_home(tmp_path, monkeypatch)
+    notified = []
+    monkeypatch.setattr(learned, "notify_learned",
+                        lambda entries, record_id=None, wait_for_undo_s=0:
+                        notified.append(([e["written"] for e in entries], record_id, wait_for_undo_s)))
+    o, e = "I read Austin yesterday", "I read Austen yesterday"
+    first = _drive_watch(monkeypatch, o, e, "w1")
+    assert first["learned"][0]["state"] == "suggested" and notified == []
+    second = _drive_watch(monkeypatch, o, e, "w2")
+    assert second["learned"][0]["state"] == "active"
+    assert notified == [(["Austen"], "w2", W.UNDO_WAIT_S)]
+
+
+def test_repeat_on_an_already_active_entry_does_not_notify(tmp_path, monkeypatch):
+    from voxtype_tui import learned
+    _learning_home(tmp_path, monkeypatch)
+    notified = []
+    monkeypatch.setattr(learned, "notify_learned", lambda entries, **k: notified.append(entries))
+    o, e = "on the Omashi", "on the Omarchy"
+    _drive_watch(monkeypatch, o, e, "w1")   # unambiguous: active at once, notified
+    _drive_watch(monkeypatch, o, e, "w2")   # nothing new became active
+    assert len(notified) == 1
