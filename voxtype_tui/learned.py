@@ -157,18 +157,37 @@ def _atomic_write_json(path: Path, data: Any, *, indent: int | None = 2) -> None
         raise
 
 
+_lock_depth: Any = None  # threading.local, created on first use
+
+
 @contextlib.contextmanager
 def _locked():
-    """Exclusive flock on ``learned.lock`` for read-modify-write cycles."""
-    import fcntl
+    """Exclusive flock on ``learned.lock`` for read-modify-write cycles.
 
+    Re-entrant within one thread (a promote callback may call back into
+    this module); other threads and processes wait."""
+    import fcntl
+    import threading
+
+    global _lock_depth
+    if _lock_depth is None:
+        _lock_depth = threading.local()
+    if getattr(_lock_depth, "n", 0) > 0:
+        _lock_depth.n += 1
+        try:
+            yield
+        finally:
+            _lock_depth.n -= 1
+        return
     d = config_dir()
     _ensure_dir(d)
     fd = os.open(str(d / "learned.lock"), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
+        _lock_depth.n = 1
         yield
     finally:
+        _lock_depth.n = 0
         with contextlib.suppress(OSError):
             fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
@@ -683,19 +702,27 @@ def promote(entry_id: str, *, add_to_user: Callable[[dict], dict] | None = None,
     Replacement rule per heard form. ``add_to_user(entry)`` lets the caller
     (the plugin bridge) do the user-side write with its own state loader;
     by default this uses ``AppState`` like the TUI. Returns
-    ``{"ok", "entry", "added": {"vocab":[...], "rules":[[from, to], ...]}}``."""
-    store = load()
-    entry = next((e for e in store["entries"] if e["id"] == entry_id), None)
-    if entry is None:
-        return {"ok": False, "error": "no such learned entry"}
-    if entry["state"] == "promoted":
-        return {"ok": True, "entry": _public(entry), "added": {"vocab": [], "rules": []}}
-    added = (add_to_user or (lambda e: _add_to_user_default(e, config_path, sidecar_path)))(entry)
+    ``{"ok", "entry", "added": {"vocab":[...], "rules":[[from, to], ...]}}``.
 
-    def f(_s, e):
-        e["state"] = "promoted"
-        e["decided_at"] = _iso(_now())
-    pub = _mutate(entry_id, f)
+    The whole step (read the entry, the user-side read-modify-write, mark
+    it promoted) runs under the learned-words lock, so concurrent promotes
+    run one after the other: each loads the user lists after the previous
+    one saved them, and an entry is added once. ``add_to_user`` may call
+    back into this module (the lock is re-entrant)."""
+    add = add_to_user or (lambda e: _add_to_user_default(e, config_path, sidecar_path))
+    with _locked():
+        store = load()
+        entry = next((e for e in store["entries"] if e["id"] == entry_id), None)
+        if entry is None:
+            return {"ok": False, "error": "no such learned entry"}
+        if entry["state"] == "promoted":
+            return {"ok": True, "entry": _public(entry), "added": {"vocab": [], "rules": []}}
+        added = add(dict(entry))
+
+        def f(_s, e):
+            e["state"] = "promoted"
+            e["decided_at"] = _iso(_now())
+        pub = _mutate(entry_id, f)  # re-reads: the callback may have changed the store
     return {"ok": True, "entry": pub, "added": added}
 
 

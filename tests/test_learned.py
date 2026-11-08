@@ -535,3 +535,52 @@ def test_copied_files_keep_using_the_compiled_copy(tmp_path):
         p.unlink()
         p.write_bytes(data)
     assert L.apply("on Omashi") == ("on Omarchy", [eid])
+
+
+def test_concurrent_promotes_keep_every_word(tmp_path, monkeypatch):
+    import threading
+    from voxtype_tui import sidecar as sc_mod
+    import voxtype_tui.config as config_mod
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[hotkey]\nkey = "SCROLLLOCK"\n[audio]\ndevice = "default"\n'
+                   'sample_rate = 16000\nmax_duration_secs = 60\n[whisper]\nmodel = "base.en"\n'
+                   '[output]\nmode = "type"\n')
+    scp = tmp_path / "metadata.json"
+    ids = [L.submit_correction(rec(f"I read {h} yesterday", f"p{i}"), f"I read {w} yesterday", "fix",
+                               kind="spelling")["applied"][0]["id"]
+           for i, (h, w) in enumerate([("Austin", "Austen"), ("Bronty", "Bronte"), ("Dikens", "Dickens")])]
+
+    def slow_save(doc, path):  # widen the read-modify-write window
+        time.sleep(0.15)
+        path.write_text(__import__("tomlkit").dumps(doc))
+    monkeypatch.setattr(config_mod, "safe_save", slow_save)
+    outs = []
+    ts = [threading.Thread(target=lambda i=i: outs.append(L.promote(i, config_path=cfg, sidecar_path=scp)))
+          for i in ids]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert all(o["ok"] for o in outs)
+    assert sorted(v.phrase for v in sc_mod.load(scp).vocabulary) == ["Austen", "Bronte", "Dickens"]
+    assert {e["state"] for e in L.load()["entries"]} == {"promoted"}
+
+
+def test_concurrent_promotes_of_one_entry_add_it_once():
+    import threading
+    eid = L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")["applied"][0]["id"]
+    calls = []
+
+    def add(e):
+        calls.append(e["id"])
+        time.sleep(0.1)
+        return L.user_additions(e)
+    ts = [threading.Thread(target=L.promote, args=(eid,), kwargs={"add_to_user": add}) for _ in range(3)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert calls == [eid]
+
+
+def test_promote_callback_may_use_the_learned_api():
+    eid = L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")["applied"][0]["id"]
+    out = L.promote(eid, add_to_user=lambda e: (L.list_entries(), L.record_hits([]),
+                                                L.user_additions(e))[-1])
+    assert out["ok"] and out["entry"]["state"] == "promoted"

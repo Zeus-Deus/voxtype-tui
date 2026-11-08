@@ -65,6 +65,8 @@ needs no restart and is fully reversible.
 To make a learned word one of your own, **promote** it: a spelling becomes a
 vocabulary word, a sounds-like/replace entry becomes a dictionary
 replacement. From then on it is yours and learning leaves it alone.
+Promotions run one at a time (under the learned-words lock), so promoting
+several words at once never loses one.
 
 ## Learn everywhere
 
