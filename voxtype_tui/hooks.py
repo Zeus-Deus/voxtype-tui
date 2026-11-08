@@ -335,6 +335,9 @@ def _purge_stale(rt: Path, keep: str | None = None) -> None:
     import stat
 
     now = time.time()
+    from . import rtdir
+
+    rtdir.prune(str(rt), now, 600, "handoff")  # records no worker picked up
     for sub, prefix, suffix in (("rec", "", ".wav"), ("", "rec-used-", ".json"),
                                 ("", "rec-discard-", ".json")):
         d = rt / sub if sub else rt
@@ -479,23 +482,15 @@ def on_pre_recording() -> None:
 
 def _claim(record_id: object) -> bool:
     """True once per record id (atomic O_EXCL marker in the runtime dir)."""
-    if not isinstance(record_id, str) or not record_id:
-        return False
-    d = F.ensure_private_dir(F.runtime_dir() / "claimed")
+    from . import rtdir
+
     try:
-        fd = os.open(str(d / record_id), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        os.close(fd)
-    except FileExistsError:
-        return False
+        rt = rtdir.runtime_path()
     except OSError:
         return False
-    now = time.time()
-    try:
-        for p in d.iterdir():
-            if now - p.stat().st_mtime > 3600:
-                p.unlink()
-    except OSError:
-        pass
+    if not rtdir.claim(rt, record_id):
+        return False
+    rtdir.prune(rt, time.time(), rtdir.CLAIM_KEEP_S, "claimed")
     return True
 
 
@@ -555,11 +550,14 @@ def _discard_unconsumed_recording(entered_at: float) -> None:
             pass
 
 
-def on_post_output(entered_at: float | None = None) -> None:
+def on_post_output(entered_at: float | None = None, record_id: str | None = None) -> None:
     """Runs in the detached process (see hook_main): voxtype waits for this
     hook before it goes idle, so nothing here may run in the hook itself.
     ``entered_at`` = when voxtype started the hook (taken before the fork),
-    so a recording that began after this hook is never touched."""
+    so a recording that began after this hook is never touched.
+    ``record_id`` = the record the hook claimed before the fork ("" = none:
+    a cancelled / no-speech recording); ``None`` = not bound (run by hand),
+    then the newest unclaimed record is used."""
     from . import history
 
     entered_at = time.time() if entered_at is None else entered_at
@@ -568,13 +566,16 @@ def on_post_output(entered_at: float | None = None) -> None:
     # once maintenance and the archive are done.
     delivery_window = _hypr_active_window()
     feats = F.load()
-    rec = history.latest()
-    if rec is not None and not _claim(rec.get("id")):
-        # Voxtype also runs post_output after a cancelled / no-speech
-        # recording (measured): the newest record is then an older
-        # dictation that was already handled. Never archive or watch it
-        # twice; drop the cancelled recording's scratch audio instead.
-        rec = None
+    if record_id is None:
+        rec = history.latest()
+        if rec is not None and not _claim(rec.get("id")):
+            # Voxtype also runs post_output after a cancelled / no-speech
+            # recording (measured): the newest record is then an older
+            # dictation that was already handled. Never archive or watch it
+            # twice; drop the cancelled recording's scratch audio instead.
+            rec = None
+    else:
+        rec = history.handoff(record_id) if record_id else None
     if rec is None:
         _discard_unconsumed_recording(entered_at)
     try:
@@ -610,6 +611,9 @@ def on_post_output(entered_at: float | None = None) -> None:
                 history.note_failure("learn_watch", str(e))
     except Exception as e:
         history.note_failure("post-output", repr(e))
+    finally:
+        if rec:
+            history.remove_handoff(str(rec.get("id")))  # handled: no text left in RAM
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -620,7 +624,8 @@ def main(argv: list[str] | None = None) -> int:
             on_pre_recording()
         elif event == "post-output":
             started = os.environ.get("VOXTYPE_TUI_HOOK_STARTED")
-            on_post_output(float(started) if started else None)
+            on_post_output(float(started) if started else None,
+                           record_id=os.environ.get("VOXTYPE_TUI_HOOK_RECORD"))
         elif event == "pre-output":
             pass
         elif event == "--unwire":

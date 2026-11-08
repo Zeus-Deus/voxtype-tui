@@ -44,6 +44,15 @@ def main(argv=None) -> int:
     os.environ["VOXTYPE_TUI_HOOK_STARTED"] = repr(time.time())
     if event == "pre-output":
         return 0
+    if event == "post-output":
+        # Bind the worker to this dictation's record now, while voxtype
+        # waits: a worker that starts late must never pick up a newer one.
+        try:
+            from . import rtdir
+
+            os.environ["VOXTYPE_TUI_HOOK_RECORD"] = rtdir.claim_newest_handoff()
+        except BaseException:
+            os.environ["VOXTYPE_TUI_HOOK_RECORD"] = ""
     if event in _DETACHED_EVENTS:
         try:
             if not _detach():

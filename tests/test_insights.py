@@ -474,7 +474,8 @@ def test_all_features_off_writes_nothing(xdg, monkeypatch, tmp_path):
     assert _run_main(monkeypatch, "private words") == "private words"
     d = features.data_dir()
     assert not any(p.name not in (".lock",) for p in d.glob("*")) if d.exists() else True
-    assert not history.last_record_path().exists()
+    hd = features.runtime_dir() / "handoff"
+    assert not hd.exists() or not any(hd.iterdir())
 
 
 def test_learned_stage_guarded_and_spans_protect_rules(xdg, monkeypatch, tmp_path):
@@ -642,7 +643,7 @@ def test_archive_only_without_text_keeps_no_text_anywhere(xdg, monkeypatch, tmp_
                      "archive": {"enabled": True, "dir": str(tmp_path / "a"), "save_text": False}},
                     wire=False)
     assert _run_main(monkeypatch, "secret words") == "secret words"
-    last = json.loads(history.last_record_path().read_text())
+    last = history.latest()
     assert "raw" not in last and "final" not in last and last["words"] == 2
     assert not history.queue_path().exists()
 
@@ -771,7 +772,7 @@ def test_resolve_source_matches_partial_device_names(monkeypatch):
 def test_post_output_after_cancel_drops_scratch_audio_and_keeps_archive(xdg, tmp_path, monkeypatch):
     feats = features.update({"archive": {"enabled": True, "dir": str(tmp_path / "a")}}, wire=False)
     rec = {"id": history.new_id(), "ts": history.iso(time.time()), "final": "x", "words": 1}
-    features.atomic_write_text(history.last_record_path(), json.dumps(rec))
+    history.write_handoff(rec)
     assert hooks._claim(rec["id"])  # already handled by its own post-output
     rt = features.ensure_private_dir(features.runtime_dir() / "rec")
     wav = rt / "1.wav"
@@ -915,7 +916,8 @@ def test_hook_entry_passes_its_start_time_to_the_worker(xdg, monkeypatch):
 
     seen = {}
     monkeypatch.setattr(hook_main, "_detach", lambda: True)
-    monkeypatch.setattr(hooks, "on_post_output", lambda entered_at=None: seen.setdefault("t", entered_at))
+    monkeypatch.setattr(hooks, "on_post_output",
+                        lambda entered_at=None, **k: seen.setdefault("t", entered_at))
     monkeypatch.setattr(os, "_exit", lambda code: (_ for _ in ()).throw(SystemExit(code)))
     t0 = time.time()
     with pytest.raises(SystemExit):
@@ -1063,3 +1065,80 @@ def test_unsafe_runtime_dir_still_passes_text_and_counts(xdg, monkeypatch, tmp_p
     assert _run_main(monkeypatch, "keep these words") == "keep these words"
     assert history.summary(30)["totals"]["dictations"] == 1
     assert not any(p.name != "rec" for p in rt.iterdir())  # nothing written into it
+
+
+# --- per-record handoff to the post-output worker ---------------------------
+
+def _hook_entry(monkeypatch) -> dict:
+    """Run the synchronous part of `voxtype-tui-hook post-output` (what
+    voxtype waits for) and return the environment it hands to the worker."""
+    from voxtype_tui import hook_main
+
+    snap = {}
+
+    def fake_detach():
+        snap.update({k: v for k, v in os.environ.items() if k.startswith("VOXTYPE_TUI_")})
+        return False  # the caller's side of the fork
+    monkeypatch.setattr(hook_main, "_detach", fake_detach)
+    assert hook_main.main(["post-output"]) == 0
+    for k in ("VOXTYPE_TUI_HOOK_STARTED", "VOXTYPE_TUI_HOOK_RECORD"):
+        monkeypatch.delenv(k, raising=False)
+    return snap
+
+
+def _worker(monkeypatch, env: dict) -> None:
+    """The detached worker, run later (possibly after newer dictations)."""
+    with monkeypatch.context() as m:
+        for k, v in env.items():
+            m.setenv(k, v)
+        hooks.main(["post-output"])
+
+
+def _archive_spy(monkeypatch, tmp_path) -> list:
+    features.update({"archive": {"enabled": True, "dir": str(tmp_path / "a")}}, wire=False)
+    done = []
+    monkeypatch.setattr("voxtype_tui.archive.finalize", lambda rec, feats, **k: done.append(rec["id"]))
+    return done
+
+
+def test_delayed_post_output_worker_handles_its_own_dictation(xdg, monkeypatch, tmp_path):
+    """A's worker starts only after dictation B was transcribed: it must
+    still handle A, and B's worker must handle B."""
+    done = _archive_spy(monkeypatch, tmp_path)
+    cli_postprocess._capture("a raw", "dictation A", [], [])
+    env_a = _hook_entry(monkeypatch)
+    cli_postprocess._capture("b raw", "dictation B", [], [])
+    env_b = _hook_entry(monkeypatch)
+    ids = [json.loads(line)["id"] for line in history.queue_path().read_text().splitlines()]
+    _worker(monkeypatch, env_a)  # delayed
+    _worker(monkeypatch, env_b)
+    assert done == ids
+
+
+def test_deleting_a_record_never_removes_a_newer_records_handoff(xdg, monkeypatch, tmp_path):
+    """Deleting A while B is being captured must not remove B's runtime
+    record (B would then never be archived or watched)."""
+    from pathlib import Path as P
+
+    done = _archive_spy(monkeypatch, tmp_path)
+    cli_postprocess._capture("a raw", "dictation A", [], [])
+    env_a = _hook_entry(monkeypatch)
+    rid_a = json.loads(history.queue_path().read_text().splitlines()[0])["id"]
+    _worker(monkeypatch, env_a)
+    real_read = P.read_text
+    state = {"b": False}
+
+    def read_then_capture_b(self, *a, **k):
+        out = real_read(self, *a, **k)
+        if not state["b"] and str(self).startswith(str(features.runtime_dir())):
+            state["b"] = True
+            cli_postprocess._capture("b raw", "dictation B", [], [])
+        return out
+    monkeypatch.setattr(P, "read_text", read_then_capture_b)
+    assert history.delete(rid_a) == 1
+    monkeypatch.setattr(P, "read_text", real_read)
+    if not state["b"]:
+        cli_postprocess._capture("b raw", "dictation B", [], [])
+    env_b = _hook_entry(monkeypatch)
+    _worker(monkeypatch, env_b)
+    assert len(done) == 2 and done[0] == rid_a and done[1] != rid_a

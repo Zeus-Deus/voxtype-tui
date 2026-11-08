@@ -61,8 +61,33 @@ def health_path(data_dir: Path | None = None) -> Path:
     return _dir(data_dir) / "health.json"
 
 
-def last_record_path() -> Path:
-    return F.runtime_dir() / "last.json"
+def handoff_path(record_id: str) -> Path:
+    """This dictation's runtime record for the post-output worker (RAM).
+    One file per record id, never overwritten by a later dictation."""
+    from . import rtdir
+
+    return Path(rtdir.handoff_file(rtdir.runtime_path(), record_id))
+
+
+HANDOFF_KEEP_S = 600.0
+
+
+def write_handoff(rec: dict) -> None:
+    """Critical path: one small tmpfs file, plus dropping handoffs no
+    worker picked up (post-output not wired) after HANDOFF_KEEP_S."""
+    from . import rtdir
+
+    rt = rtdir.runtime_path()
+    path = Path(rtdir.handoff_file(rt, rec["id"]))
+    F.atomic_write_text(path, json.dumps(rec, ensure_ascii=False))
+    rtdir.prune(rt, time.time(), HANDOFF_KEEP_S, "handoff")
+
+
+def remove_handoff(record_id: str) -> None:
+    try:
+        handoff_path(record_id).unlink()
+    except (OSError, ValueError):
+        pass
 
 
 # --- locking ---
@@ -519,8 +544,8 @@ def get(record_id: str, data_dir: Path | None = None) -> dict | None:
     """A record by id (history, queue or the runtime copy of the newest
     one). Expired records are never returned."""
     cutoff = _cutoff(F.load()["history"]["keep_days"])
-    rec = _read_last()
-    if rec and rec.get("id") == record_id and not _expired(rec, cutoff):
+    rec = handoff(record_id)
+    if rec and not _expired(rec, cutoff):
         return rec
     for item in _read_jsonl(history_path(data_dir)):
         if item.get("id") == record_id:
@@ -532,25 +557,34 @@ def get(record_id: str, data_dir: Path | None = None) -> dict | None:
     return None
 
 
-def _read_last() -> dict | None:
+def handoff(record_id: str, max_age_s: float | None = None) -> dict | None:
+    """Record ``record_id``'s runtime copy (text included when a consumer
+    that is on may keep it), or None (gone, unreadable, older than
+    ``max_age_s``)."""
     try:
-        rec = json.loads(last_record_path().read_text(encoding="utf-8"))
+        rec = json.loads(handoff_path(record_id).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    return rec if isinstance(rec, dict) else None
+    if not isinstance(rec, dict) or rec.get("id") != record_id:
+        return None
+    if max_age_s is not None:
+        ts = parse_ts(rec.get("ts"))
+        if ts is None or time.time() - ts > max_age_s:
+            return None
+    return rec
 
 
 def latest(max_age_s: float = 120.0) -> dict | None:
-    """The newest dictation's full record (text included), for the
-    post-output hook and the learning watcher. None when older than
-    ``max_age_s`` or unavailable."""
-    rec = _read_last()
-    if not rec:
+    """The newest dictation's runtime record, or None when older than
+    ``max_age_s`` or unavailable. The post-output hook does not use this:
+    it binds to its own record id before it forks."""
+    from . import rtdir
+
+    try:
+        rid = rtdir.newest_handoff(rtdir.runtime_path(), max_age_s)
+    except OSError:
         return None
-    ts = parse_ts(rec.get("ts"))
-    if ts is None or time.time() - ts > max_age_s:
-        return None
-    return rec
+    return handoff(rid, max_age_s) if rid else None
 
 
 def _drain_stripped(data_dir: Path | None, feats: dict, record_id: str | None) -> int:
@@ -588,12 +622,7 @@ def delete(record_id: str, data_dir: Path | None = None) -> int:
             removed = 1
         if _drain_stripped(data_dir, feats, record_id):
             removed = 1  # enqueued meanwhile: keep its count, drop its text
-        last = _read_last()
-        if last and last.get("id") == record_id:
-            try:
-                last_record_path().unlink()
-            except OSError:
-                pass
+        remove_handoff(record_id)  # only this record's runtime copy
         return removed
 
 
@@ -615,7 +644,9 @@ def clear(data_dir: Path | None = None) -> int:
             pass
         n += _drain_stripped(data_dir, feats, None)
         try:
-            last_record_path().unlink()
+            from . import rtdir
+
+            rtdir.prune(rtdir.runtime_path(), time.time(), -1.0, "handoff")
         except OSError:
             pass
         return n

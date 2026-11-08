@@ -45,7 +45,7 @@ When a recording is cancelled, or VAD finds no speech, nothing is archived.
 | `~/.local/share/voxtype-tui/usage.json` | counters, no text |
 | `~/.local/share/voxtype-tui/history.jsonl` | recent dictations (text), pruned to `keep_days` |
 | `~/.local/share/voxtype-tui/health.json`, `failures.jsonl` | last capture time and recent capture errors |
-| `$XDG_RUNTIME_DIR/voxtype-tui/` | per-dictation scratch (RAM): recording start, the last record for the archive and the learning watcher, the temp WAV |
+| `$XDG_RUNTIME_DIR/voxtype-tui/` | per-dictation scratch (RAM): recording start, the temp WAV, and `handoff/<id>.json`, one record per dictation for the archive and the learning watcher (removed once handled, or after 10 minutes) |
 
 The files are created 0600 in 0700 directories. None of them are in `sync.json` or in Export.
 
@@ -78,8 +78,10 @@ if you have not set them yourself:
   archive recorder. Voxtype starts capturing before it runs this hook, so the hook
   cannot cost you words. The hook returns in about 13 ms. The rest runs in the background.
 - `post_output_command`, only for the archive or the learning watcher. Voxtype waits
-  for this hook before it can record again, so the hook only starts a background
-  process and returns.
+  for this hook before it can record again, so the hook only claims this
+  dictation's record (by id, before Voxtype can start the next one), starts a
+  background process and returns. A background process that starts late still
+  handles its own dictation, never a newer one.
 
 The command it writes is safe if voxtype-tui is removed:
 

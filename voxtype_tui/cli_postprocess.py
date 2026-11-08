@@ -293,9 +293,7 @@ def _capture(raw: str, final: str, changed_by: list[str], hits: list[str]) -> No
         last = rec
         if not (learn_on or (arch_on and feats["archive"]["save_text"])):
             last = {k: v for k, v in rec.items() if k not in ("raw", "final")}
-        features.atomic_write_text(
-            history.last_record_path(), json.dumps(last, ensure_ascii=False),
-        )
+        history.write_handoff(last)
 
 
 def main() -> int:
