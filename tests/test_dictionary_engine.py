@@ -207,3 +207,84 @@ def test_process_spans_cover_composed_rule_output():
     text, spans = DictionaryEngine(rules).process_spans("the project now")
     assert text == "the Codemux Omashi now"
     assert spans == [(4, 18)] and text[4:18] == "Codemux Omashi"
+
+
+def _remap_reference(spans, edits, protect_new=True):
+    """The straightforward per-endpoint scan (quadratic), kept as the oracle."""
+    edits = sorted(edits)
+    starts, delta = [], 0
+    for a, b, new in edits:
+        starts.append((a, b, a + delta, a + delta + len(new)))
+        delta += len(new) - (b - a)
+
+    def pos(x, end):
+        d = 0
+        for a, b, na, nb in starts:
+            if (a < x <= b) if end else (a <= x < b):
+                return nb if end else na
+            if b > x:
+                break
+            d = nb - b
+        return x + d
+
+    out = [(pos(s, False), pos(e, True)) for s, e in spans]
+    out = [(s, e) for s, e in out if e > s]
+    if protect_new:
+        out += [(na, nb) for _, _, na, nb in starts if nb > na]
+    out.sort()
+    merged = []
+    for s, e in out:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def test_remap_spans_matches_the_reference_on_random_edits():
+    import random
+
+    from voxtype_tui.dictionary_engine import remap_spans
+
+    rng = random.Random(7)
+    for _ in range(3000):
+        n = rng.randint(0, 40)
+        cuts = sorted(rng.sample(range(n + 1), k=min(n + 1, 2 * rng.randint(0, 6))))
+        edits = [(cuts[i], cuts[i + 1], "x" * rng.randint(0, 4)) for i in range(0, len(cuts) - 1, 2)]
+        if rng.random() < 0.3 and n:  # zero-width insertions too
+            at = rng.randint(0, n)
+            if all(not (a < at < b) and a != at and b != at for a, b, _ in edits):
+                edits.append((at, at, "ins"))
+        spans = []
+        for _ in range(rng.randint(0, 5)):
+            a = rng.randint(0, n)
+            spans.append((a, rng.randint(a, n)))
+        for pn in (True, False):
+            assert remap_spans(spans, edits, protect_new=pn) == _remap_reference(spans, edits, pn), (
+                spans, edits, pn)
+
+
+def test_process_spans_stays_linear_on_long_repetitive_text():
+    """Both stages firing on every word of a long transcript: carrying the
+    spans costs about as much as the rewrite itself, never quadratic time
+    (the post-process has a timeout)."""
+    import time
+
+    eng = DictionaryEngine([Rule("foo", "bar", REPLACEMENT), Rule("bar", "Bar", CAPITALIZATION)])
+    text = "foo " * 12500  # 50,000 characters
+
+    def best(fn):
+        times = []
+        for _ in range(3):
+            t0 = time.perf_counter()
+            fn(text)
+            times.append(time.perf_counter() - t0)
+        return min(times)
+
+    out, spans = eng.process_spans(text)
+    assert out == eng.process(text) == "Bar " * 12500
+    assert len(spans) == 12500 and all(out[a:b] == "Bar" for a, b in spans)
+    plain = best(eng.process)
+    with_spans = best(eng.process_spans)
+    assert with_spans < 1.0
+    assert with_spans < 3 * plain + 0.01, (with_spans, plain)

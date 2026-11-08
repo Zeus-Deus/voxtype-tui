@@ -251,22 +251,28 @@ def remap_spans(spans: Iterable[tuple[int, int]], edits: Iterable[Edit],
     A span grows to cover any edit that overlaps it (its output stays
     inside), others shift. With ``protect_new`` each edit's output becomes
     a span too. Returns sorted, merged spans of the edited text."""
+    from bisect import bisect_left, bisect_right
+
     edits = sorted(edits)
     starts = []  # (old_a, old_b, new_a, new_b)
     delta = 0
     for a, b, new in edits:
         starts.append((a, b, a + delta, a + delta + len(new)))
         delta += len(new) - (b - a)
+    # Non-overlapping and sorted, so the old ends are sorted too: each span
+    # endpoint is a binary search (a per-endpoint rescan is quadratic on a
+    # long transcript where a rule fires on every word).
+    ends = [b for _, b, _, _ in starts]
 
     def pos(x: int, end: bool) -> int:
-        d = 0
-        for a, b, na, nb in starts:
-            if (a < x <= b) if end else (a <= x < b):
-                return nb if end else na  # inside an edit: cover its output
-            if b > x:
-                break  # this and later edits lie after x
-            d = nb - b  # cumulative shift after this edit
-        return x + d
+        if end:
+            j = bisect_left(ends, x)  # the only edit that can hold x: a < x <= b
+            if j < len(starts) and starts[j][0] < x <= starts[j][1]:
+                return starts[j][3]  # inside an edit: cover its output
+        k = bisect_right(ends, x)  # edits wholly before x
+        if not end and k < len(starts) and starts[k][0] <= x < starts[k][1]:
+            return starts[k][2]
+        return x + (starts[k - 1][3] - starts[k - 1][1] if k else 0)
 
     out = []
     for s, e in spans:
