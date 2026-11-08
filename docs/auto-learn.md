@@ -133,7 +133,10 @@ None of them are in `sync.json`. Debugging with text in the log:
   about 0.2 ms per dictation (measured in an Omarchy VM on a real dictation).
   Worst case measured: 500 learned entries, 60 words, a fresh process each
   time (as Voxtype runs it): import + apply p95 2.5 ms. It never loads the
-  50k-word list.
+  50k-word list. Checking that the compiled file matches `learned.json`
+  is one `stat`. Only if it does not (a write failed half-way) does apply
+  compile `learned.json` itself, about 8 ms with 500 entries, until the
+  next save fixes the file.
 - The watcher exists only after a dictation, for at most 30 s (plus up to
   10 s for the Undo click), and costs ~0.2 % of one core and ~32 MB while
   armed. Nothing runs while you are not dictating.
