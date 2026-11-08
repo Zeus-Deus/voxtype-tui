@@ -56,7 +56,11 @@ if you have not set them yourself:
 
 - `[output.post_process] command` runs `voxtype-tui-postprocess`, as before for vocabulary
   and dictionary users. It is the only program that sees the text. After the
-  existing stages it adds one line to the queue (about 0.3 ms). The command is
+  existing stages it adds one line to the queue (about 0.3 ms). Voxtype waits
+  for this command, so the queue is never waited on for more than 50 ms: if
+  something holds it longer, that one record is dropped and counted in
+  `health.dropped`, and the text goes out unchanged. Deleting or clearing
+  History never holds the queue for more than a rename. The command is
   `command -v voxtype-tui-postprocess >/dev/null 2>&1 && exec voxtype-tui-postprocess; exec cat`.
   If voxtype-tui is removed, `cat` passes the text through unchanged. A bare
   command that exits without reading the text can kill the Voxtype 1.1.1 daemon

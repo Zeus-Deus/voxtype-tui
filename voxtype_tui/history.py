@@ -4,9 +4,11 @@ Data flow:
 
 * ``voxtype-tui-postprocess`` (critical path) builds one record per
   dictation and calls :func:`enqueue`: a single ``O_APPEND`` line in
-  ``$XDG_DATA_HOME/voxtype-tui/queue.jsonl`` under ``flock``. Nothing
+  ``$XDG_DATA_HOME/voxtype-tui/queue.jsonl`` under ``flock``, waiting at
+  most ``ENQUEUE_WAIT_S`` (then the record is dropped and counted). Nothing
   else — no pruning, no rewrites. Text is only in that line when recent
-  history is on.
+  history is on. Every other holder of the queue's lock only renames the
+  file away under it.
 * :func:`maintain` drains the queue into ``usage.json`` (counters, never
   text) and ``history.jsonl`` (text, when history is on) and prunes
   expired history. It runs detached from the post-output hook and at the
@@ -31,6 +33,7 @@ if TYPE_CHECKING:  # keep the post-process import cost minimal
 from . import features as F
 
 QUEUE_MAX_BYTES = 4 * 1024 * 1024
+ENQUEUE_WAIT_S = 0.05  # longest a dictation may wait for the queue lock
 FAILURES_KEEP = 20
 RECENT_IDS_KEEP = 2000
 USAGE_VERSION = 1
@@ -136,24 +139,49 @@ def note_failure(where: str, msg: str, data_dir: Path | None = None) -> None:
 
 # --- critical path ---
 
-def enqueue(record: dict, data_dir: Path | None = None) -> bool:
-    """Append one record to the queue. Bounded: when the queue is over
-    QUEUE_MAX_BYTES (nobody drained it for thousands of dictations) the
-    record is dropped and counted. Returns True when written.
+def _note_dropped(d: Path) -> None:
+    dfd = os.open(str(d / "dropped"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(dfd, b"1\n")
+    finally:
+        os.close(dfd)
 
-    The queue lock is only ever held by other writers for microseconds
-    (maintenance renames the file away and drains the renamed copy), so
-    this never waits on a drain. If the file was renamed between our open
-    and our lock, we reopen the new one."""
+
+def _try_lock(fd: int, wait_s: float) -> bool:
+    """Non-blocking flock, retried for at most ``wait_s``."""
     import fcntl
 
+    deadline = time.monotonic() + wait_s
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.002)
+
+
+def enqueue(record: dict, data_dir: Path | None = None) -> bool:
+    """Append one record to the queue. Returns True when written.
+
+    Runs on the dictation's critical path (voxtype waits for the
+    post-process command to exit), so it never blocks: the queue's lock is
+    tried without blocking for at most ENQUEUE_WAIT_S. Other holders keep
+    it for microseconds (a rename); a stuck holder costs this one record,
+    which is counted in ``dropped``, never the dictation. The same happens
+    when the queue is over QUEUE_MAX_BYTES (nobody drained it for
+    thousands of dictations). If the file was renamed between our open and
+    our lock, we reopen the new one."""
     p = queue_path(data_dir)
     F.ensure_private_dir(p.parent)
     line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+    deadline = time.monotonic() + ENQUEUE_WAIT_S
     for _ in range(5):
         fd = os.open(str(p), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            if not _try_lock(fd, max(0.0, deadline - time.monotonic())):
+                break
             st = os.fstat(fd)
             try:
                 same = os.stat(str(p)).st_ino == st.st_ino
@@ -162,16 +190,12 @@ def enqueue(record: dict, data_dir: Path | None = None) -> bool:
             if not same:
                 continue  # renamed away for draining: append to the new queue
             if st.st_size + len(line) > QUEUE_MAX_BYTES:
-                dfd = os.open(str(p.parent / "dropped"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-                try:
-                    os.write(dfd, b"1\n")
-                finally:
-                    os.close(dfd)
-                return False
+                break
             os.write(fd, line)
             return True
         finally:
             os.close(fd)  # releases the flock
+    _note_dropped(p.parent)
     return False
 
 
@@ -529,47 +553,32 @@ def latest(max_age_s: float = 120.0) -> dict | None:
     return rec
 
 
-def _strip_queue_text(data_dir: Path | None, record_id: str | None) -> int:
-    """Drop text from queued (not yet drained) records, in place, holding
-    the queue's flock only for this short edit. ``None`` = every record."""
-    import fcntl
-
-    try:
-        qfd = os.open(str(queue_path(data_dir)), os.O_RDWR)
-    except FileNotFoundError:
+def _drain_stripped(data_dir: Path | None, feats: dict, record_id: str | None) -> int:
+    """Records enqueued after this edit's own drain: claim the queue (a
+    rename under its lock, never a parse), drop the text of the matching
+    records (``None`` = all), then drain them, so their counts are kept.
+    Returns how many lost their text. Caller holds :class:`_Lock`."""
+    _claim_queue(data_dir)
+    dp = _draining_path(data_dir)
+    if not dp.exists():
         return 0
-    try:
-        fcntl.flock(qfd, fcntl.LOCK_EX)
-        with os.fdopen(os.dup(qfd), "r", encoding="utf-8") as f:
-            items = []
-            for line in f:
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(obj, dict):
-                    items.append(obj)
-        hits = 0
-        out = []
-        for i in items:
-            if "final" in i and (record_id is None or i.get("id") == record_id):
-                out.append(_strip_text(i))
-                hits += 1
-            else:
-                out.append(i)
-        if not hits:
-            return 0
-        data = "".join(json.dumps(i, ensure_ascii=False, separators=(",", ":")) + "\n" for i in out)
-        os.ftruncate(qfd, 0)
-        os.pwrite(qfd, data.encode(), 0)
-        return hits
-    finally:
-        os.close(qfd)
+    hits = 0
+    records = []
+    for r in _read_jsonl(dp):
+        if "final" in r and (record_id is None or r.get("id") == record_id):
+            r = _strip_text(r)
+            hits += 1
+        records.append(r)
+    if records:
+        _drain(records, data_dir, feats, history_path(data_dir))
+    dp.unlink()
+    return hits
 
 
 def delete(record_id: str, data_dir: Path | None = None) -> int:
     with _Lock(data_dir):
-        _maintain_locked(data_dir, F.load())  # no draining batch is left behind
+        feats = F.load()
+        _maintain_locked(data_dir, feats)  # no draining batch is left behind
         removed = 0
         hp = history_path(data_dir)
         items = list(_read_jsonl(hp))
@@ -577,7 +586,7 @@ def delete(record_id: str, data_dir: Path | None = None) -> int:
         if len(keep) != len(items):
             _write_jsonl(hp, keep)
             removed = 1
-        if _strip_queue_text(data_dir, record_id):
+        if _drain_stripped(data_dir, feats, record_id):
             removed = 1  # enqueued meanwhile: keep its count, drop its text
         last = _read_last()
         if last and last.get("id") == record_id:
@@ -596,14 +605,15 @@ def _strip_text(rec: dict) -> dict:
 
 def clear(data_dir: Path | None = None) -> int:
     with _Lock(data_dir):
-        _maintain_locked(data_dir, F.load())
+        feats = F.load()
+        _maintain_locked(data_dir, feats)
         hp = history_path(data_dir)
         n = sum(1 for _ in _read_jsonl(hp))
         try:
             hp.unlink()
         except FileNotFoundError:
             pass
-        n += _strip_queue_text(data_dir, None)
+        n += _drain_stripped(data_dir, feats, None)
         try:
             last_record_path().unlink()
         except OSError:

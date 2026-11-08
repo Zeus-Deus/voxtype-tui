@@ -921,3 +921,69 @@ def test_hook_entry_passes_its_start_time_to_the_worker(xdg, monkeypatch):
     with pytest.raises(SystemExit):
         hook_main.main(["post-output"])
     assert t0 <= seen["t"] <= time.time()
+
+
+# --- critical path never waits ---------------------------------------------
+
+def test_enqueue_never_blocks_on_a_held_queue_lock(xdg):
+    """A stuck lock holder (another process, a stalled filesystem) must not
+    delay the dictation: enqueue gives up after a short bounded wait and
+    the record is counted as dropped."""
+    import fcntl
+    import threading
+
+    history.enqueue(_rec(0))
+    holder = os.open(str(history.queue_path()), os.O_RDWR)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    result = {}
+    try:
+        t0 = time.perf_counter()
+        th = threading.Thread(target=lambda: result.setdefault("ok", history.enqueue(_rec(1))),
+                              daemon=True)
+        th.start()
+        th.join(2.0)
+        blocked = th.is_alive()
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+    finally:
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        os.close(holder)
+    assert not blocked, "enqueue waited on the queue lock"
+    assert result["ok"] is False and elapsed_ms < 200
+    assert history.health()["dropped"] == 1
+
+
+def test_history_edits_never_parse_the_queue_under_its_lock(xdg, monkeypatch):
+    """delete/clear take the queue's lock only for a rename; stripping text
+    from queued records happens on the claimed copy."""
+    import fcntl
+
+    for i in range(3):
+        history.enqueue(_rec(i))
+    probes = []
+    real_strip = history._strip_text
+
+    def probing_strip(rec):
+        fd = os.open(str(history.queue_path()), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            probes.append(True)
+        except BlockingIOError:
+            probes.append(False)
+        finally:
+            os.close(fd)
+        return real_strip(rec)
+    monkeypatch.setattr(history, "_strip_text", probing_strip)
+    # a record that arrives after the edit's own drain: still in the queue
+    real_maintain = history._maintain_locked
+
+    def maintain_then_enqueue(*a, **k):
+        r = real_maintain(*a, **k)
+        history.enqueue(_rec(9))
+        return r
+    monkeypatch.setattr(history, "_maintain_locked", maintain_then_enqueue)
+    history.clear()
+    assert probes and all(probes), "queue lock held while rewriting queued records"
+    monkeypatch.setattr(history, "_maintain_locked", real_maintain)
+    assert history.list_items()["items"] == []
+    assert history.summary(30)["totals"]["dictations"] == 4
