@@ -485,7 +485,8 @@ def health(data_dir: Path | None = None) -> dict:
     h = _load_health(data_dir)
     d = _dir(data_dir)
     try:
-        dropped = sum(1 for _ in (d / "dropped").open())
+        with (d / "dropped").open() as f:
+            dropped = sum(1 for _ in f)
     except OSError:
         dropped = 0
     failures = list(_read_jsonl(d / "failures.jsonl"))[-FAILURES_KEEP:]
