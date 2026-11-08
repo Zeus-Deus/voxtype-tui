@@ -581,8 +581,10 @@ def submit_correction(record: dict | str, edited_text: str, source: str = "fix",
             duplicate = rec_id is not None and rec_id in e.get("records", [])
             step = steps.get(e["id"])
             if step is None:
-                step = steps[e["id"]] = {"record": rec_id, "new": is_new, "prev_state": e["state"],
-                                         "counted": not duplicate, "aliases": [], "pending": {}}
+                step = steps[e["id"]] = {"id": _new_id().replace("l_", "s_", 1), "record": rec_id,
+                                         "new": is_new, "prev_state": e["state"],
+                                         "counted": not duplicate, "at": _iso(now),
+                                         "aliases": [], "pending": {}}
             hl = p["heard"].lower()
             if hl not in step["pending"]:
                 snap = (e.get("pending_aliases") or {}).get(hl)
@@ -618,8 +620,17 @@ def submit_correction(record: dict | str, edited_text: str, source: str = "fix",
             changed = True
         if changed:
             for e in store["entries"]:
-                if e["id"] in steps:
-                    e["last_step"] = steps[e["id"]]
+                st = steps.get(e["id"])
+                if st is None:
+                    continue
+                if _noop_step(e, st):
+                    # e.g. the same correction submitted again for the same
+                    # dictation: nothing to undo, and the step that did
+                    # change something keeps its Undo.
+                    st["id"] = None
+                    continue
+                e["steps"] = (_steps(e) + [st])[-MAX_STEPS:]
+                e.pop("last_step", None)
             _save(store)
     pub = []
     for e in out["applied"]:
@@ -630,6 +641,7 @@ def submit_correction(record: dict | str, edited_text: str, source: str = "fix",
         row = _public(e)
         row["activated"] = e["state"] == "active" and (
             st.get("prev_state") != "active" or bool(st.get("aliases")))
+        row["step"] = st.get("id")  # undo(entry, record, step=...) undoes exactly this
         pub.append(row)
     out["applied"] = pub
     return out
@@ -702,7 +714,7 @@ def _mutate(entry_id: str, fn: Callable[[dict, dict], None]) -> dict | None:
 
 def accept(entry_id: str) -> dict | None:
     def f(_s, e):
-        e.pop("last_step", None)
+        _drop_steps(e)
         if e["state"] in ("suggested", "dormant", "rejected", "active"):
             if e["state"] != "active":
                 e["state"] = "active"
@@ -715,7 +727,7 @@ def accept(entry_id: str) -> dict | None:
 def reject(entry_id: str) -> dict | None:
     """Tombstone: stop applying it and never learn it again."""
     def f(_s, e):
-        e.pop("last_step", None)
+        _drop_steps(e)
         if e["state"] != "promoted":
             e["state"] = "rejected"
             e["decided_at"] = _iso(_now())
@@ -734,18 +746,60 @@ def forget(entry_id: str) -> bool:
         return True
 
 
-def undo(entry_id: str, record_id: str | None = None) -> bool:
-    """Undo the last learning step for an entry (notification Undo): a
+MAX_STEPS = 5  # learning steps kept per entry for Undo
+
+
+def _steps(e: dict) -> list[dict]:
+    steps = [s for s in e.get("steps") or [] if isinstance(s, dict)]
+    legacy = e.get("last_step")
+    if not steps and isinstance(legacy, dict):
+        steps = [legacy]
+    return steps
+
+
+def _drop_steps(e: dict) -> None:
+    e.pop("steps", None)
+    e.pop("last_step", None)
+
+
+def _noop_step(e: dict, step: dict) -> bool:
+    """True when a learning step changed nothing that Undo would revert."""
+    if step.get("new") or step.get("counted") or step.get("aliases"):
+        return False
+    if e.get("state") != step.get("prev_state"):
+        return False
+    pending = e.get("pending_aliases") or {}
+    return all(pending.get(hl) == snap for hl, snap in (step.get("pending") or {}).items())
+
+
+def undo(entry_id: str, record_id: str | None = None, step: str | None = None) -> bool:
+    """Undo one learning step for an entry (notification Undo): a
     first-time entry is forgotten; otherwise that step's sighting, the
-    aliases it confirmed and the state before it are restored."""
+    aliases it confirmed and the state before it are restored.
+
+    ``step`` is the id :func:`submit_correction` returned for the entry
+    (``applied[i]["step"]``); with it exactly that step is undone, even
+    after later submissions, and False is returned if it no longer exists
+    (already undone, or the entry was decided since). Without it the
+    latest step (for ``record_id``, if given) is undone."""
     with _locked():
         store = load()
         for e in store["entries"]:
             if e["id"] != entry_id:
                 continue
-            step = e.pop("last_step", None)
-            if isinstance(step, dict) and (record_id is None or step.get("record") == record_id):
-                _undo_step(store, e, step)
+            steps = _steps(e)
+            if step is not None:
+                target = next((s for s in steps if s.get("id") == step), None)
+                if target is None:
+                    return False
+            else:
+                target = next((s for s in reversed(steps)
+                               if record_id is None or s.get("record") == record_id), None)
+            if target is not None:
+                latest = target is steps[-1]
+                e["steps"] = [s for s in steps if s is not target]
+                e.pop("last_step", None)
+                _undo_step(store, e, target, latest=latest)
             elif int(e.get("count", 0)) <= 1:
                 store["entries"].remove(e)
             else:
@@ -761,23 +815,41 @@ def undo(entry_id: str, record_id: str | None = None) -> bool:
     return False
 
 
-def _undo_step(store: dict, e: dict, step: dict) -> None:
+def _drop_one(seq: list, value: object) -> None:
+    """Remove the last occurrence of ``value`` (no-op when absent)."""
+    for i in range(len(seq) - 1, -1, -1):
+        if seq[i] == value:
+            del seq[i]
+            return
+
+
+def _undo_step(store: dict, e: dict, step: dict, *, latest: bool = True) -> None:
     if step.get("new"):
-        store["entries"].remove(e)
+        store["entries"].remove(e)  # everything after a first sighting builds on it
         return
     undone = {h.lower() for h in step.get("aliases") or [] if isinstance(h, str)}
     e["aliases"] = [h for h in e.get("aliases") or [] if h.lower() not in undone]
     pending = e.setdefault("pending_aliases", {})
+    rid = step.get("record")
     for hl, snap in (step.get("pending") or {}).items():
-        if snap is None:
-            pending.pop(hl, None)
-        else:
-            pending[hl] = snap
+        if latest:
+            if snap is None:
+                pending.pop(hl, None)
+            else:
+                pending[hl] = snap
+        elif isinstance(pending.get(hl), dict):
+            # later steps touched it too: take back only this step's sighting
+            p = pending[hl]
+            if rid and rid in p.get("records", []) and rid not in ((snap or {}).get("records") or []):
+                p["records"].remove(rid)
+                _drop_one(p.get("seen", []), step.get("at"))
     if step.get("counted"):
         e["count"] = max(0, int(e.get("count", 0)) - 1)
-        if e.get("seen"):
-            e["seen"].pop()
-        rid = step.get("record")
+        seen = e.get("seen") or []
+        if step.get("at") in seen:
+            _drop_one(seen, step["at"])
+        elif seen:
+            seen.pop()
         if rid and rid in e.get("records", []):
             e["records"].remove(rid)
     if step.get("prev_state") in STATES:
@@ -817,10 +889,14 @@ def promote(entry_id: str, *, add_to_user: Callable[[dict], dict] | None = None,
             return {"ok": False, "error": "no such learned entry"}
         if entry["state"] == "promoted":
             return {"ok": True, "entry": _public(entry), "added": {"vocab": [], "rules": []}}
-        added = add(dict(entry))
+        # Promote is an explicit confirmation: heard forms still waiting for
+        # a second sighting become rules too (user_additions includes them).
+        added = add(json.loads(json.dumps(entry)))
 
         def f(_s, e):
-            e.pop("last_step", None)
+            _drop_steps(e)
+            if e["kind"] in ("sounds_like", "replace"):
+                _confirm_pending(e)
             e["state"] = "promoted"
             e["decided_at"] = _iso(_now())
         pub = _mutate(entry_id, f)  # re-reads: the callback may have changed the store
@@ -828,8 +904,18 @@ def promote(entry_id: str, *, add_to_user: Callable[[dict], dict] | None = None,
 
 
 def user_additions(entry: dict) -> dict:
-    """What promoting ``entry`` adds to the user's own lists."""
-    aliases = entry.get("aliases") if isinstance(entry.get("aliases"), list) else entry["heard"]
+    """What promoting ``entry`` adds to the user's own lists. Promoting
+    confirms the entry, so pending heard forms count as aliases."""
+    raw = entry.get("aliases")
+    aliases = list(raw) if isinstance(raw, list) else list(entry.get("heard") or [])
+    have = {h.lower() for h in aliases if isinstance(h, str)}
+    pending = entry.get("pending_aliases")
+    for hl, p in (pending.items() if isinstance(pending, dict) else ()):
+        h = p.get("heard") if isinstance(p, dict) else None
+        h = h if isinstance(h, str) else str(hl)
+        if h.lower() not in have:
+            aliases.append(h)
+            have.add(h.lower())
     if entry["kind"] == "spelling" or not aliases:
         return {"vocab": [entry["written"]], "rules": []}
     return {"vocab": [], "rules": [[h, entry["written"]] for h in aliases]}
@@ -904,7 +990,7 @@ def _compile(store: dict) -> dict:
 
 
 def _public(e: dict) -> dict:
-    out = {k: v for k, v in e.items() if k not in ("seen", "pending_aliases", "last_step")}
+    out = {k: v for k, v in e.items() if k not in ("seen", "pending_aliases", "last_step", "steps")}
     out["score"] = round(score(e), 2)
     return out
 
@@ -1350,7 +1436,8 @@ def notify_learned(entries: list[dict], *, record_id: str | None = None,
             return False
         if p.stdout.strip() in ("default", "undo"):
             for e in entries:
-                undo(e["id"], record_id)
+                # bound to the learning step this notification announced
+                undo(e["id"], record_id, step=e.get("step"))
             return True
         return False
     except Exception:

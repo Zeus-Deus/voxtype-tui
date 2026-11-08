@@ -638,3 +638,71 @@ def test_undo_of_a_new_alias_keeps_the_active_entry():
     assert L.apply("on Omarion")[0] == "on Omarion"
     assert L.apply("on Omashi")[0] == "on Omarchy"
     assert L.load()["entries"][0]["state"] == "active"
+
+
+# ---------------------------------------------------------------- promote / undo binding
+
+def test_promote_of_a_suggested_entry_uses_its_pending_heard_forms():
+    out = L.submit_correction(rec("today we are going to build on Omarion with computers", "w1"),
+                              "today we are going to build on Omarchy with computers", "atspi")
+    ent = out["applied"][0]
+    assert ent["state"] == "suggested" and ent["kind"] == "sounds_like" and ent["aliases"] == []
+    seen = []
+    res = L.promote(ent["id"], add_to_user=lambda e: (seen.append(L.user_additions(e)),
+                                                      L.user_additions(e))[1])
+    assert seen == [{"vocab": [], "rules": [["Omarion", "Omarchy"]]}]
+    assert res["entry"]["state"] == "promoted"
+    stored = L.load()["entries"][0]
+    assert stored["aliases"] == ["Omarion"] and not stored.get("pending_aliases")
+
+
+def _click_undo(monkeypatch):
+    import shutil
+    import subprocess
+    monkeypatch.setattr(shutil, "which", lambda n: "/usr/bin/notify-send")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, "default\n", ""))
+
+
+def test_duplicate_submit_keeps_the_activation_undo(monkeypatch):
+    o, e = "today we are going to build Omarshi with computers", "today we are going to build Omarchy with computers"
+    first = L.submit_correction(rec(o, "w1"), e, "atspi")
+    assert first["applied"][0]["activated"] is True
+    L.submit_correction(rec(o, "w1"), e, "atspi")  # the same correction again
+    assert L.undo(first["applied"][0]["id"], "w1")
+    assert L.apply("on Omarshi")[0] == "on Omarshi"
+    assert L.load()["entries"] == []
+
+
+def test_notification_undo_undoes_its_own_step(monkeypatch):
+    o = "today we are going to build Omarshi and Omarzo quite good"
+    first = L.submit_correction(rec(o, "w1"),
+                                "today we are going to build Omarchy and Omarzo quite good", "atspi")
+    assert first["applied"][0]["activated"] is True
+    # the same dictation corrected further before the Undo click
+    L.submit_correction(rec(o, "w1"), "today we are going to build Omarchy and Omarchy quite good", "atspi")
+    _click_undo(monkeypatch)
+    assert L.notify_learned(first["applied"], record_id="w1", wait_for_undo_s=1) is True
+    assert L.apply("on Omarshi")[0] == "on Omarshi"
+    assert L.load()["entries"] == []
+
+
+def test_undo_by_step_takes_back_only_that_step():
+    eid = L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")["applied"][0]["id"]
+    s2 = L.submit_correction(rec("on Omarshi", "w1"), "on Omarchy", "atspi")["applied"][0]
+    assert s2["activated"] and s2["step"]
+    L.submit_correction(rec("on Omarion", "w2"), "on Omarchy", "atspi")  # a later, pending step
+    assert L.undo(eid, "w1", step=s2["step"])
+    assert L.apply("on Omarshi")[0] == "on Omarshi"
+    assert L.apply("on Omashi")[0] == "on Omarchy"
+    ent = L.load()["entries"][0]
+    assert ent["state"] == "active" and ent["records"] == ["r1", "w2"]
+    assert ent["pending_aliases"]["omarion"]["records"] == ["w2"]
+    assert L.undo(eid, "w1", step=s2["step"]) is False  # already undone: nothing else changes
+    assert L.load()["entries"][0]["records"] == ["r1", "w2"]
+
+
+def test_a_duplicate_submit_returns_no_step_of_its_own():
+    first = L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")["applied"][0]
+    again = L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")["applied"][0]
+    assert first["step"] and again["step"] is None and again["activated"] is False
+    assert "steps" not in again and "last_step" not in again
