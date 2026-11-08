@@ -1,6 +1,6 @@
 # Maintainer: Zeus-Deus <github.commits@widow.cc>
 pkgname=voxtype-tui
-pkgver=0.1.9
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Textual-based TUI for managing Voxtype (Linux voice-to-text daemon)"
 arch=('any')
@@ -21,6 +21,9 @@ makedepends=(
 optdepends=(
     'libpulse: audio device enumeration via pactl'
     'systemd: daemon restart prompts via systemctl --user'
+    'python-gobject: learn corrections typed in other apps (AT-SPI)'
+    'at-spi2-core: learn corrections typed in other apps (AT-SPI)'
+    'libnotify: "Vocabulary learned" notifications'
 )
 install=voxtype-tui.install
 source=("$pkgname-$pkgver.tar.gz::https://github.com/Zeus-Deus/voxtype-tui/archive/v$pkgver.tar.gz")
