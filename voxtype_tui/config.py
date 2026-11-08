@@ -26,6 +26,50 @@ class ValidationError(RuntimeError):
     """Raised when `voxtype -c <tmp> config` rejects a proposed write."""
 
 
+class ConfigChanged(RuntimeError):
+    """config.toml changed on disk after it was read; nothing was written.
+    Reload, re-apply the change and save again."""
+
+
+UNCHECKED = object()  # safe_save(expect=...) default: no change detection
+
+
+def read_snapshot(path: Path) -> tuple[TOMLDocument, bytes]:
+    """``(doc, raw bytes)`` from one read. Pass the bytes as
+    ``safe_save(..., expect=raw)`` to refuse the save when someone (the user,
+    another voxtype-tui process) changed the file in between."""
+    raw = path.read_bytes()
+    text = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")  # as read_text()
+    return tomlkit.parse(text), raw
+
+
+def _save_lock():
+    """Serializes check-then-replace among voxtype-tui writers (held for a
+    read and a rename)."""
+    import fcntl
+
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    d = Path(base) / "voxtype-tui"
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(str(d / ".config-save.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _replace_if_unchanged(tmp: Path, path: Path, expect: "bytes | None") -> None:
+    fd = _save_lock()
+    try:
+        try:
+            current: bytes | None = path.read_bytes()
+        except FileNotFoundError:
+            current = None
+        if current != expect:
+            raise ConfigChanged(f"{path} changed since it was read; not saved")
+        os.replace(tmp, path)
+    finally:
+        os.close(fd)  # releases the flock
+
+
 def _backup_path(path: Path) -> Path:
     return path.parent / (path.name + BACKUP_SUFFIX)
 
@@ -73,10 +117,15 @@ async def safe_save_async(
     *,
     validate: bool = True,
     backup: bool = True,
+    expect: Any = UNCHECKED,
 ) -> None:
     """Non-blocking equivalent of safe_save. Use from Textual/async contexts.
     The validation subprocess runs on a worker thread via asyncio.to_thread."""
-    await asyncio.to_thread(safe_save, doc, path, validate=validate, backup=backup)
+    if expect is UNCHECKED:
+        await asyncio.to_thread(safe_save, doc, path, validate=validate, backup=backup)
+    else:
+        await asyncio.to_thread(safe_save, doc, path, validate=validate, backup=backup,
+                                expect=expect)
 
 
 def safe_save(
@@ -85,8 +134,14 @@ def safe_save(
     *,
     validate: bool = True,
     backup: bool = True,
+    expect: Any = UNCHECKED,
 ) -> None:
     """Atomic save with pre-write voxtype validation and first-write backup.
+
+    ``expect`` = the file's bytes as read (``None`` = it did not exist):
+    right before step 4 the file is compared with them, under a lock shared
+    by voxtype-tui writers, and :class:`ConfigChanged` is raised (nothing
+    written) when it changed meanwhile.
 
     Flow:
       1. Serialize the doc to a temp file in the same directory.
@@ -119,7 +174,10 @@ def safe_save(
             if not bak.exists():
                 shutil.copy2(path, bak)
 
-        os.replace(tmp, path)
+        if expect is UNCHECKED:
+            os.replace(tmp, path)
+        else:
+            _replace_if_unchanged(tmp, path, expect)
     except Exception:
         if tmp.exists():
             tmp.unlink()
@@ -167,6 +225,26 @@ RESTART_SENSITIVE_PATHS: frozenset[str] = frozenset({
     "text.replacements",
     "text.spoken_punctuation",
     "text.smart_auto_submit",
+    # Stock voxtype keys exposed in the insights release; voxtype reports
+    # every one of them as "needs restart" (`voxtype config schema`).
+    "audio.pause_media",
+    "audio.duck_media",
+    "audio.duck_media_volume_percent",
+    "audio.duck_media_fade_ms",
+    "osd.enabled",
+    "osd.frontend",
+    "osd.layout",
+    "osd.position",
+    "osd.palette",
+    "text.filter_filler_words",
+    "output.restore_clipboard",
+    "output.shift_enter_newlines",
+    "output.notification.on_recording_start",
+    "output.notification.on_recording_stop",
+    "output.notification.on_transcription",
+    "output.notification.on_no_speech",
+    "output.pre_recording_command",
+    "output.post_output_command",
 })
 
 
@@ -267,11 +345,29 @@ def remove_replacement(doc: TOMLDocument, from_text: str) -> None:
     set_replacements(doc, reps)
 
 
-# Our post-process CLI. When `[output.post_process].command` equals this
-# value, voxtype-tui owns the post-process layer: Vexis-style fuzzy
+# Our post-process CLI. When `[output.post_process].command` is one of our
+# commands, voxtype-tui owns the post-process layer: Vexis-style fuzzy
 # replacement + exact capitalization applied to every transcript.
-POSTPROCESS_COMMAND = "voxtype-tui-postprocess"
+#
+# Voxtype runs the command through `sh -c`, writes the transcript to its
+# stdin, and resets SIGPIPE to the default action: a command that exits
+# without reading stdin (e.g. "command not found" after voxtype-tui was
+# uninstalled) can kill the daemon (measured on voxtype 1.1.1). The wired
+# form therefore falls back to `cat` (text passes through unchanged) when
+# the CLI is missing. The bare name is what versions <= 0.1.9 wrote; it is
+# still ours and is upgraded to the safe form when we rewire.
+POSTPROCESS_BIN = "voxtype-tui-postprocess"
+POSTPROCESS_COMMAND = (
+    f"command -v {POSTPROCESS_BIN} >/dev/null 2>&1 && exec {POSTPROCESS_BIN}; exec cat"
+)
+LEGACY_POSTPROCESS_COMMANDS: tuple[str, ...] = (POSTPROCESS_BIN,)
 POSTPROCESS_TIMEOUT_MS = 5000
+
+
+def is_our_post_process_command(command: object) -> bool:
+    return command is not None and str(command) in (
+        (POSTPROCESS_COMMAND,) + LEGACY_POSTPROCESS_COMMANDS
+    )
 
 
 def get_post_process(doc: TOMLDocument) -> dict[str, Any]:
@@ -309,7 +405,7 @@ def is_our_post_process(doc: TOMLDocument) -> bool:
     """True when `[output.post_process].command` is our CLI (so we own
     the post-process layer and can safely assume our rule schema)."""
     pp = get_post_process(doc)
-    return pp.get("command") == POSTPROCESS_COMMAND
+    return is_our_post_process_command(pp.get("command"))
 
 
 def _get_in(node: Any, path: str) -> Any:

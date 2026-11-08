@@ -24,6 +24,7 @@ dev = [
 [project.scripts]
 voxtype-tui = "voxtype_tui.app:main"
 voxtype-tui-postprocess = "voxtype_tui.cli_postprocess:main"
+voxtype-tui-hook = "voxtype_tui.hook_main:main"
 
 [tool.setuptools.packages.find]
 include = ["voxtype_tui*"]

@@ -121,6 +121,41 @@ def gpu_status_sync(timeout: float = 5.0) -> tuple[bool, str]:
 CUSTOM_AUDIO_DEVICE = "__custom_audio__"
 AUDIO_FEEDBACK_THEMES: list[str] = ["default", "subtle", "mechanical"]
 
+# Stock voxtype 1.1.1 keys added for the insights release (values and
+# defaults from `voxtype config schema` with the key absent). All are
+# restart-sensitive (config.RESTART_SENSITIVE_PATHS).
+OSD_FRONTENDS: list[str] = ["gtk4", "native", "quickshell"]
+OSD_LAYOUTS: list[str] = ["compact", "wide", "minimal", "tile", "orb", "custom"]
+OSD_POSITIONS: list[str] = [
+    "bottom-center", "top-center", "bottom-left", "bottom-right", "top-left", "top-right",
+]
+OSD_PALETTES: list[str] = ["omarchy", "fallback", "package", "custom"]
+OSD_PALETTE_UNSET = "__unset__"
+# widget id -> (config path, voxtype default when the key is absent)
+EXTRA_BOOL_SETTINGS: dict[str, tuple[str, bool]] = {
+    "settings-audio-pause-media": ("audio.pause_media", False),
+    "settings-audio-duck-media": ("audio.duck_media", False),
+    "settings-osd-enabled": ("osd.enabled", True),
+    "settings-text-filter-fillers": ("text.filter_filler_words", True),
+    "settings-output-restore-clipboard": ("output.restore_clipboard", False),
+    "settings-output-shift-enter": ("output.shift_enter_newlines", False),
+    "settings-notify-recording-start": ("output.notification.on_recording_start", False),
+    "settings-notify-recording-stop": ("output.notification.on_recording_stop", False),
+    "settings-notify-transcription": ("output.notification.on_transcription", True),
+    "settings-notify-no-speech": ("output.notification.on_no_speech", True),
+}
+# widget id -> (config path, default, min, max)
+EXTRA_INT_SETTINGS: dict[str, tuple[str, int, int, int]] = {
+    "settings-audio-duck-volume": ("audio.duck_media_volume_percent", 34, 0, 150),
+    "settings-audio-duck-fade": ("audio.duck_media_fade_ms", 150, 0, 5000),
+}
+# widget id -> (config path, default, options)
+EXTRA_SELECT_SETTINGS: dict[str, tuple[str, str, list[str]]] = {
+    "settings-osd-frontend": ("osd.frontend", "gtk4", OSD_FRONTENDS),
+    "settings-osd-layout": ("osd.layout", "compact", OSD_LAYOUTS),
+    "settings-osd-position": ("osd.position", "bottom-center", OSD_POSITIONS),
+}
+
 
 def _clean_audio_label(name: str) -> str:
     """Cosmetic: turn a pactl source name like
@@ -360,6 +395,57 @@ class SettingsPane(VerticalScroll):
                     placeholder="0",
                     id="settings-output-type-delay",
                 )
+
+        with Collapsible(
+            title=f"Media, indicator & notifications{engine_section_restart_hint()}",
+            collapsed=True,
+            id="settings-extra-section",
+        ):
+            for wid, label in (
+                ("settings-audio-pause-media", "Pause media"),
+                ("settings-audio-duck-media", "Lower other audio"),
+            ):
+                with Horizontal(classes="field-row"):
+                    yield Label(label, classes="label")
+                    yield Switch(value=EXTRA_BOOL_SETTINGS[wid][1], id=wid)
+            for wid, label, ph in (
+                ("settings-audio-duck-volume", "Lowered to (%)", "34 (0 – 150)"),
+                ("settings-audio-duck-fade", "Fade (ms)", "150 (0 – 5000)"),
+            ):
+                with Horizontal(classes="field-row"):
+                    yield Label(label, classes="label")
+                    yield Input(placeholder=ph, id=wid)
+            with Horizontal(classes="field-row"):
+                yield Label("Indicator (OSD)", classes="label")
+                yield Switch(value=True, id="settings-osd-enabled")
+            for wid, label in (
+                ("settings-osd-frontend", "OSD renderer"),
+                ("settings-osd-layout", "OSD layout"),
+                ("settings-osd-position", "OSD position"),
+            ):
+                _path, default, opts = EXTRA_SELECT_SETTINGS[wid]
+                with Horizontal(classes="field-row"):
+                    yield Label(label, classes="label")
+                    yield Select(options=[(o, o) for o in opts], allow_blank=False,
+                                 value=default, id=wid)
+            with Horizontal(classes="field-row"):
+                yield Label("OSD colors", classes="label")
+                yield Select(
+                    options=[("style decides", OSD_PALETTE_UNSET)] + [(p, p) for p in OSD_PALETTES],
+                    allow_blank=False, value=OSD_PALETTE_UNSET, id="settings-osd-palette",
+                )
+            for wid, label in (
+                ("settings-text-filter-fillers", "Remove um/uh"),
+                ("settings-output-restore-clipboard", "Restore clipboard"),
+                ("settings-output-shift-enter", "Shift+Enter newlines"),
+                ("settings-notify-recording-start", "Notify: start"),
+                ("settings-notify-recording-stop", "Notify: stop"),
+                ("settings-notify-transcription", "Notify: text"),
+                ("settings-notify-no-speech", "Notify: no speech"),
+            ):
+                with Horizontal(classes="field-row"):
+                    yield Label(label, classes="label")
+                    yield Switch(value=EXTRA_BOOL_SETTINGS[wid][1], id=wid)
 
         with Collapsible(
             title=f"VAD{engine_section_restart_hint()}",
@@ -715,6 +801,21 @@ class SettingsPane(VerticalScroll):
                 str(remote_to) if remote_to != "" else ""
             )
 
+            for wid, (path, default) in EXTRA_BOOL_SETTINGS.items():
+                self.query_one(f"#{wid}", Switch).value = bool(
+                    self._extra_value(path, default)
+                )
+            for wid, (path, _default, _lo, _hi) in EXTRA_INT_SETTINGS.items():
+                raw = self._extra_value(path, None)
+                self.query_one(f"#{wid}", Input).value = "" if raw is None else str(raw)
+            for wid, (path, default, opts) in EXTRA_SELECT_SETTINGS.items():
+                val = str(self._extra_value(path, default))
+                self.query_one(f"#{wid}", Select).value = val if val in opts else default
+            palette = self._extra_value("osd.palette", None)
+            self.query_one("#settings-osd-palette", Select).value = (
+                str(palette) if palette in OSD_PALETTES else OSD_PALETTE_UNSET
+            )
+
             # GPU device lives in a systemd drop-in, NOT config.toml — read
             # it straight off disk. Only snap to a static option here; the
             # async status probe (below) swaps in detected hardware and
@@ -728,6 +829,67 @@ class SettingsPane(VerticalScroll):
                 self._gpu_committed = gpu_target
         finally:
             self._suppress_events = False
+
+    def _extra_value(self, path: str, default: object) -> object:
+        """Current config value of a dotted path, or ``default`` if absent."""
+        node: object = self.tui.state.doc if self.tui.state is not None else None
+        for part in path.split("."):
+            if node is None or not hasattr(node, "get"):
+                return default
+            node = node.get(part)  # type: ignore[union-attr]
+        if node is None:
+            return default
+        unwrap = getattr(node, "unwrap", None)
+        return unwrap() if callable(unwrap) else node
+
+    def _write_extra(self, path: str, value: object, default: object) -> None:
+        """Write one of the insights-release voxtype keys. Hydration echoes
+        (value equals what the config already means) never write, so an
+        absent key stays absent. Literal paths keep the plugin bridge's
+        allow-list parity test exact."""
+        if self.tui.state is None:
+            return
+        if self._extra_value(path, default) == value:
+            return
+        st = self.tui.state
+        if path == "audio.pause_media":
+            st.set_setting("audio.pause_media", value)
+        elif path == "audio.duck_media":
+            st.set_setting("audio.duck_media", value)
+        elif path == "audio.duck_media_volume_percent":
+            st.set_setting("audio.duck_media_volume_percent", value)
+        elif path == "audio.duck_media_fade_ms":
+            st.set_setting("audio.duck_media_fade_ms", value)
+        elif path == "osd.enabled":
+            st.set_setting("osd.enabled", value)
+        elif path == "osd.frontend":
+            st.set_setting("osd.frontend", value)
+        elif path == "osd.layout":
+            st.set_setting("osd.layout", value)
+        elif path == "osd.position":
+            st.set_setting("osd.position", value)
+        elif path == "osd.palette":
+            if value is None:
+                st.unset_setting("osd.palette")
+            else:
+                st.set_setting("osd.palette", value)
+        elif path == "text.filter_filler_words":
+            st.set_setting("text.filter_filler_words", value)
+        elif path == "output.restore_clipboard":
+            st.set_setting("output.restore_clipboard", value)
+        elif path == "output.shift_enter_newlines":
+            st.set_setting("output.shift_enter_newlines", value)
+        elif path == "output.notification.on_recording_start":
+            st.set_setting("output.notification.on_recording_start", value)
+        elif path == "output.notification.on_recording_stop":
+            st.set_setting("output.notification.on_recording_stop", value)
+        elif path == "output.notification.on_transcription":
+            st.set_setting("output.notification.on_transcription", value)
+        elif path == "output.notification.on_no_speech":
+            st.set_setting("output.notification.on_no_speech", value)
+        else:
+            return
+        self.tui.refresh_dirty()
 
     def _refresh_model_options(self, engine: str, preferred: str) -> None:
         """Rebuild the Model Select for the given engine. If `preferred` is a
@@ -773,6 +935,17 @@ class SettingsPane(VerticalScroll):
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if self._suppress_events or self.tui.state is None:
+            return
+        if event.select.id in EXTRA_SELECT_SETTINGS:
+            path, default, opts = EXTRA_SELECT_SETTINGS[event.select.id]
+            if event.value in opts:
+                self._write_extra(path, str(event.value), default)
+            return
+        if event.select.id == "settings-osd-palette":
+            if event.value == OSD_PALETTE_UNSET:
+                self._write_extra("osd.palette", None, None)
+            elif event.value in OSD_PALETTES:
+                self._write_extra("osd.palette", str(event.value), None)
             return
         if event.select.id == "settings-engine":
             new_engine = str(event.value)
@@ -1014,6 +1187,15 @@ class SettingsPane(VerticalScroll):
     def on_input_changed(self, event: Input.Changed) -> None:
         if self._suppress_events or self.tui.state is None:
             return
+        if event.input.id in EXTRA_INT_SETTINGS:
+            path, default, lo, hi = EXTRA_INT_SETTINGS[event.input.id]
+            try:
+                n = int(event.value.strip())
+            except ValueError:
+                return
+            if lo <= n <= hi:
+                self._write_extra(path, n, default)
+            return
         if event.input.id == "settings-custom-model":
             path = event.value.strip()
             if not path:
@@ -1254,6 +1436,10 @@ class SettingsPane(VerticalScroll):
 
     def on_switch_changed(self, event: Switch.Changed) -> None:
         if self._suppress_events or self.tui.state is None:
+            return
+        if event.switch.id in EXTRA_BOOL_SETTINGS:
+            path, default = EXTRA_BOOL_SETTINGS[event.switch.id]
+            self._write_extra(path, bool(event.value), default)
             return
         if event.switch.id == "settings-hotkey-enabled":
             self.tui.state.set_setting("hotkey.enabled", bool(event.value))

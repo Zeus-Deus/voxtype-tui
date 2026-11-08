@@ -143,13 +143,32 @@ def correct(text: str, terms: Iterable[object]) -> str:
         return text
 
 
+def correct_with_edits(text: str, terms: Iterable[object]) -> tuple[str, list[tuple[int, int, str]]]:
+    """:func:`correct`, also returning its edits as ``(start, end, term)``
+    on the input text. Never raises."""
+    try:
+        if not text or not isinstance(text, str) or len(text) > MAX_TEXT_CHARS:
+            return text, []
+        clean = _clean_terms(terms)
+        if not clean:
+            return text, []
+        return _fix_edits(text, clean, wordlist())
+    except Exception:
+        return text, []
+
+
 def _fix(text: str, terms: list[str], words: frozenset[str] | None) -> str:
+    return _fix_edits(text, terms, words)[0]
+
+
+def _fix_edits(text: str, terms: list[str],
+               words: frozenset[str] | None) -> tuple[str, list[tuple[int, int, str]]]:
     """Collect candidate spans for every term, then apply the best
     non-overlapping ones (same letters before fuzzy, longer spans first,
     then higher similarity). ``words=None`` disables fuzzy rewrites."""
     toks = list(TOKEN.finditer(text))
     if not toks:
-        return text
+        return text, []
     fuzzy = words is not None
     vocab_sq = {squash(t) for t in terms}
     n_text = len(text)
@@ -168,7 +187,7 @@ def _fix(text: str, terms: list[str], words: frozenset[str] | None) -> str:
         widths = tuple(w for w in ((n - 1, n) if n > 1 else (1, 2)) if w >= 1)
         specs.append((term, tq, skeleton(term), n, widths))
     if not specs:
-        return text
+        return text, []
 
     # Span facts don't depend on the term: compute each (i, w) once.
     span_cache: dict[tuple[int, int], tuple | None] = {}
@@ -250,4 +269,4 @@ def _fix(text: str, terms: list[str], words: frozenset[str] | None) -> str:
             edits.append((a, b, term))
     for a, b, term in sorted(edits, reverse=True):
         text = text[:a] + term + text[b:]
-    return text
+    return text, sorted(edits)

@@ -177,22 +177,32 @@ class _RuleSet:
         return len(self.replacements)
 
     def apply(self, text: str) -> str:
-        if self.regex is None:
-            return text
+        return self.apply_edits(text)[0]
 
-        def sub(m: re.Match[str]) -> str:
+    def apply_edits(self, text: str) -> tuple[str, list[Edit]]:
+        """Like ``regex.sub``, also returning the fired rules as
+        ``(start, end, replacement)`` edits on the input text."""
+        if self.regex is None:
+            return text, []
+        out: list[str] = []
+        edits: list[Edit] = []
+        pos = 0
+        for m in self.regex.finditer(text):
             idx: int | None = None
             for i in range(len(self.replacements)):
                 if m.group(i + 1) is not None:
                     idx = i
                     break
-            if idx is None:
-                return m.group(0)
-            if _is_token_boundary(text, m.start(), m.end()):
-                return self.replacements[idx]
-            return m.group(0)
-
-        return self.regex.sub(sub, text)
+            if idx is None or not _is_token_boundary(text, m.start(), m.end()):
+                continue
+            out.append(text[pos:m.start()])
+            out.append(self.replacements[idx])
+            edits.append((m.start(), m.end(), self.replacements[idx]))
+            pos = m.end()
+        if not edits:
+            return text, []
+        out.append(text[pos:])
+        return "".join(out), edits
 
 
 class DictionaryEngine:
@@ -220,6 +230,65 @@ class DictionaryEngine:
     def process(self, text: str) -> str:
         stage1 = self._replacements.apply(text)
         return self._capitalizations.apply(stage1)
+
+    def process_spans(self, text: str) -> tuple[str, list[tuple[int, int]]]:
+        """``process`` plus the character spans of the result that the
+        rules produced (a later rule rewriting inside an earlier rule's
+        output stays inside that span)."""
+        stage1, e1 = self._replacements.apply_edits(text)
+        spans = remap_spans([], e1)
+        stage2, e2 = self._capitalizations.apply_edits(stage1)
+        return stage2, remap_spans(spans, e2)
+
+
+Edit = tuple  # (start, end, replacement) on the text before the edit
+
+
+def remap_spans(spans: Iterable[tuple[int, int]], edits: Iterable[Edit],
+                protect_new: bool = True) -> list[tuple[int, int]]:
+    """Carry ``spans`` of a text through non-overlapping ``edits`` of it.
+
+    A span grows to cover any edit that overlaps it (its output stays
+    inside), others shift. With ``protect_new`` each edit's output becomes
+    a span too. Returns sorted, merged spans of the edited text."""
+    from bisect import bisect_left, bisect_right
+
+    edits = sorted(edits)
+    starts = []  # (old_a, old_b, new_a, new_b)
+    delta = 0
+    for a, b, new in edits:
+        starts.append((a, b, a + delta, a + delta + len(new)))
+        delta += len(new) - (b - a)
+    # Non-overlapping and sorted, so the old ends are sorted too: each span
+    # endpoint is a binary search (a per-endpoint rescan is quadratic on a
+    # long transcript where a rule fires on every word).
+    ends = [b for _, b, _, _ in starts]
+
+    def pos(x: int, end: bool) -> int:
+        if end:
+            j = bisect_left(ends, x)  # the only edit that can hold x: a < x <= b
+            if j < len(starts) and starts[j][0] < x <= starts[j][1]:
+                return starts[j][3]  # inside an edit: cover its output
+        k = bisect_right(ends, x)  # edits wholly before x
+        if not end and k < len(starts) and starts[k][0] <= x < starts[k][1]:
+            return starts[k][2]
+        return x + (starts[k - 1][3] - starts[k - 1][1] if k else 0)
+
+    out = []
+    for s, e in spans:
+        ns, ne = pos(s, False), pos(e, True)
+        if ne > ns:
+            out.append((ns, ne))
+    if protect_new:
+        out += [(na, nb) for _, _, na, nb in starts if nb > na]
+    out.sort()
+    merged: list[tuple[int, int]] = []
+    for s, e in out:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
 
 
 def process(text: str, rules: Iterable[Rule]) -> str:

@@ -300,6 +300,11 @@ def qenv(tmp_path: Path, monkeypatch):
     b.chmod(0o755)
     monkeypatch.setattr(config, "CONFIG_PATH", cfg)
     monkeypatch.setattr(sidecar, "SIDECAR_PATH", tmp_path / "metadata.json")
+    # The live config would get the insights hooks wired on load (dirty);
+    # these tests are about Qwen3 refusals, so keep the capture switches off.
+    from voxtype_tui import features as _features
+    _features.update({k: {"enabled": False} for k in ("usage", "history", "archive", "learning")},
+                     wire=False)
     st = state.AppState.load(cfg, tmp_path / "metadata.json")
     return st, models_dir
 

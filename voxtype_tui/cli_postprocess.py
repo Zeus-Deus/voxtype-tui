@@ -34,7 +34,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-import traceback
+import time
 from pathlib import Path
 
 from . import vocab_corrector
@@ -43,6 +43,7 @@ from .dictionary_engine import (
     REPLACEMENT,
     DictionaryEngine,
     Rule,
+    remap_spans,
 )
 
 SIDECAR_PATH = Path.home() / ".config" / "voxtype-tui" / "metadata.json"
@@ -128,9 +129,77 @@ def _load_rules(
 
 def _passthrough_note() -> None:
     if os.environ.get("VOXTYPE_TUI_POSTPROCESS_DEBUG"):
+        import traceback  # lazy: ~9 ms of startup on every dictation otherwise
+
         traceback.print_exc(file=sys.stderr)
     else:
         sys.stderr.write("voxtype-tui-postprocess: passthrough on error\n")
+
+
+def _learned_module():
+    """The learned-words stage (auto-learn), when installed (guarded: absent → no-op)."""
+    try:
+        from . import learned  # type: ignore[attr-defined]
+    except Exception:
+        return None
+    return learned if hasattr(learned, "apply") else None
+
+
+def process_detailed(
+    text: str,
+    sidecar_path: Path = SIDECAR_PATH,
+    config_path: Path = CONFIG_PATH,
+) -> tuple[str, list[str], list[str]]:
+    """The full pipeline: dictionary engine, vocabulary corrector, then
+    learned words. Returns ``(text, changed_by, learned_hit_ids)``.
+
+    Each stage is fail-open: an exception leaves that stage's input
+    unchanged and the next stage still runs."""
+    changed_by: list[str] = []
+    sc_data = _read_sidecar(sidecar_path)
+    rules: list[Rule] = []
+    vocab: list[str] = []
+    # Character spans of ``text`` that the user's rules and vocabulary
+    # produced, carried through every later edit: learned words never
+    # rewrite inside them (user rules win), even after a later rule
+    # changed part of an earlier rule's output.
+    spans: list[tuple[int, int]] = []
+    try:
+        rules = _load_rules(sidecar_path, config_path, sc_data=sc_data)
+        if rules:
+            before = text
+            text, spans = DictionaryEngine(rules).process_spans(text)
+            if text != before:
+                changed_by.append("dictionary")
+    except Exception:  # fail-open — never drop a user's transcript
+        _passthrough_note()
+    try:
+        vocab = _load_vocab(sc_data)
+        if vocab:
+            before = text
+            new_text, edits = vocab_corrector.correct_with_edits(text, vocab)
+            spans = remap_spans(spans, edits)
+            text = new_text
+            if text != before:
+                changed_by.append("vocab")
+    except Exception:
+        _passthrough_note()
+    hits: list[str] = []
+    learned = _learned_module()
+    if learned is not None:
+        try:
+            new_text, hits = learned.apply(
+                text, spans, user_phrases=[r.replacement for r in rules] + vocab,
+            )
+            if isinstance(new_text, str):
+                if new_text != text:
+                    changed_by.append("learned")
+                text = new_text
+            hits = [h for h in (hits or []) if isinstance(h, str)]
+        except Exception:
+            hits = []
+            _passthrough_note()
+    return text, changed_by, hits
 
 
 def process(
@@ -138,35 +207,106 @@ def process(
     sidecar_path: Path = SIDECAR_PATH,
     config_path: Path = CONFIG_PATH,
 ) -> str:
-    """Dictionary engine first, then the vocabulary corrector.
+    """Dictionary engine first, then the vocabulary corrector (then learned
+    words, when that module is installed).
 
     Each stage is fail-open: an exception leaves that stage's input
     unchanged and the next stage still runs."""
-    sc_data = _read_sidecar(sidecar_path)
-    try:
-        rules = _load_rules(sidecar_path, config_path, sc_data=sc_data)
-        if rules:
-            text = DictionaryEngine(rules).process(text)
-    except Exception:  # fail-open — never drop a user's transcript
-        _passthrough_note()
-    try:
-        vocab = _load_vocab(sc_data)
-        if vocab:
-            text = vocab_corrector.correct(text, vocab)
-    except Exception:
-        _passthrough_note()
-    return text
+    return process_detailed(text, sidecar_path, config_path)[0]
+
+
+def _capture(raw: str, final: str, changed_by: list[str], hits: list[str]) -> None:
+    """Queue one record for usage/history/archive/learning.
+
+    Critical path: one features read, a few stats, one O_APPEND line (and
+    one small runtime file, never fsynced, when the archive or learning
+    needs the text after output). No waited-on subprocesses, no pruning, no
+    fsync. Raises on failure; the caller has already written the text and
+    logs the failure from a detached process."""
+    from . import capture, features, history
+
+    feats = features.load()
+    usage_on = feats["usage"]["enabled"]
+    hist_on = feats["history"]["enabled"]
+    arch_on = feats["archive"]["enabled"]
+    learn_on = feats["learning"]["enabled"]
+    if not (usage_on or hist_on or arch_on or learn_on):
+        return
+    now = time.time()
+    rid = history.new_id(now)
+    cfg = capture.config_info()
+    start_info = capture.read_rec_start()
+    if start_info is not None:
+        # Consume the recording's start info (never reused). Only the
+        # archive needs it after output: hand it to exactly this record
+        # (rec-used-<id>.json, claimed by the finalizer); else delete it.
+        try:
+            if arch_on and start_info.get("wav"):
+                os.replace(capture.rec_start_path(), capture.rec_used_path(rid))
+            else:
+                os.unlink(capture.rec_start_path())
+        except OSError:
+            pass
+    started, duration = capture.measure_duration(start_info, cfg.get("max_duration_secs") or 60, cfg)
+    rec = {
+        "id": rid,
+        "ts": history.iso(now),
+        "started_at": history.iso(started) if started is not None else None,
+        "duration_s": duration,
+        "raw": raw,
+        "final": final,
+        "words": history.count_words(final),
+        "chars": len(final),
+        "engine": cfg.get("engine"),
+        "model": cfg.get("model"),
+        "language": cfg.get("language"),
+        "model_uncertain": bool(cfg.get("model_uncertain")),
+        "app": (start_info or {}).get("app"),
+        "changed_by": changed_by,
+        "audio": None,
+    }
+    if arch_on and feats["archive"]["save_audio"] and start_info and start_info.get("wav") \
+            and started is not None:
+        rec["audio"] = time.strftime("%Y/%m/%d/", time.localtime(now)) + rec["id"] + ".wav"
+    if hits:
+        rec["learned_hits"] = hits
+    queued = dict(rec, count_usage=bool(usage_on), keep_text=bool(hist_on))
+    if not hist_on:
+        queued.pop("raw")
+        queued.pop("final")
+    if usage_on or hist_on:
+        history.enqueue(queued)
+    if arch_on or learn_on:
+        # Runtime copy (RAM) for the post-output hook. Text only when a
+        # consumer that is on may keep it: the learning watcher, or the
+        # archive with "save text".
+        last = rec
+        if not (learn_on or (arch_on and feats["archive"]["save_text"])):
+            last = {k: v for k, v in rec.items() if k not in ("raw", "final")}
+        history.write_handoff(last)
 
 
 def main() -> int:
     text = sys.stdin.read()
     try:
-        sys.stdout.write(process(text))
-        return 0
+        final, changed_by, hits = process_detailed(text)
     except Exception:  # fail-open — never drop a user's transcript
         _passthrough_note()
         sys.stdout.write(text)
         return 0
+    sys.stdout.write(final)
+    sys.stdout.flush()
+    try:
+        _capture(text, final, changed_by, hits)
+    except Exception as e:  # capture must never affect the output
+        try:
+            from . import history
+
+            # Logged by a detached process: voxtype waits for this one.
+            history.note_failure_detached("post_process", repr(e))
+        except Exception:
+            pass
+    return 0
 
 
 if __name__ == "__main__":

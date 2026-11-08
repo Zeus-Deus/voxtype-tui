@@ -67,6 +67,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: failed to load voxtype config: {e}", file=sys.stderr)
         return 1
 
+    # Insights hooks: a fresh install (no metadata.json) runs no migration,
+    # so wire what the default switches need here too (live config only;
+    # never touches a user's own hook command).
+    from .state import _reconcile_hooks
+    if _reconcile_hooks(state.doc, args.config_path):
+        state.config_dirty = True
+        state.daemon_stale = True
+        state.migrations_applied.append("insights-wire-hooks")
+
     applied = state.migrations_applied
     if not applied and not state.config_dirty and not state.daemon_stale:
         out("==> voxtype-tui: schema already current, no migrations to apply.")

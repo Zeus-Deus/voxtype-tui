@@ -18,6 +18,8 @@ from . import asr_server, config, migrations, sidecar, sync
 
 _logger = logging.getLogger(__name__)
 
+SAVE_ATTEMPTS = 3
+
 
 def _toml_equals(a: object, b: object) -> bool:
     """Compare a tomlkit-wrapped value with a Python primitive. tomlkit bool
@@ -32,6 +34,96 @@ def _toml_equals(a: object, b: object) -> bool:
         return str(a) == str(b)
     except Exception:
         return False
+
+
+def _is_live_config(path: Path) -> bool:
+    """True for the config the daemon reads (``config.CONFIG_PATH``).
+    Hook wiring follows the user's features.json, which only describes
+    that config — alternate configs (tests, exports) are never rewired."""
+    try:
+        return Path(path).expanduser().resolve() == Path(config.CONFIG_PATH).expanduser().resolve()
+    except OSError:
+        return False
+
+
+def _reconcile_hooks(doc: TOMLDocument, path: Path, *, record_intent: bool = False) -> bool:
+    """Apply :func:`hooks.reconcile` to ``doc``; True when it changed.
+    With ``record_intent`` (right before a save) the hook strings about to
+    be written are recorded as ours first (never a hook of ours we don't
+    know we own). Fail-open: a broken features file must never
+    block loading/saving."""
+    if not _is_live_config(path):
+        return False
+    try:
+        from . import features, hooks
+
+        feats = features.load()
+        plan = hooks.reconcile(doc, feats)
+        if record_intent:
+            # Covers hooks wired earlier in memory too (upgrade load,
+            # --apply-migrations): anything about to be written is recorded
+            # as pending before the save, committed after it.
+            hooks.record_intent(feats, plan)
+        return plan.changed
+    except Exception as e:  # pragma: no cover - defensive
+        _logger.warning("insights hook reconcile failed: %s", e)
+        return False
+
+
+# Every config field voxtype runs a command from. A TUI save takes the
+# disk's value of any of them that changed outside while the TUI was open.
+HOOK_FIELDS = (
+    "output.pre_recording_command",
+    "output.pre_output_command",
+    "output.post_output_command",
+    "output.post_process",  # the whole table: command + timeout_ms
+)
+
+
+def _plain(v: object) -> object:
+    return v.unwrap() if hasattr(v, "unwrap") else v
+
+
+def _hook_field(doc: object, key: str) -> object:
+    """Plain value of a :data:`HOOK_FIELDS` entry (``None`` = absent)."""
+    node = doc
+    for part in key.split("."):
+        if node is None or not hasattr(node, "get"):
+            return None
+        node = node.get(part)
+    if node is not None and hasattr(node, "items"):
+        return {str(k): _plain(v) for k, v in node.items()}
+    return _plain(node)
+
+
+def _set_hook_field(doc: TOMLDocument, key: str, value: object) -> None:
+    name = key.split(".", 1)[1]
+    out = doc.get("output")
+    if value is None:
+        if out is not None and name in out:
+            del out[name]
+        return
+    if out is None:
+        doc["output"] = tomlkit.table()
+        out = doc["output"]
+    if isinstance(value, dict):
+        table = tomlkit.table()
+        for k, v in value.items():
+            table[k] = v
+        out[name] = table
+    else:
+        out[name] = value
+
+
+def _record_managed_hooks(doc: TOMLDocument) -> None:
+    """After a successful config save, commit which hook strings are ours."""
+    try:
+        from . import features, hooks
+
+        plan = hooks.reconcile(tomlkit.parse(tomlkit.dumps(doc)), features.load())
+        hooks.commit_ownership(plan)
+    except Exception as e:  # pragma: no cover - defensive
+        _logger.warning("could not record managed hooks: %s", e)
 
 
 @dataclass
@@ -63,6 +155,10 @@ class AppState:
     # Problems from the last save's Qwen3-ASR unit reconcile
     # (`asr_server.apply_after_save`). Empty = fine / not in use.
     asr_problems: list[str] = field(default_factory=list)
+    # config.toml's bytes as last read or written by us (None = unknown).
+    # A save compares the file against them, so a hook the user saved
+    # meanwhile is adopted instead of overwritten.
+    disk_bytes: "bytes | None" = None
 
     @property
     def dirty(self) -> bool:
@@ -70,7 +166,7 @@ class AppState:
 
     @classmethod
     def load(cls, config_path: Path, sidecar_path: Path) -> "AppState":
-        doc = config.load(config_path)
+        doc, disk_bytes = config.read_snapshot(config_path)
         raw_sc = sidecar.load(sidecar_path)
 
         initial = config.get_initial_prompt(doc)
@@ -91,6 +187,18 @@ class AppState:
         # the sync bundle uses the migrated config shape.
         migration_result = migrations.run_pending(doc, sc)
         config_dirty_from_migrations = migration_result.touches_config
+        # Insights hook wiring: reconciled on every load of the
+        # live config — upgrades, fresh installs without metadata.json (no
+        # migration runs) and installs whose hooks went missing alike. Only
+        # absent or recorded-as-ours values change; a change marks the
+        # config dirty + stale like any migration, and the next save writes
+        # it. Alternate configs are never rewired.
+        # Dirty only: nothing is written by a load, so the running daemon is
+        # not stale yet (a quit without saving must not restart it); the
+        # save that writes the wiring marks it stale.
+        config_dirty_from_hooks = _reconcile_hooks(doc, config_path)
+        if config_dirty_from_hooks and "insights-wire-hooks" not in migration_result.applied:
+            migration_result.applied.append("insights-wire-hooks")
         sidecar_dirty_from_migrations = migration_result.new_version != raw_sc.version
 
         # If reconcile changed the sidecar, mark it dirty so the next save
@@ -130,6 +238,7 @@ class AppState:
             loaded_dump=pre_sync_dump,
             config_dirty=(
                 config_dirty_from_migrations
+                or config_dirty_from_hooks
                 or sync_result.needs_save_doc
             ),
             sidecar_dirty=(
@@ -147,6 +256,7 @@ class AppState:
             reconcile_warnings=w1 + w2 + asr_server.load_warnings(doc, sc),
             migrations_applied=migration_result.applied,
             sync_reconcile=sync_result,
+            disk_bytes=disk_bytes,
         )
 
     # --- mutations (all set config_dirty and/or sidecar_dirty) ---
@@ -308,7 +418,7 @@ class AppState:
             return
         pp = config.get_post_process(self.doc)
         existing = pp.get("command")
-        if existing and existing != config.POSTPROCESS_COMMAND:
+        if existing and not config.is_our_post_process_command(existing):
             return
         want_timeout = config.POSTPROCESS_TIMEOUT_MS
         if existing == config.POSTPROCESS_COMMAND and pp.get("timeout_ms") == want_timeout:
@@ -338,8 +448,19 @@ class AppState:
         that didn't commit locally, which another Syncthing peer could
         then pull as truth.
         """
-        self._ensure_post_process_enabled()
         baseline_doc = tomlkit.parse(self.loaded_dump)
+        live = _is_live_config(self.config_path)
+        # Hook fields the user changed in the TUI this session; any other
+        # hook field changed on disk meanwhile is taken from disk. Measured
+        # before the automatic wiring below, which is not a user change.
+        tui_hooks = {
+            key for key in HOOK_FIELDS
+            if _hook_field(self.doc, key) != _hook_field(baseline_doc, key)
+        }
+        expect = self._adopt_external_hooks(tui_hooks) if live else config.UNCHECKED
+        self._ensure_post_process_enabled()
+        if _reconcile_hooks(self.doc, self.config_path, record_intent=True):
+            self.config_dirty = True
         # Capture whether this save carries any config.toml mutation.
         # Used below to gate the broad `daemon_stale` flag — any config
         # change requires a daemon restart because Voxtype reads its
@@ -349,7 +470,26 @@ class AppState:
         # "these fields changed" message; the broad gate only drives
         # the stale pill + exit-time auto-restart.
         config_touched = self.config_dirty
-        config.safe_save(self.doc, self.config_path)
+        for attempt in range(SAVE_ATTEMPTS):
+            try:
+                if expect is config.UNCHECKED:
+                    config.safe_save(self.doc, self.config_path)
+                else:
+                    config.safe_save(self.doc, self.config_path, expect=expect)
+                break
+            except config.ConfigChanged:
+                # Changed while we validated: take the user's hooks from
+                # disk again and re-check ownership before retrying.
+                if attempt == SAVE_ATTEMPTS - 1:
+                    raise
+                expect = self._adopt_external_hooks(tui_hooks)
+                self._ensure_post_process_enabled()
+                if _reconcile_hooks(self.doc, self.config_path, record_intent=True):
+                    self.config_dirty = True
+                config_touched = config_touched or self.config_dirty
+        self.disk_bytes = tomlkit.dumps(self.doc).encode("utf-8")
+        if live:
+            _record_managed_hooks(self.doc)
         sidecar.save_atomic(self.sc, self.sidecar_path)
         # Both primary saves succeeded — derive and write the portable
         # bundle. A write failure here (disk full, unwritable path, etc.)
@@ -379,6 +519,40 @@ class AppState:
         self.config_dirty = False
         self.sidecar_dirty = False
         return restart_fields
+
+    def _adopt_external_hooks(self, tui_hooks: "set[str] | frozenset[str]" = frozenset()) -> "bytes | None":
+        """Re-read config.toml. A hook field (:data:`HOOK_FIELDS`) that
+        changed there since we last read or wrote the file (the user set
+        their own command, or removed one) is taken into ``doc`` before hook
+        reconcile, so the save never overwrites it, unless the TUI changed
+        that field itself this session (``tui_hooks``). Returns the bytes
+        read (``None`` = no file), the content the save expects to replace.
+        Other keys keep the usual rule: the TUI's state is saved."""
+        try:
+            disk_doc, raw = config.read_snapshot(self.config_path)
+        except FileNotFoundError:
+            self.disk_bytes = None
+            return None
+        except Exception:  # unreadable/unparseable: nothing to adopt
+            try:
+                return self.config_path.read_bytes()
+            except OSError:
+                return None
+        if self.disk_bytes is not None and raw != self.disk_bytes:
+            try:
+                base = tomlkit.parse(self.disk_bytes.decode("utf-8"))
+            except Exception:
+                base = {}
+            for key in HOOK_FIELDS:
+                if key in tui_hooks:
+                    continue
+                on_disk = _hook_field(disk_doc, key)
+                if on_disk in (_hook_field(base, key), _hook_field(self.doc, key)):
+                    continue  # not changed outside, or already the same here
+                _set_hook_field(self.doc, key, on_disk)
+                self.config_dirty = True
+        self.disk_bytes = raw
+        return raw
 
     async def save_async(self) -> list[str]:
         return await asyncio.to_thread(self.save)

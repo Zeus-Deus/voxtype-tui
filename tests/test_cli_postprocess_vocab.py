@@ -92,6 +92,7 @@ def test_process_dictionary_survives_broken_corrector(tmp_path: Path, monkeypatc
         "added_at": "2026-01-01T00:00:00+00:00",
     }])
     monkeypatch.setattr(vocab_corrector, "_fix", lambda *a: 1 / 0)
+    monkeypatch.setattr(vocab_corrector, "_fix_edits", lambda *a: 1 / 0)
     out = cli_postprocess.process("say foo bar code mux", sc, tmp_path / "none.toml")
     assert out == "say baz code mux"
 
