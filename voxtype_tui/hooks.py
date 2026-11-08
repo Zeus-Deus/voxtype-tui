@@ -221,26 +221,40 @@ def _del_output(doc: Any, key: str) -> None:
         del out[name]
 
 
+SYNC_ATTEMPTS = 3
+
+
 def sync_config(config_path: Path | None = None, features_file: Path | None = None) -> dict:
     """Load config.toml, reconcile, save it (voxtype-validated) when changed,
-    then record ownership. Returns {changed, wired, unwired, unavailable}."""
+    then record ownership. Returns {changed, wired, unwired, unavailable}.
+
+    The save is refused when the file changed after it was read (the user
+    saved their own hook meanwhile): it is then reloaded and reconciled
+    again, so a value we don't own is never overwritten. Gives up with
+    :class:`config.ConfigChanged` after SYNC_ATTEMPTS; the pending record
+    keeps our strings ours until a later sync commits."""
     from . import config
 
     path = config_path or config.CONFIG_PATH
-    feats = F.load(features_file)
-    if not path.exists():
-        return {"changed": False, "wired": [], "unwired": [],
-                "unavailable": availability({}, feats, {})}
-    doc = config.load(path)
-    old = dict(feats.get(F.MANAGED_HOOKS_KEY) or {})
-    plan = reconcile(doc, feats)
-    record_intent(feats, plan, features_file)
-    if plan.changed:
-        config.safe_save(doc, path)  # on failure the pending record keeps both strings ours
-    commit_ownership(plan, features_file)
-    _ = old
-    return {"changed": plan.changed, "wired": plan.wired, "unwired": plan.unwired,
-            "unavailable": plan.unavailable}
+    for _ in range(SYNC_ATTEMPTS):
+        feats = F.load(features_file)
+        try:
+            doc, raw = config.read_snapshot(path)
+        except FileNotFoundError:
+            return {"changed": False, "wired": [], "unwired": [],
+                    "unavailable": availability({}, feats, {})}
+        plan = reconcile(doc, feats)
+        record_intent(feats, plan, features_file)
+        if plan.changed:
+            try:
+                # on failure the pending record keeps both strings ours
+                config.safe_save(doc, path, expect=raw)
+            except config.ConfigChanged:
+                continue
+        commit_ownership(plan, features_file)
+        return {"changed": plan.changed, "wired": plan.wired, "unwired": plan.unwired,
+                "unavailable": plan.unavailable}
+    raise config.ConfigChanged(f"{path} kept changing; hooks not reconciled")
 
 
 def record_intent(feats: dict, plan: "Plan", features_file: Path | None = None) -> None:
@@ -268,22 +282,33 @@ def commit_ownership(plan: "Plan", features_file: Path | None = None) -> None:
 
 
 def unwire_all(config_path: Path | None = None, features_file: Path | None = None) -> dict:
-    """Remove every hook we own (package removal). Foreign values untouched."""
+    """Remove every hook we own (package removal). Foreign values untouched,
+    also when the file changes while this runs (reloaded and rechecked)."""
     from . import config
 
     path = config_path or config.CONFIG_PATH
     feats = F.load(features_file)
     managed = dict(feats.get(F.MANAGED_HOOKS_KEY) or {})
     changed = False
-    if path.exists():
-        doc = config.load(path)
+    for attempt in range(SYNC_ATTEMPTS):
+        try:
+            doc, raw = config.read_snapshot(path)
+        except FileNotFoundError:
+            break
+        changed = False
         for key in (PRE_RECORDING, POST_OUTPUT):
             cur = _get(doc, key)
             if cur is not None and str(cur) in F.owned_hook_strings(feats, key):
                 _del_output(doc, key)
                 changed = True
-        if changed:
-            config.safe_save(doc, path, validate=False)
+        if not changed:
+            break
+        try:
+            config.safe_save(doc, path, validate=False, expect=raw)
+            break
+        except config.ConfigChanged:
+            if attempt == SYNC_ATTEMPTS - 1:
+                raise
     if managed or feats.get(F.PENDING_HOOKS_KEY):
         F.set_managed_hooks({}, features_file, pending={})
     return {"changed": changed}

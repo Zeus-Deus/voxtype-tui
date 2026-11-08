@@ -26,6 +26,50 @@ class ValidationError(RuntimeError):
     """Raised when `voxtype -c <tmp> config` rejects a proposed write."""
 
 
+class ConfigChanged(RuntimeError):
+    """config.toml changed on disk after it was read; nothing was written.
+    Reload, re-apply the change and save again."""
+
+
+UNCHECKED = object()  # safe_save(expect=...) default: no change detection
+
+
+def read_snapshot(path: Path) -> tuple[TOMLDocument, bytes]:
+    """``(doc, raw bytes)`` from one read. Pass the bytes as
+    ``safe_save(..., expect=raw)`` to refuse the save when someone (the user,
+    another voxtype-tui process) changed the file in between."""
+    raw = path.read_bytes()
+    text = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")  # as read_text()
+    return tomlkit.parse(text), raw
+
+
+def _save_lock():
+    """Serializes check-then-replace among voxtype-tui writers (held for a
+    read and a rename)."""
+    import fcntl
+
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    d = Path(base) / "voxtype-tui"
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(str(d / ".config-save.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _replace_if_unchanged(tmp: Path, path: Path, expect: "bytes | None") -> None:
+    fd = _save_lock()
+    try:
+        try:
+            current: bytes | None = path.read_bytes()
+        except FileNotFoundError:
+            current = None
+        if current != expect:
+            raise ConfigChanged(f"{path} changed since it was read; not saved")
+        os.replace(tmp, path)
+    finally:
+        os.close(fd)  # releases the flock
+
+
 def _backup_path(path: Path) -> Path:
     return path.parent / (path.name + BACKUP_SUFFIX)
 
@@ -73,10 +117,15 @@ async def safe_save_async(
     *,
     validate: bool = True,
     backup: bool = True,
+    expect: Any = UNCHECKED,
 ) -> None:
     """Non-blocking equivalent of safe_save. Use from Textual/async contexts.
     The validation subprocess runs on a worker thread via asyncio.to_thread."""
-    await asyncio.to_thread(safe_save, doc, path, validate=validate, backup=backup)
+    if expect is UNCHECKED:
+        await asyncio.to_thread(safe_save, doc, path, validate=validate, backup=backup)
+    else:
+        await asyncio.to_thread(safe_save, doc, path, validate=validate, backup=backup,
+                                expect=expect)
 
 
 def safe_save(
@@ -85,8 +134,14 @@ def safe_save(
     *,
     validate: bool = True,
     backup: bool = True,
+    expect: Any = UNCHECKED,
 ) -> None:
     """Atomic save with pre-write voxtype validation and first-write backup.
+
+    ``expect`` = the file's bytes as read (``None`` = it did not exist):
+    right before step 4 the file is compared with them, under a lock shared
+    by voxtype-tui writers, and :class:`ConfigChanged` is raised (nothing
+    written) when it changed meanwhile.
 
     Flow:
       1. Serialize the doc to a temp file in the same directory.
@@ -119,7 +174,10 @@ def safe_save(
             if not bak.exists():
                 shutil.copy2(path, bak)
 
-        os.replace(tmp, path)
+        if expect is UNCHECKED:
+            os.replace(tmp, path)
+        else:
+            _replace_if_unchanged(tmp, path, expect)
     except Exception:
         if tmp.exists():
             tmp.unlink()

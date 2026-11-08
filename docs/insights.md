@@ -96,7 +96,10 @@ command -v voxtype-tui-hook >/dev/null 2>&1 && exec voxtype-tui-hook pre-recordi
 ```
 
 If you already have your own `pre_recording_command` or `post_output_command`,
-voxtype-tui leaves it alone. The feature that needs it shows as unavailable,
+voxtype-tui leaves it alone. That holds when you set it while voxtype-tui is
+saving, or while the TUI is open: a save checks that `config.toml` is still
+what it read, and when it is not, it reloads the file, keeps your hook
+commands and checks again before writing. The feature that needs it shows as unavailable,
 with the reason. Usage and history keep working with your own
 `post_output_command`: once the queue passes 256 KiB, the post-process starts
 one background drain (at most once a minute), so the queue never fills up and

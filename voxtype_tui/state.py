@@ -18,6 +18,8 @@ from . import asr_server, config, migrations, sidecar, sync
 
 _logger = logging.getLogger(__name__)
 
+SAVE_ATTEMPTS = 3
+
 
 def _toml_equals(a: object, b: object) -> bool:
     """Compare a tomlkit-wrapped value with a Python primitive. tomlkit bool
@@ -108,6 +110,10 @@ class AppState:
     # Problems from the last save's Qwen3-ASR unit reconcile
     # (`asr_server.apply_after_save`). Empty = fine / not in use.
     asr_problems: list[str] = field(default_factory=list)
+    # config.toml's bytes as last read or written by us (None = unknown).
+    # A save compares the file against them, so a hook the user saved
+    # meanwhile is adopted instead of overwritten.
+    disk_bytes: "bytes | None" = None
 
     @property
     def dirty(self) -> bool:
@@ -115,7 +121,7 @@ class AppState:
 
     @classmethod
     def load(cls, config_path: Path, sidecar_path: Path) -> "AppState":
-        doc = config.load(config_path)
+        doc, disk_bytes = config.read_snapshot(config_path)
         raw_sc = sidecar.load(sidecar_path)
 
         initial = config.get_initial_prompt(doc)
@@ -205,6 +211,7 @@ class AppState:
             reconcile_warnings=w1 + w2 + asr_server.load_warnings(doc, sc),
             migrations_applied=migration_result.applied,
             sync_reconcile=sync_result,
+            disk_bytes=disk_bytes,
         )
 
     # --- mutations (all set config_dirty and/or sidecar_dirty) ---
@@ -397,6 +404,8 @@ class AppState:
         then pull as truth.
         """
         self._ensure_post_process_enabled()
+        live = _is_live_config(self.config_path)
+        expect = self._adopt_external_hooks() if live else config.UNCHECKED
         if _reconcile_hooks(self.doc, self.config_path, record_intent=True):
             self.config_dirty = True
         baseline_doc = tomlkit.parse(self.loaded_dump)
@@ -409,8 +418,24 @@ class AppState:
         # "these fields changed" message; the broad gate only drives
         # the stale pill + exit-time auto-restart.
         config_touched = self.config_dirty
-        config.safe_save(self.doc, self.config_path)
-        if _is_live_config(self.config_path):
+        for attempt in range(SAVE_ATTEMPTS):
+            try:
+                if expect is config.UNCHECKED:
+                    config.safe_save(self.doc, self.config_path)
+                else:
+                    config.safe_save(self.doc, self.config_path, expect=expect)
+                break
+            except config.ConfigChanged:
+                # Changed while we validated: take the user's hooks from
+                # disk again and re-check ownership before retrying.
+                if attempt == SAVE_ATTEMPTS - 1:
+                    raise
+                expect = self._adopt_external_hooks()
+                if _reconcile_hooks(self.doc, self.config_path, record_intent=True):
+                    self.config_dirty = True
+                config_touched = config_touched or self.config_dirty
+        self.disk_bytes = tomlkit.dumps(self.doc).encode("utf-8")
+        if live:
             _record_managed_hooks(self.doc)
         sidecar.save_atomic(self.sc, self.sidecar_path)
         # Both primary saves succeeded — derive and write the portable
@@ -441,6 +466,46 @@ class AppState:
         self.config_dirty = False
         self.sidecar_dirty = False
         return restart_fields
+
+    def _adopt_external_hooks(self) -> "bytes | None":
+        """Re-read config.toml. A hook command that changed there since we
+        last read or wrote the file (the user set their own, or removed
+        one) is taken into ``doc`` before hook reconcile, so the save never
+        overwrites it. Returns the bytes read (``None`` = no file), the
+        content the save expects to replace. Other keys keep the usual
+        rule: the TUI's state is saved."""
+        from . import hooks
+
+        try:
+            disk_doc, raw = config.read_snapshot(self.config_path)
+        except FileNotFoundError:
+            self.disk_bytes = None
+            return None
+        except Exception:  # unreadable/unparseable: nothing to adopt
+            try:
+                return self.config_path.read_bytes()
+            except OSError:
+                return None
+        if self.disk_bytes is not None and raw != self.disk_bytes:
+            try:
+                base = tomlkit.parse(self.disk_bytes.decode("utf-8"))
+            except Exception:
+                base = {}
+
+            def s(doc: object, key: str) -> "str | None":
+                v = hooks._get(doc, key)
+                return None if v is None else str(v)
+            for key in (hooks.PRE_RECORDING, hooks.POST_OUTPUT):
+                on_disk = s(disk_doc, key)
+                if on_disk in (s(base, key), s(self.doc, key)):
+                    continue  # not changed outside, or already the same here
+                if on_disk is None:
+                    hooks._del_output(self.doc, key)
+                else:
+                    hooks._set_output(self.doc, key, on_disk)
+                self.config_dirty = True
+        self.disk_bytes = raw
+        return raw
 
     async def save_async(self) -> list[str]:
         return await asyncio.to_thread(self.save)

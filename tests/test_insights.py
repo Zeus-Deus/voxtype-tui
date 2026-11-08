@@ -1414,3 +1414,74 @@ def test_newest_handoff_skips_an_entry_removed_during_the_scan(xdg, monkeypatch)
         mp.setattr(rtdir.os, "scandir", _RacingPrune)
         rtdir.prune(rt, now, 600, "handoff")
     assert sorted(os.listdir(Path(rt) / "handoff")) == ["new-b.json"]
+
+
+USER_HOOK = "notify-send done"
+
+
+def _add_user_post_output(cfg: Path) -> None:
+    doc = tomlkit.parse(cfg.read_text())
+    doc["output"]["post_output_command"] = USER_HOOK
+    cfg.write_text(tomlkit.dumps(doc))
+
+
+def test_sync_config_never_overwrites_a_hook_added_while_it_ran(live_config, monkeypatch):
+    real = hooks.record_intent
+    calls = []
+
+    def racing(*a, **k):
+        real(*a, **k)
+        if not calls:
+            _add_user_post_output(live_config)  # the user saves their own hook now
+        calls.append(1)
+    monkeypatch.setattr(hooks, "record_intent", racing)
+    res = hooks.sync_config()
+    doc = tomlkit.parse(live_config.read_text())
+    assert doc["output"]["post_output_command"] == USER_HOOK
+    assert doc["output"]["pre_recording_command"] == hooks.OUR_COMMANDS[hooks.PRE_RECORDING]
+    assert hooks.POST_OUTPUT not in features.load()["managed_hooks"]
+    assert res["changed"] and len(calls) == 2
+
+
+def test_sync_config_gives_up_when_the_config_keeps_changing(live_config, monkeypatch):
+    real = hooks.record_intent
+    n = []
+
+    def churn(*a, **k):
+        real(*a, **k)
+        n.append(1)
+        live_config.write_text(live_config.read_text() + f"# edit {len(n)}\n")
+    monkeypatch.setattr(hooks, "record_intent", churn)
+    with pytest.raises(config.ConfigChanged):
+        hooks.sync_config()
+    assert "voxtype-tui-hook" not in live_config.read_text()
+    assert len(n) == hooks.SYNC_ATTEMPTS
+
+
+def test_app_save_keeps_a_hook_the_user_added_after_load(live_config):
+    st = AppState.load(config.CONFIG_PATH, sidecar.SIDECAR_PATH)
+    _add_user_post_output(live_config)
+    st.save()
+    doc = tomlkit.parse(live_config.read_text())
+    assert doc["output"]["post_output_command"] == USER_HOOK
+    assert doc["output"]["pre_recording_command"] == hooks.OUR_COMMANDS[hooks.PRE_RECORDING]
+    assert hooks.POST_OUTPUT not in features.load()["managed_hooks"]
+    assert st.doc["output"]["post_output_command"] == USER_HOOK
+
+
+def test_app_save_keeps_a_hook_the_user_added_during_the_save(live_config, monkeypatch):
+    st = AppState.load(config.CONFIG_PATH, sidecar.SIDECAR_PATH)
+    real = hooks.record_intent
+    calls = []
+
+    def racing(*a, **k):
+        real(*a, **k)
+        if not calls:
+            _add_user_post_output(live_config)
+        calls.append(1)
+    monkeypatch.setattr(hooks, "record_intent", racing)
+    st.save()
+    doc = tomlkit.parse(live_config.read_text())
+    assert doc["output"]["post_output_command"] == USER_HOOK
+    assert hooks.POST_OUTPUT not in features.load()["managed_hooks"]
+    assert len(calls) >= 2
