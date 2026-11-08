@@ -52,7 +52,14 @@ in the panel. The same rule holds for each misheard form on its own: once
 "Omashi → Omarchy" is learned, an in-app "Omarion → Omarchy" is only
 applied after you make it twice (or accept the entry), because it is not
 close enough to count the first time. Typing more text after the dictation is fine; only the
-dictated words are compared.
+dictated words are compared. Text typed right after the dictation counts
+only as part of fixing it: finishing its last word, retyping after you
+deleted back into it, or Return. New words, or a dictation glued to the
+end (`simple.Hey`), are not part of it.
+
+A new dictation ends the previous dictation's watch at once, and nothing
+is learned from that window: the new text may already sit right after
+the old one. Use History › Fix for that dictation instead.
 
 Whenever an in-app correction turns a word on (learned at once, a
 suggestion confirmed by its second fix, or a new misheard form confirmed
@@ -61,7 +68,10 @@ Added "Omarchy" from your correction." Click it within 10 s to undo that
 step: the entry goes back to how it was before (a new entry is removed).
 The Undo is bound to the step the notification announced, so it still
 works if the same correction is picked up again before you click it (a
-repeat that changes nothing is not a step of its own).
+repeat that changes nothing is not a step of its own). Undoing an older
+step takes back only that step: if a later correction turned the word on
+by itself (an explicit History › Fix, or a newly confirmed misheard form),
+the word stays on with what that later step added.
 
 ## Your words always win
 
@@ -115,7 +125,12 @@ can try again. No path is ever replaced while you might be saving it:
   is the one it read (same file, same bytes; otherwise it is put back
   untouched), and publishes the cleaned copy only if the name is still
   free. If you saved a new copy in that instant, yours stays and the old
-  one is kept beside it as `<name>.voxtype-tui-kept`.
+  one is kept beside it as `<name>.voxtype-tui-kept`. A program that had
+  the file open before can still write to the moved file; it is checked
+  again right before the cleaned copy is published and before it is
+  deleted. If it changed, it goes back in place (or, once the cleaned copy
+  is there, is kept as `<name>.voxtype-tui-kept`) and the switch reports
+  the file.
 
 Cost, measured in an Omarchy VM: Chromium idle CPU unchanged (0.20 vs 0.23 %
 of one core over 20 s); Chromium memory about 190 MB higher (all processes,
