@@ -584,3 +584,29 @@ def test_promote_callback_may_use_the_learned_api():
     out = L.promote(eid, add_to_user=lambda e: (L.list_entries(), L.record_hits([]),
                                                 L.user_additions(e))[-1])
     assert out["ok"] and out["entry"]["state"] == "promoted"
+
+
+def test_new_passive_alias_on_an_active_entry_needs_confirmation():
+    L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")
+    assert L.similarity("Omarion", "Omarchy") < 0.6  # below the first-sighting bar
+    out = L.submit_correction(rec("on Omarion", "w1"), "on Omarchy", "atspi")
+    assert out["candidates"][0]["kind"] == "sounds_like"
+    assert L.apply("on Omarion")[0] == "on Omarion"       # seen once: not applied
+    assert L.apply("on Omashi")[0] == "on Omarchy"        # the confirmed alias still is
+    L.submit_correction(rec("on Omarion", "w1"), "on Omarchy", "atspi")  # same dictation again
+    assert L.apply("on Omarion")[0] == "on Omarion"
+    L.submit_correction(rec("on Omarion", "w2"), "on Omarchy", "atspi")  # a second dictation
+    assert L.apply("on Omarion")[0] == "on Omarchy"
+
+
+def test_unambiguous_passive_alias_on_an_active_entry_applies_at_once():
+    L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")
+    L.submit_correction(rec("on Omarshi", "w1"), "on Omarchy", "atspi")
+    assert L.apply("on Omarshi")[0] == "on Omarchy"
+
+
+def test_accept_confirms_pending_aliases():
+    L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")
+    eid = L.submit_correction(rec("on Omarion", "w1"), "on Omarchy", "atspi")["applied"][0]["id"]
+    L.accept(eid)
+    assert L.apply("on Omarion")[0] == "on Omarchy"

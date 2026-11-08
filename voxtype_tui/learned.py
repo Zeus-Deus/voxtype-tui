@@ -576,13 +576,15 @@ def submit_correction(record: dict | str, edited_text: str, source: str = "fix",
                 e["kind"] = k
             if p["heard"].lower() not in {h.lower() for h in e["heard"]}:
                 e["heard"].append(p["heard"])
-            # Exact aliases are decided per heard form: "Auston" may be an
-            # alias of "Austen" while the English "Austin" never is.
-            aliases = e.setdefault("aliases", [])
-            if k in ("sounds_like", "replace") and \
-                    p["heard"].lower() not in {h.lower() for h in aliases}:
-                aliases.append(p["heard"])
             duplicate = rec_id is not None and rec_id in e.get("records", [])
+            # Exact aliases are decided per heard form: "Auston" may be an
+            # alias of "Austen" while the English "Austin" never is. A
+            # passive sighting confirms a heard/written pair on its own
+            # terms (first-sighting or two-sighting rule), whatever state
+            # the entry is in; until then it waits in pending_aliases.
+            if k in ("sounds_like", "replace"):
+                _note_alias(e, p["heard"], p["written"], k, passive=passive,
+                            pair_count=len(pairs), rec_id=rec_id, now=now)
             if not duplicate:
                 e["count"] = int(e.get("count", 0)) + 1
                 e.setdefault("seen", []).append(_iso(now))
@@ -610,13 +612,55 @@ def submit_correction(record: dict | str, edited_text: str, source: str = "fix",
 
 
 def _recent_count(e: dict, now: datetime) -> int:
+    return _recent(e.get("seen", []), now)
+
+
+def _recent(seen: Iterable[object], now: datetime) -> int:
     cutoff = now - timedelta(days=PASSIVE_WINDOW_DAYS)
     n = 0
-    for s in e.get("seen", []):
+    for s in seen:
         dt = _parse_iso(s)
         if dt is not None and dt >= cutoff:
             n += 1
     return n
+
+
+def _note_alias(e: dict, heard: str, written: str, kind: str, *, passive: bool,
+                pair_count: int, rec_id: str | None, now: datetime) -> bool:
+    """Record one sighting of ``heard -> written`` as an exact alias.
+    Returns True when the alias became confirmed (compiled) now."""
+    aliases = e.setdefault("aliases", [])
+    hl = heard.lower()
+    if hl in {h.lower() for h in aliases}:
+        return False
+    pending = e.setdefault("pending_aliases", {})
+    if not passive or _unambiguous(pair_count, heard, written, kind):
+        aliases.append(heard)
+        pending.pop(hl, None)
+        return True
+    p = pending.setdefault(hl, {"heard": heard, "seen": [], "records": []})
+    if rec_id is None or rec_id not in p["records"]:
+        p["seen"] = (p["seen"] + [_iso(now)])[-RECORDS_PER_ENTRY:]
+        if rec_id:
+            p["records"] = (p["records"] + [rec_id])[-RECORDS_PER_ENTRY:]
+    if _recent(p["seen"], now) >= PASSIVE_MIN_COUNT:
+        aliases.append(p["heard"])
+        pending.pop(hl, None)
+        return True
+    return False
+
+
+def _confirm_pending(e: dict) -> None:
+    """An explicit accept confirms every alias the panel showed."""
+    pending = e.pop("pending_aliases", None) or {}
+    aliases = e.setdefault("aliases", [])
+    have = {h.lower() for h in aliases}
+    for hl, p in pending.items():
+        h = p.get("heard") if isinstance(p, dict) else None
+        h = h if isinstance(h, str) else str(hl)
+        if h.lower() not in have:
+            aliases.append(h)
+            have.add(h.lower())
 
 
 # ---------------------------------------------------------------- decisions
@@ -634,9 +678,12 @@ def _mutate(entry_id: str, fn: Callable[[dict, dict], None]) -> dict | None:
 
 def accept(entry_id: str) -> dict | None:
     def f(_s, e):
-        if e["state"] in ("suggested", "dormant", "rejected"):
-            e["state"] = "active"
-            e["decided_at"] = _iso(_now())
+        if e["state"] in ("suggested", "dormant", "rejected", "active"):
+            if e["state"] != "active":
+                e["state"] = "active"
+                e["decided_at"] = _iso(_now())
+            if e["kind"] in ("sounds_like", "replace"):
+                _confirm_pending(e)
     return _mutate(entry_id, f)
 
 
@@ -803,7 +850,7 @@ def _compile(store: dict) -> dict:
 
 
 def _public(e: dict) -> dict:
-    out = {k: v for k, v in e.items() if k not in ("seen",)}
+    out = {k: v for k, v in e.items() if k not in ("seen", "pending_aliases")}
     out["score"] = round(score(e), 2)
     return out
 

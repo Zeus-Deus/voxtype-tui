@@ -48,7 +48,10 @@ An explicit Fix is learned at once. An in-app correction is learned at once
 when it is unambiguous (one word replaced, the old word is not English and
 sounds like the new one, e.g. Omashi → Omarchy). Otherwise it stays
 **suggested** until you make the same fix twice within 30 days, or accept it
-in the panel. Typing more text after the dictation is fine; only the
+in the panel. The same rule holds for each misheard form on its own: once
+"Omashi → Omarchy" is learned, an in-app "Omarion → Omarchy" is only
+applied after you make it twice (or accept the entry), because it is not
+close enough to count the first time. Typing more text after the dictation is fine; only the
 dictated words are compared.
 
 When a word is learned you get a notification, "Vocabulary learned — Added
