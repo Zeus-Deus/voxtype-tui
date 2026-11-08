@@ -886,6 +886,13 @@ def apply(text: str, protected_spans: Iterable[tuple[int, int]] = (), *,
         return original, []
 
 
+def _mark_at(text: str, i: int) -> bool:
+    """Is ``text[i]`` a combining mark? (Same boundary rule as the fuzzy
+    stage: a word with a mark attached is not the bare word.)"""
+    return 0 <= i < len(text) and not text[i].isascii() and \
+        unicodedata.category(text[i]).startswith("M")
+
+
 def _apply_aliases(text: str, comp: dict, prot: list[tuple[int, int]],
                    hits: list[str]) -> tuple[str, list[tuple[int, int]]]:
     aliases = comp.get("aliases") or {}
@@ -917,6 +924,10 @@ def _apply_aliases(text: str, comp: dict, prot: list[tuple[int, int]],
             a = group[0].start()
             b = group[-1].end() - len(suffix)
             if _overlaps(a, b, prot) or _url_like(text, a, group[-1].end()):
+                continue
+            if _mark_at(text, a - 1) or _mark_at(text, group[-1].end()):
+                continue  # "Omashi\u0301": the mark belongs to the word
+            if suffix and _mark_at(text, b):
                 continue
             edits.append((a, b, hit[0]))
             hits.append(hit[1])

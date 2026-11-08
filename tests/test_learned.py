@@ -470,3 +470,13 @@ def test_r2_many_spelling_terms_stay_bounded():
     runs = sorted(float(subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                                        check=True, env=dict(os.environ)).stdout) for _ in range(5))
     assert runs[2] < 3.0, runs
+
+
+# ---------------------------------------------------------------- consistency and confirmation
+
+@pytest.mark.parametrize("text", ["on Omashi\u0301 today", "on \u0301Omashi today",
+                                  "on Omashi\u0301's today"])
+def test_exact_alias_never_rewrites_next_to_a_combining_mark(text):
+    L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")
+    assert L.apply("on Omashi today")[0] == "on Omarchy today"  # control
+    assert L.apply(text)[0] == text
