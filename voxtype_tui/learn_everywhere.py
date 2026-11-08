@@ -125,7 +125,13 @@ def _load_state() -> dict:
     return {"version": 1, "enabled": False, "files": {}}
 
 
-def _atomic_write(path: Path, text: str, mode: int = 0o644) -> None:
+def _atomic_write(path: Path, text: str, mode: int = 0o644, *,
+                  check=None, exclusive: bool = False) -> None:
+    """Write ``text`` to a temp file, then publish it in one step.
+
+    ``check()`` runs right before publishing and may raise to abort (the
+    target changed meanwhile). ``exclusive`` publishes with link(), which
+    fails if the target exists, instead of replacing it."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
     try:
@@ -137,7 +143,13 @@ def _atomic_write(path: Path, text: str, mode: int = 0o644) -> None:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        if check is not None:
+            check()
+        if exclusive:
+            os.link(tmp, path)
+            os.unlink(tmp)
+        else:
+            os.replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
@@ -157,6 +169,50 @@ def _read(path: Path) -> str | None:
         return path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
+
+
+def _ident(path: Path) -> list[int] | None:
+    """What the directory entry is right now (no symlink following):
+    type, inode, size and mtime. None = absent."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return [st.st_dev, st.st_ino, st.st_mode & 0o170000, st.st_size, st.st_mtime_ns]
+
+
+class _Conflict(Exception):
+    """A target changed between planning and writing it."""
+
+
+def _expect(path: Path, item: dict) -> None:
+    """Raise :class:`_Conflict` unless ``path`` is still exactly what the
+    plan saw (same entry, not a symlink, same bytes)."""
+    if _ident(path) != item.get("ident"):
+        raise _Conflict(str(path))
+    if item.get("ident") is not None and (path.is_symlink() or _read(path) != item["old"]):
+        raise _Conflict(str(path))
+
+
+def _remove_if_unchanged(path: Path, item: dict) -> None:
+    """Delete ``path`` only if it still holds what the plan saw: move it
+    aside first (atomic), verify the moved file, then delete it or put it
+    back."""
+    _expect(path, item)
+    aside = path.with_name(f".{path.name}.voxtype-tui-remove.{os.getpid()}")
+    try:
+        os.rename(path, aside)
+    except FileNotFoundError:
+        return
+    if not aside.is_symlink() and _read(aside) == item["old"]:
+        aside.unlink()
+        return
+    try:  # changed in the last instant: put it back, never over a newer file
+        os.link(aside, path)
+        aside.unlink()
+    except OSError:
+        pass
+    raise _Conflict(str(path))
 
 
 # ------------------------------------------------------------------ edits
@@ -217,6 +273,7 @@ def _plan(enable: bool) -> list[dict]:
     st = _load_state()
     plan = []
     envp = env_file()
+    env_ident = _ident(envp)
     cur = _read(envp)
     if enable:
         want = _env_content()
@@ -229,7 +286,7 @@ def _plan(enable: bool) -> list[dict]:
                          "reason": "already in place"})
         elif cur is None:
             plan.append({"path": envp, "action": "create", "old": None, "new": want,
-                         "rec": {"kind": "env", "created": True}})
+                         "rec": {"kind": "env", "created": True}, "ident": env_ident})
         else:
             plan.append({"path": envp, "action": "none", "old": cur, "new": cur, "rec": None,
                          "reason": "a file with this name exists and is not ours"})
@@ -238,6 +295,7 @@ def _plan(enable: bool) -> list[dict]:
                 plan.append({"path": path, "action": "none", "old": None, "new": None, "rec": None,
                              "reason": f"a symlink; add {FLAG} to it yourself", "app": why})
                 continue
+            ident = _ident(path)
             old = _read(path)
             new, rec = _enable_flags_text(old)
             if new is None:
@@ -245,7 +303,7 @@ def _plan(enable: bool) -> list[dict]:
                              "rec": None, "reason": rec.get("reason"), "app": why})
             else:
                 plan.append({"path": path, "action": "create" if old is None else "append",
-                             "old": old, "new": new, "rec": rec, "app": why})
+                             "old": old, "new": new, "rec": rec, "app": why, "ident": ident})
     else:
         for p, rec in st["files"].items():
             path = Path(p)
@@ -253,6 +311,7 @@ def _plan(enable: bool) -> list[dict]:
                 plan.append({"path": path, "action": "none", "old": None, "new": None, "rec": rec,
                              "reason": f"now a symlink; remove the {FLAG} line yourself"})
                 continue
+            ident = _ident(path)
             curp = _read(path)
             if curp is None:
                 plan.append({"path": path, "action": "none", "old": None, "new": None,
@@ -264,7 +323,7 @@ def _plan(enable: bool) -> list[dict]:
                              "reason": "no longer contains our lines"})
                 continue
             plan.append({"path": path, "action": "remove" if new is None else "edit",
-                         "old": curp, "new": new, "rec": rec})
+                         "old": curp, "new": new, "rec": rec, "ident": ident})
     return plan
 
 
@@ -418,16 +477,30 @@ def _set_enabled_locked(enabled: bool) -> dict:
     try:
         for it in plan:
             path: Path = it["path"]
+            recorded = False
             if enabled and it["rec"] is not None and it["action"] != "none":
                 # record ownership BEFORE touching the file, so a crash
                 # between the two can still be undone
+                recorded = str(path) not in st["files"]
                 st["files"][str(path)] = it["rec"]
                 _save_state(st)
-            if it["action"] in ("create", "append", "edit"):
-                _atomic_write(path, it["new"])
-            elif it["action"] == "remove":
-                with contextlib.suppress(FileNotFoundError):
-                    path.unlink()
+            # Each target is checked again right before it is written: a
+            # user or editor change since the plan is never overwritten.
+            try:
+                if it["action"] == "create":
+                    _atomic_write(path, it["new"], check=lambda p=path, i=it: _expect(p, i),
+                                  exclusive=True)
+                elif it["action"] in ("append", "edit"):
+                    _atomic_write(path, it["new"], check=lambda p=path, i=it: _expect(p, i))
+                elif it["action"] == "remove":
+                    _remove_if_unchanged(path, it)
+            except (_Conflict, FileExistsError):
+                if recorded:
+                    st["files"].pop(str(path), None)
+                _save_state(st)
+                return {"ok": False, "conflict": str(path), "files": done,
+                        "error": f"{path} changed while Learn everywhere was updating it; "
+                                 "nothing was written to it. Try again."}
             if not enabled and it["action"] in ("edit", "remove", "none"):
                 st["files"].pop(str(path), None)
             done.append({"path": str(path), "action": it["action"]})

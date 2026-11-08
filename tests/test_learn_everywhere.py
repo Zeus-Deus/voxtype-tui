@@ -184,3 +184,76 @@ def test_r2_session_env_restores_previous_values(cfg, monkeypatch):
     calls.clear()
     LE.set_enabled(False)
     assert not any("unset-environment" in c or "set-environment" in c for c in calls)
+
+
+# ---------------------------------------------------------------- concurrent user edits
+
+def _after_plan(monkeypatch, fn):
+    """Run ``fn`` right after set_enabled planned its edits (a user or an
+    editor saving the file in that window). Returns a function that turns
+    the interference off again."""
+    real = LE._plan
+
+    def plan(enable):
+        out = real(enable)
+        fn()
+        return out
+    monkeypatch.setattr(LE, "_plan", plan)
+    return lambda: monkeypatch.setattr(LE, "_plan", real)
+
+
+def test_enable_never_overwrites_an_edit_made_meanwhile(cfg, monkeypatch):
+    p = cfg / "chromium-flags.conf"
+    p.write_text("--a\n")
+    stop = _after_plan(monkeypatch, lambda: p.write_text("--a\n--user-added-meanwhile\n"))
+    r = LE.set_enabled(True)
+    assert p.read_text() == "--a\n--user-added-meanwhile\n"
+    assert r["ok"] is False and "changed" in r["error"] and r["conflict"] == str(p)
+    assert str(p) not in LE._load_state()["files"]  # not recorded as ours
+    stop()
+    assert LE.set_enabled(True)["ok"]  # trying again works on the new content
+    assert p.read_text() == "--a\n--user-added-meanwhile\n" + LE.MARKER + "\n" + LE.FLAG + "\n"
+
+
+def test_enable_never_overwrites_a_file_created_meanwhile(cfg, monkeypatch):
+    p = cfg / "electron43-flags.conf"
+    _after_plan(monkeypatch, lambda: p.write_text("--mine\n"))
+    r = LE.set_enabled(True)
+    assert p.read_text() == "--mine\n" and r["ok"] is False
+
+
+def test_disable_never_overwrites_an_edit_made_meanwhile(cfg, monkeypatch):
+    p = cfg / "chromium-flags.conf"
+    p.write_text("--a\n")
+    LE.set_enabled(True)
+    edited = p.read_text() + "--user-added-meanwhile\n"
+    stop = _after_plan(monkeypatch, lambda: p.write_text(edited))
+    r = LE.set_enabled(False)
+    assert p.read_text() == edited and r["ok"] is False
+    assert str(p) in LE._load_state()["files"]  # still ours to clean up later
+    stop()
+    assert LE.set_enabled(False)["ok"]
+    assert p.read_text() == "--a\n--user-added-meanwhile\n"
+
+
+def test_disable_never_deletes_a_file_edited_meanwhile(cfg, monkeypatch):
+    LE.set_enabled(True)
+    p = cfg / "electron43-flags.conf"
+    edited = p.read_text() + "--mine\n"
+    _after_plan(monkeypatch, lambda: p.write_text(edited))
+    LE.set_enabled(False)
+    assert p.read_text() == edited
+
+
+def test_a_file_turned_into_a_symlink_meanwhile_is_left_alone(cfg, tmp_path, monkeypatch):
+    p = cfg / "chromium-flags.conf"
+    p.write_text("--a\n")
+    real = tmp_path / "dotfiles-chromium.conf"
+
+    def swap():
+        real.write_text(p.read_text())
+        p.unlink()
+        p.symlink_to(real)
+    _after_plan(monkeypatch, swap)
+    r = LE.set_enabled(True)
+    assert p.is_symlink() and real.read_text() == "--a\n" and r["ok"] is False

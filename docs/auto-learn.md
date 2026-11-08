@@ -96,6 +96,10 @@ restart, and everything is in place after your next login.
 Turning it off removes only the lines voxtype-tui added. Changes you made to
 those files later are kept; a file it created and nothing else uses is
 deleted. Symlinked flag files are left alone (add the flag yourself).
+Each file is checked again right before it is written or removed; if you
+(or another program) changed it, or replaced it with a symlink, in the
+meantime, nothing is written to it and the switch reports the file so you
+can try again.
 
 Cost, measured in an Omarchy VM: Chromium idle CPU unchanged (0.20 vs 0.23 %
 of one core over 20 s); Chromium memory about 190 MB higher (all processes,
