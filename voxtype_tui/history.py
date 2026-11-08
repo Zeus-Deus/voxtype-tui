@@ -77,17 +77,43 @@ def handoff_path(record_id: str) -> Path:
 
 
 HANDOFF_KEEP_S = 600.0
+PRUNE_EVERY_S = 300.0
 
 
 def write_handoff(rec: dict) -> None:
-    """Critical path: one small tmpfs file, plus dropping handoffs no
-    worker picked up (post-output not wired) after HANDOFF_KEEP_S."""
+    """Critical path: one small runtime file (tmpfs normally), written and
+    renamed into place without fsync — it only has to outlive this
+    dictation, and a disk-backed fallback dir must not stall voxtype.
+    Handoffs no worker picked up (post-output not wired) are dropped after
+    HANDOFF_KEEP_S by a detached ``--prune-runtime`` started at most once
+    per PRUNE_EVERY_S (and by the pre-recording hook), never here."""
     from . import rtdir
 
     rt = rtdir.runtime_path()
     path = Path(rtdir.handoff_file(rt, rec["id"]))
-    F.atomic_write_text(path, json.dumps(rec, ensure_ascii=False))
-    rtdir.prune(rt, time.time(), HANDOFF_KEEP_S, "handoff")
+    F.atomic_write_text(path, json.dumps(rec, ensure_ascii=False), durable=False)
+    try:
+        marker = os.path.join(rt, ".pruned")
+        try:
+            if time.time() - os.stat(marker).st_mtime < PRUNE_EVERY_S:
+                return
+        except FileNotFoundError:
+            pass
+        os.close(os.open(marker, os.O_WRONLY | os.O_CREAT, 0o600))
+        os.utime(marker)
+    except OSError:
+        return
+    spawn_detached(["--prune-runtime"])
+
+
+def prune_runtime() -> None:
+    """Drop old handoffs and claim markers (detached; see write_handoff)."""
+    from . import rtdir
+
+    rt = rtdir.runtime_path()
+    now = time.time()
+    rtdir.prune(rt, now, HANDOFF_KEEP_S, "handoff")
+    rtdir.prune(rt, now, rtdir.CLAIM_KEEP_S, "claimed")
 
 
 def remove_handoff(record_id: str) -> None:
@@ -153,6 +179,13 @@ def count_words(text: str) -> int:
 
 
 # --- failures / health (rare paths only) ---
+
+def note_failure_detached(where: str, msg: str) -> None:
+    """:func:`note_failure` from a detached process, for the post-process:
+    voxtype waits for it to exit, and a failure log on a stalled disk must
+    not delay the dictation. Never raises, never waits."""
+    spawn_detached(["--note-failure", str(where)[:80], str(msg)[:300]])
+
 
 def note_failure(where: str, msg: str, data_dir: Path | None = None) -> None:
     """Append one failure line. Never raises (used on error paths)."""
@@ -234,14 +267,25 @@ def enqueue(record: dict, data_dir: Path | None = None) -> bool:
     return False
 
 
-def _self_drain(d: Path) -> None:
-    """Start one detached ``voxtype-tui-hook --maintain`` (rate-limited by a
-    marker's mtime). posix_spawn, stdio on /dev/null, own session: the
-    post-process exits without waiting and voxtype never waits on it.
-    Never raises."""
+def spawn_detached(args: list[str]) -> None:
+    """Start ``voxtype-tui-hook <args>`` detached: posix_spawn, stdio on
+    /dev/null, own session, never waited for — the post-process exits at
+    once and voxtype never waits on it. Never raises."""
     try:
         import sys
 
+        fa = [(os.POSIX_SPAWN_OPEN, fd, os.devnull, os.O_RDWR, 0) for fd in (0, 1, 2)]
+        os.posix_spawn(sys.executable,
+                       [sys.executable, "-m", "voxtype_tui.hook_main", *args],
+                       os.environ, file_actions=fa, setsid=True)
+    except Exception:
+        pass
+
+
+def _self_drain(d: Path) -> None:
+    """Start one detached ``voxtype-tui-hook --maintain`` (rate-limited by a
+    marker's mtime). Never raises."""
+    try:
         marker = d / ".self-drain"
         try:
             if time.time() - os.stat(marker).st_mtime < SELF_DRAIN_EVERY_S:
@@ -250,12 +294,9 @@ def _self_drain(d: Path) -> None:
             pass
         os.close(os.open(str(marker), os.O_WRONLY | os.O_CREAT, 0o600))
         os.utime(marker)
-        fa = [(os.POSIX_SPAWN_OPEN, fd, os.devnull, os.O_RDWR, 0) for fd in (0, 1, 2)]
-        os.posix_spawn(sys.executable,
-                       [sys.executable, "-m", "voxtype_tui.hook_main", "--maintain"],
-                       os.environ, file_actions=fa, setsid=True)
     except Exception:
-        pass
+        return
+    spawn_detached(["--maintain"])
 
 
 # --- storage ---

@@ -80,8 +80,10 @@ def ensure_private_dir(path: Path) -> Path:
     return path
 
 
-def atomic_write_text(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` atomically with mode 0600."""
+def atomic_write_text(path: Path, text: str, *, durable: bool = True) -> None:
+    """Write ``text`` to ``path`` atomically with mode 0600. ``durable=False``
+    skips the fsync: for ephemeral runtime files written while voxtype
+    waits, where a stalled disk must never hold up the dictation."""
     import tempfile
 
     ensure_private_dir(path.parent)
@@ -91,7 +93,8 @@ def atomic_write_text(path: Path, text: str) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
             f.flush()
-            os.fsync(f.fileno())
+            if durable:
+                os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
         try:

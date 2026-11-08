@@ -458,9 +458,9 @@ def test_postprocess_capture_failure_never_changes_output(xdg, monkeypatch, tmp_
     def boom(*a, **k):
         raise OSError("disk full")
     monkeypatch.setattr(history, "enqueue", boom)
+    monkeypatch.setenv("PYTHONPATH", str(Path(__file__).resolve().parent.parent))
     assert _run_main(monkeypatch, "keep me exactly") == "keep me exactly"
-    fails = history.health()["failures"]
-    assert fails and fails[-1]["where"] == "post_process"
+    _wait_for_failure("post_process", "disk full")  # logged by a detached process
 
 
 def test_postprocess_pipeline_failure_passes_text_through(xdg, monkeypatch):
@@ -1315,6 +1315,51 @@ def test_learned_never_rewrites_dictionary_output_the_vocab_stage_changed(xdg, m
 
 
 # --- critical-path robustness ---------------------------------------------
+
+def _stall(*a, **k):
+    time.sleep(3.0)
+
+
+def test_postprocess_exits_while_storage_stalls(xdg, monkeypatch, tmp_path):
+    """Voxtype waits for the post-process to exit: once the text is out, a
+    stalled fsync or a slow handoff prune must not hold it up."""
+    from voxtype_tui import rtdir
+
+    monkeypatch.setattr(cli_postprocess, "SIDECAR_PATH", tmp_path / "none.json")
+    monkeypatch.setattr(os, "fsync", _stall)
+    monkeypatch.setattr(rtdir, "prune", _stall)
+    t0 = time.monotonic()
+    assert _run_main(monkeypatch, "hello stalled disk") == "hello stalled disk"
+    assert time.monotonic() - t0 < 1.0
+    rid = rtdir.newest_handoff(rtdir.runtime_path())
+    assert rid and history.handoff(rid)["final"] == "hello stalled disk"
+
+
+def _wait_for_failure(where: str, needle: str, timeout: float = 15.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for f in history.health()["failures"]:
+            if f["where"] == where and needle in f["msg"]:
+                return f
+        time.sleep(0.05)
+    raise AssertionError(f"no {where!r} failure containing {needle!r}")
+
+
+def test_postprocess_failure_logging_never_blocks(xdg, monkeypatch, tmp_path):
+    """A capture failure is logged outside the waited-on process: a stalled
+    failure log costs nothing, and the failure still gets recorded."""
+    monkeypatch.setattr(cli_postprocess, "SIDECAR_PATH", tmp_path / "none.json")
+    monkeypatch.setenv("PYTHONPATH", str(Path(__file__).resolve().parent.parent))
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(history, "enqueue", boom)
+    monkeypatch.setattr(history, "note_failure", _stall)
+    t0 = time.monotonic()
+    assert _run_main(monkeypatch, "keep me") == "keep me"
+    assert time.monotonic() - t0 < 1.0
+    _wait_for_failure("post_process", "disk full")
+
 
 def test_newest_handoff_skips_an_entry_removed_during_the_scan(xdg, monkeypatch):
     """An older handoff removed by its worker while the next post-output

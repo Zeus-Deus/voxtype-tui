@@ -67,7 +67,11 @@ if you have not set them yourself:
   for this command, so the queue is never waited on for more than 50 ms: if
   something holds it longer, that one record is dropped and counted in
   `health.dropped`, and the text goes out unchanged. Deleting or clearing
-  History never holds the queue for more than a rename. The command is
+  History never holds the queue for more than a rename. Once the text is
+  written, the command does no fsync and no cleanup: the per-dictation
+  handoff file is written without fsync, old handoffs are removed by a
+  background process, and a capture error is logged by a background process,
+  so a stalled disk cannot delay the dictation. The command is
   `command -v voxtype-tui-postprocess >/dev/null 2>&1 && exec voxtype-tui-postprocess; exec cat`.
   If voxtype-tui is removed, `cat` passes the text through unchanged. A bare
   command that exits without reading the text can kill the Voxtype 1.1.1 daemon

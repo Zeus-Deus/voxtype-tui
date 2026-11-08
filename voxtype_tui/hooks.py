@@ -652,6 +652,14 @@ def main(argv: list[str] | None = None) -> int:
             from . import history
 
             history.maintain()
+        elif event == "--prune-runtime":
+            from . import history
+
+            history.prune_runtime()
+        elif event == "--note-failure" and len(argv) >= 3:
+            from . import history
+
+            history.note_failure(argv[1], argv[2])
         else:
             sys.stderr.write("usage: voxtype-tui-hook pre-recording|pre-output|post-output\n")
     except Exception as e:  # never break dictation

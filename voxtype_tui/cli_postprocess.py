@@ -219,9 +219,10 @@ def _capture(raw: str, final: str, changed_by: list[str], hits: list[str]) -> No
     """Queue one record for usage/history/archive/learning.
 
     Critical path: one features read, a few stats, one O_APPEND line (and
-    one small tmpfs file when the archive or learning needs the text after
-    output). No subprocesses, no pruning. Raises on failure; the caller
-    has already written the text."""
+    one small runtime file, never fsynced, when the archive or learning
+    needs the text after output). No waited-on subprocesses, no pruning, no
+    fsync. Raises on failure; the caller has already written the text and
+    logs the failure from a detached process."""
     from . import capture, features, history
 
     feats = features.load()
@@ -301,7 +302,8 @@ def main() -> int:
         try:
             from . import history
 
-            history.note_failure("post_process", repr(e))
+            # Logged by a detached process: voxtype waits for this one.
+            history.note_failure_detached("post_process", repr(e))
         except Exception:
             pass
     return 0
