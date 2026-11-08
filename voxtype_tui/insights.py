@@ -85,6 +85,9 @@ def usage_summary(days: int = 365, config_path: Path | None = None) -> dict:
                                     feats.get(F.MANAGED_HOOKS_KEY, {}).get(hooks.PRE_RECORDING)):
             unavailable.append({"feature": "duration",
                                 "reason": "your own pre_recording_command is set"})
+        elif doc.get("state_file") == "disabled":
+            unavailable.append({"feature": "duration",
+                                "reason": "Voxtype's state_file is disabled"})
     except (OSError, ValueError):
         pass
     # Right after an upgrade nothing has saved the config yet: the switches

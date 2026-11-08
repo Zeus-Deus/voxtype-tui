@@ -108,7 +108,10 @@ and nothing else.
 
 - **Duration and words per minute** come from the moments Voxtype writes `recording`
   and `transcribing` to its state file. If the pre-recording hook is not ours, durations
-  are `null`, never estimated, and "time saved" is not shown.
+  are `null`, never estimated, and "time saved" is not shown. The state file is
+  wherever Voxtype's `state_file` setting puts it (`"auto"` or a path). With
+  `state_file = "disabled"` durations are `null` (health says why) and the
+  archive saves no audio, because nothing tells the recorder when you stopped.
 - **The model** is read from `config.toml`. When the config is newer than the
   running daemon, the record says `model_uncertain: true`.
 - **Dictations made before the upgrade** are not counted. voxtype-tui does not

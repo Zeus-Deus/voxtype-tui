@@ -3,6 +3,9 @@
 Used by the post-process CLI (critical path: stat + small reads only) and
 by ``voxtype-tui-hook``. Stdlib only, no subprocesses.
 
+* Voxtype's state file is wherever its ``state_file`` setting says
+  (:func:`state_file`); with ``"disabled"`` durations are ``None`` and the
+  archive records no audio.
 * Recording start = mtime of voxtype's state file when the pre-recording
   hook sees ``recording`` (voxtype writes it before running the hook).
 * Recording stop = mtime of the state file when post-process runs (it was
@@ -30,12 +33,24 @@ def voxtype_runtime() -> Path:
     return Path(base) / "voxtype"
 
 
-def state_file() -> Path:
-    return voxtype_runtime() / "state"
+def state_file(info: dict | None = None) -> Path | None:
+    """Voxtype's state file per its ``state_file`` setting: ``"auto"`` (the
+    default) = ``$XDG_RUNTIME_DIR/voxtype/state``, a custom path, or
+    ``"disabled"`` -> None (no recording/transcribing timestamps at all)."""
+    setting = (info if info is not None else config_info()).get("state_file", "auto")
+    if setting == "disabled":
+        return None
+    if not setting or setting == "auto":
+        return voxtype_runtime() / "state"
+    return Path(os.path.expanduser(setting))
 
 
-def read_state() -> tuple[str, float | None]:
-    p = state_file()
+def read_state(path: "Path | None | bool" = True) -> tuple[str, float | None]:
+    """(state, mtime) of voxtype's state file; ``path=True`` resolves it
+    from the config, ``None`` = disabled -> ("", None)."""
+    p = state_file() if path is True else path
+    if p is None:
+        return "", None
     try:
         with p.open() as f:
             st = os.fstat(f.fileno())
@@ -79,7 +94,7 @@ def config_info(cfg: Path | None = None) -> dict:
     try:
         st = cfg.stat()
     except OSError:
-        return {"engine": None, "model": None, "language": None,
+        return {"engine": None, "model": None, "language": None, "state_file": "auto",
                 "max_duration_secs": DEFAULT_MAX_DURATION, "model_uncertain": True}
     key = f"{st.st_mtime_ns}:{st.st_size}:{st.st_ino}"
     info = None
@@ -89,7 +104,7 @@ def config_info(cfg: Path | None = None) -> dict:
         cache = None
     try:
         c = json.loads(cache.read_text()) if cache is not None else {}
-        if c.get("key") == key and c.get("path") == str(cfg):
+        if c.get("key") == key and c.get("path") == str(cfg) and "state_file" in c["info"]:
             info = c["info"]
     except (OSError, ValueError, KeyError, TypeError):
         info = None
@@ -103,8 +118,10 @@ def config_info(cfg: Path | None = None) -> dict:
             doc = {}
         engine, model, lang = _engine_model(doc)
         audio = doc.get("audio") or {}
+        sf = doc.get("state_file", "auto")
         info = {
             "engine": engine, "model": model, "language": lang,
+            "state_file": sf if isinstance(sf, str) else "auto",
             "max_duration_secs": int(audio.get("max_duration_secs") or DEFAULT_MAX_DURATION),
             "device": str(audio.get("device") or "default"),
         }
@@ -135,12 +152,14 @@ def read_rec_start(max_age_s: float = 3600.0) -> dict | None:
     return info
 
 
-def measure_duration(start_info: dict | None, max_duration: int) -> tuple[float | None, float | None]:
-    """(started_at_epoch, duration_s) or (None, None) when not measurable."""
+def measure_duration(start_info: dict | None, max_duration: int,
+                     info: dict | None = None) -> tuple[float | None, float | None]:
+    """(started_at_epoch, duration_s) or (None, None) when not measurable
+    (including voxtype's state file being disabled)."""
     if not start_info:
         return None, None
     start = start_info.get("start")
-    state, mtime = read_state()
+    state, mtime = read_state(state_file(info))
     if not isinstance(start, (int, float)) or mtime is None:
         return None, None
     if state == "recording":

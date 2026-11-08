@@ -402,10 +402,11 @@ def _supervise(proc, cap_s: float) -> None:
     from . import capture
 
     deadline = time.time() + cap_s
+    state_path = capture.state_file()
     if cap_s > 0:
         time.sleep(0.2)
     while time.time() < deadline and proc.poll() is None:
-        state, _ = capture.read_state()
+        state, _ = capture.read_state(state_path)
         if state != "recording":
             break
         time.sleep(0.05)
@@ -427,7 +428,9 @@ def on_pre_recording() -> None:
     from . import capture
 
     feats = F.load()
-    state, mtime = capture.read_state()
+    cfg = capture.config_info()
+    state_path = capture.state_file(cfg)
+    state, mtime = capture.read_state(state_path)
     now = time.time()
     start = mtime if state == "recording" and mtime and now - mtime < 5 else now
     info: dict[str, Any] = {"start": start, "hook_ts": now, "app": None}
@@ -437,10 +440,15 @@ def on_pre_recording() -> None:
     info["app"] = _hypr_active_window()
     rt = F.ensure_private_dir(F.runtime_dir())
     _purge_stale(rt)
-    if archive["enabled"] and archive["save_audio"]:
+    if archive["enabled"] and archive["save_audio"] and state_path is None:
+        # Without voxtype's state file nothing tells the recorder when the
+        # recording stops: save no audio rather than a wrong clip.
+        from . import history
+
+        history.note_failure("archive", "audio not saved: voxtype's state_file is disabled")
+    elif archive["enabled"] and archive["save_audio"]:
         binary = recorder_binary()
         if binary:
-            cfg = capture.config_info()
             rec_dir = F.ensure_private_dir(rt / "rec")
             wav = str(rec_dir / f"{int(start * 1000)}.wav")
             target, note = resolve_source(str(cfg.get("device", "default")))

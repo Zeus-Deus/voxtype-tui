@@ -257,7 +257,7 @@ def _capture(raw: str, final: str, changed_by: list[str], hits: list[str]) -> No
                 os.unlink(capture.rec_start_path())
         except OSError:
             pass
-    started, duration = capture.measure_duration(start_info, cfg.get("max_duration_secs") or 60)
+    started, duration = capture.measure_duration(start_info, cfg.get("max_duration_secs") or 60, cfg)
     rec = {
         "id": rid,
         "ts": history.iso(now),

@@ -1189,3 +1189,70 @@ def test_queue_drains_itself_when_post_output_is_not_ours(xdg, monkeypatch):
         time.sleep(0.05)
     u = json.loads(history.usage_path().read_text())
     assert sum(d["n"] for d in u["days"].values()) >= 10
+
+
+# --- voxtype's configured state_file ----------------------------------------
+
+def _voxtype_config(text: str) -> Path:
+    cfg = Path(os.environ["XDG_CONFIG_HOME"]) / "voxtype" / "config.toml"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text(text)
+    return cfg
+
+
+def _set_state(path: Path, state: str, mtime: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(state)
+    os.utime(path, (mtime, mtime))
+
+
+def test_duration_uses_the_configured_state_file(xdg, monkeypatch, tmp_path):
+    monkeypatch.setattr(cli_postprocess, "SIDECAR_PATH", tmp_path / "none.json")
+    custom = tmp_path / "custom" / "vt-state"
+    _voxtype_config(f'state_file = "{custom}"\n[whisper]\nmodel = "base.en"\n')
+    start = time.time() - 8.0
+    features.atomic_write_text(capture.rec_start_path(), json.dumps({"start": start}))
+    _set_state(custom, "transcribing", start + 7.5)
+    assert _run_main(monkeypatch, "three words here") == "three words here"
+    assert history.list_items()["items"][0]["duration_s"] == 7.5
+
+
+def test_recorder_supervisor_follows_the_configured_state_file(xdg, tmp_path):
+    import subprocess as sp
+
+    custom = tmp_path / "custom" / "vt-state"
+    _voxtype_config(f'state_file = "{custom}"\n')
+    _set_state(custom, "recording", time.time())
+    proc = sp.Popen([_fake_recorder(tmp_path)], stdout=sp.DEVNULL, stderr=sp.DEVNULL)
+    t = time.perf_counter()
+    hooks._supervise(proc, 0.8)  # stops at the cap, not after the first poll
+    assert time.perf_counter() - t >= 0.7
+    assert proc.poll() is not None
+
+
+def test_disabled_state_file_measures_nothing_and_records_no_audio(xdg, monkeypatch, tmp_path):
+    import subprocess as sp
+
+    monkeypatch.setattr(cli_postprocess, "SIDECAR_PATH", tmp_path / "none.json")
+    _voxtype_config('state_file = "disabled"\n')
+    start = time.time() - 8.0
+    # a stale state file at the default path must not be read
+    _set_state(capture.voxtype_runtime() / "state", "transcribing", start + 7.5)
+    features.atomic_write_text(capture.rec_start_path(), json.dumps({"start": start}))
+    _run_main(monkeypatch, "three words here")
+    assert history.list_items()["items"][0]["duration_s"] is None
+    features.update({"archive": {"enabled": True, "dir": str(tmp_path / "a")}}, wire=False)
+    monkeypatch.setattr(hooks, "recorder_binary", lambda: _fake_recorder(tmp_path))
+    monkeypatch.setattr(hooks, "resolve_source", lambda d: (None, "default source"))
+    started = []
+    monkeypatch.setattr(sp, "Popen", lambda *a, **k: started.append(a) or (_ for _ in ()).throw(
+        AssertionError("recorder started")))
+    hooks.on_pre_recording()
+    assert started == []
+    assert any("state_file" in f["msg"] for f in history.health()["failures"])
+
+
+def test_disabled_state_file_reports_why_durations_are_missing(live_config):
+    live_config.write_text('state_file = "disabled"\n' + live_config.read_text())
+    health = insights.usage_summary(30)["health"]
+    assert {"feature": "duration", "reason": "Voxtype's state_file is disabled"} in health["unavailable"]
