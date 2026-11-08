@@ -11,8 +11,9 @@ Data flow:
   file away under it.
 * :func:`maintain` drains the queue into ``usage.json`` (counters, never
   text) and ``history.jsonl`` (text, when history is on) and prunes
-  expired history. It runs detached from the post-output hook and at the
-  start of every read, so data is fresh even when that hook is not wired.
+  expired history. It runs detached from the post-output hook, at the
+  start of every read, and (when that hook is not ours) from a detached
+  drain the post-process starts once the queue is large.
 * Reads (:func:`summary`, :func:`list_items`) always enforce expiry.
 
 Everything is idempotent by record id (ids are time-sortable): a crash
@@ -34,6 +35,12 @@ from . import features as F
 
 QUEUE_MAX_BYTES = 4 * 1024 * 1024
 ENQUEUE_WAIT_S = 0.05  # longest a dictation may wait for the queue lock
+# The post-output worker drains the queue after every dictation. When it is
+# not ours (the user's own post_output_command) or not wired yet, the queue
+# grows; past this size the post-process starts one detached drain, at most
+# once per SELF_DRAIN_EVERY_S, so it never reaches QUEUE_MAX_BYTES.
+SELF_DRAIN_BYTES = 256 * 1024
+SELF_DRAIN_EVERY_S = 60.0
 FAILURES_KEEP = 20
 RECENT_IDS_KEEP = 2000
 USAGE_VERSION = 1
@@ -217,11 +224,38 @@ def enqueue(record: dict, data_dir: Path | None = None) -> bool:
             if st.st_size + len(line) > QUEUE_MAX_BYTES:
                 break
             os.write(fd, line)
-            return True
+            size = st.st_size + len(line)
         finally:
             os.close(fd)  # releases the flock
+        if size > SELF_DRAIN_BYTES:
+            _self_drain(p.parent)
+        return True
     _note_dropped(p.parent)
     return False
+
+
+def _self_drain(d: Path) -> None:
+    """Start one detached ``voxtype-tui-hook --maintain`` (rate-limited by a
+    marker's mtime). posix_spawn, stdio on /dev/null, own session: the
+    post-process exits without waiting and voxtype never waits on it.
+    Never raises."""
+    try:
+        import sys
+
+        marker = d / ".self-drain"
+        try:
+            if time.time() - os.stat(marker).st_mtime < SELF_DRAIN_EVERY_S:
+                return
+        except FileNotFoundError:
+            pass
+        os.close(os.open(str(marker), os.O_WRONLY | os.O_CREAT, 0o600))
+        os.utime(marker)
+        fa = [(os.POSIX_SPAWN_OPEN, fd, os.devnull, os.O_RDWR, 0) for fd in (0, 1, 2)]
+        os.posix_spawn(sys.executable,
+                       [sys.executable, "-m", "voxtype_tui.hook_main", "--maintain"],
+                       os.environ, file_actions=fa, setsid=True)
+    except Exception:
+        pass
 
 
 # --- storage ---

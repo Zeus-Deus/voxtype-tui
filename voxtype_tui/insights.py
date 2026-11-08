@@ -119,7 +119,12 @@ def _pending_wiring(feats: dict, config_path: Path | None = None) -> list[str]:
         out.append("capture")
     if hooks.PRE_RECORDING in wired:
         out.append("duration")
-    if hooks.POST_OUTPUT in wired:
+    # post_output also drains the queue for usage/history, but those keep
+    # working without it (reads and the post-process drain the queue), so
+    # only the archive and the learning watcher report it as pending.
+    if hooks.POST_OUTPUT in wired and (
+            feats["archive"]["enabled"]
+            or (feats["learning"]["enabled"] and hooks._module_exists("voxtype_tui.learn_watch"))):
         out.append("learning")
     return out
 

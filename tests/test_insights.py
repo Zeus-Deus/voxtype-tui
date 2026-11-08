@@ -258,9 +258,10 @@ def test_reconcile_wires_needed_hooks_and_is_idempotent(xdg):
     plan = hooks.reconcile(doc, features.load())
     assert plan.changed
     assert doc["output"]["pre_recording_command"] == hooks.OUR_COMMANDS[hooks.PRE_RECORDING]
-    assert "post_output_command" not in doc["output"]  # archive off, no watcher module
+    # usage/history: post_output drains the queue after each dictation
+    assert doc["output"]["post_output_command"] == hooks.OUR_COMMANDS[hooks.POST_OUTPUT]
     assert doc["output"]["post_process"]["command"] == config.POSTPROCESS_COMMAND
-    assert plan.managed == {hooks.PRE_RECORDING: hooks.OUR_COMMANDS[hooks.PRE_RECORDING]}
+    assert plan.managed == {k: hooks.OUR_COMMANDS[k] for k in (hooks.PRE_RECORDING, hooks.POST_OUTPUT)}
     feats = features.load() | {"managed_hooks": plan.managed}
     before = tomlkit.dumps(doc)
     again = hooks.reconcile(doc, feats)
@@ -273,7 +274,8 @@ def test_learning_watcher_wires_post_output_only_when_installed(xdg, monkeypatch
     hooks.reconcile(doc, features.load())
     assert doc["output"]["post_output_command"] == hooks.OUR_COMMANDS[hooks.POST_OUTPUT]
     feats = features.load()
-    feats["learning"]["enabled"] = False
+    for k in ("learning", "usage", "history"):
+        feats[k]["enabled"] = False
     feats["managed_hooks"] = {hooks.POST_OUTPUT: hooks.OUR_COMMANDS[hooks.POST_OUTPUT]}
     hooks.reconcile(doc, feats)
     assert "post_output_command" not in doc["output"]
@@ -361,7 +363,7 @@ def test_sync_config_and_unwire_all_roundtrip(live_config):
     text = live_config.read_text()
     assert "voxtype-tui-hook pre-recording" in text
     assert features.load()["managed_hooks"] == {
-        hooks.PRE_RECORDING: hooks.OUR_COMMANDS[hooks.PRE_RECORDING]}
+        k: hooks.OUR_COMMANDS[k] for k in (hooks.PRE_RECORDING, hooks.POST_OUTPUT)}
     assert hooks.sync_config()["changed"] is False
     assert hooks.unwire_all()["changed"] is True
     text = live_config.read_text()
@@ -374,7 +376,8 @@ def test_sync_config_and_unwire_all_roundtrip(live_config):
 def test_features_update_rewires_config(live_config):
     insights.set_features({"archive": {"enabled": True, "dir": str(live_config.parent / "arch")}})
     assert "voxtype-tui-hook post-output" in live_config.read_text()
-    out = insights.set_features({"archive": {"enabled": False}})
+    out = insights.set_features({"archive": {"enabled": False}, "usage": {"enabled": False},
+                                 "history": {"enabled": False}})
     assert "post_output_command" not in live_config.read_text()
     assert out["restart_needed"] is True
     assert out["available"]["usage"] is True
@@ -1142,3 +1145,47 @@ def test_deleting_a_record_never_removes_a_newer_records_handoff(xdg, monkeypatc
     env_b = _hook_entry(monkeypatch)
     _worker(monkeypatch, env_b)
     assert len(done) == 2 and done[0] == rid_a and done[1] != rid_a
+
+
+# --- the queue is drained without the panel ---------------------------------
+
+def test_usage_and_history_wire_post_output_for_maintenance(xdg):
+    """Usage/history alone (archive off, no learning watcher): post_output
+    is wired so every dictation drains the queue; nothing has to read."""
+    doc = _doc()
+    plan = hooks.reconcile(doc, features.load())
+    assert doc["output"]["post_output_command"] == hooks.OUR_COMMANDS[hooks.POST_OUTPUT]
+    assert plan.managed[hooks.POST_OUTPUT] == hooks.OUR_COMMANDS[hooks.POST_OUTPUT]
+    off = features.load() | {"managed_hooks": plan.managed}
+    for k in ("usage", "history"):
+        off[k]["enabled"] = False
+    hooks.reconcile(doc, off)
+    assert "post_output_command" not in doc["output"]
+
+
+def test_queue_drains_itself_when_post_output_is_not_ours(xdg, monkeypatch):
+    """With the user's own post_output_command (never touched) the
+    post-process starts one detached drain once the queue is large, so it
+    never reaches the cap and drops dictations."""
+    import sys
+
+    repo = Path(__file__).resolve().parent.parent
+    monkeypatch.setenv("PYTHONPATH", str(repo))
+    monkeypatch.setattr(history, "SELF_DRAIN_BYTES", 2000, raising=False)
+    spawned = []
+    real_spawn = os.posix_spawn
+
+    def spy(path, argv, env, **k):
+        spawned.append(argv)
+        return real_spawn(path, argv, env, **k)
+    monkeypatch.setattr(os, "posix_spawn", spy)
+    for i in range(20):
+        assert history.enqueue(_rec(i))
+    assert len(spawned) == 1 and spawned[0][0] == sys.executable  # rate-limited
+    for _ in range(200):
+        if history.usage_path().exists() and not history.queue_path().exists() or \
+                history.usage_path().exists() and history.queue_path().stat().st_size < 2000:
+            break
+        time.sleep(0.05)
+    u = json.loads(history.usage_path().read_text())
+    assert sum(d["n"] for d in u["days"].values()) >= 10

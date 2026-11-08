@@ -77,7 +77,9 @@ if you have not set them yourself:
   started (for measured durations) and which window was focused, and starts the
   archive recorder. Voxtype starts capturing before it runs this hook, so the hook
   cannot cost you words. The hook returns in about 13 ms. The rest runs in the background.
-- `post_output_command`, only for the archive or the learning watcher. Voxtype waits
+- `post_output_command`, for usage, history, the archive or the learning watcher.
+  After each dictation it moves the queue into `usage.json` and `history.jsonl`, so
+  nothing has to open the panel for the counts to stay current. Voxtype waits
   for this hook before it can record again, so the hook only claims this
   dictation's record (by id, before Voxtype can start the next one), starts a
   background process and returns. A background process that starts late still
@@ -91,7 +93,10 @@ command -v voxtype-tui-hook >/dev/null 2>&1 && exec voxtype-tui-hook pre-recordi
 
 If you already have your own `pre_recording_command` or `post_output_command`,
 voxtype-tui leaves it alone. The feature that needs it shows as unavailable,
-with the reason. With your own post-processing command (an LLM cleanup script,
+with the reason. Usage and history keep working with your own
+`post_output_command`: once the queue passes 256 KiB, the post-process starts
+one background drain (at most once a minute), so the queue never fills up and
+drops dictations. With your own post-processing command (an LLM cleanup script,
 say), usage and history are unavailable, because voxtype-tui never sees the text.
 
 Changing these settings needs a daemon restart, like any Voxtype config change.

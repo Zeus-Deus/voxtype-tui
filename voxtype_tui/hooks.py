@@ -21,9 +21,12 @@ works — also measured.)
   it timestamps the recording start (for measured durations), notes the
   focused window and, for the archive, starts a detached recorder. Voxtype
   starts capturing before it runs this hook, so it cannot cost first words.
-* ``post_output_command`` is wired when the archive is on or the learning
+* ``post_output_command`` is wired when usage, history or the archive is
+  on (the worker drains the queue after every dictation), or the learning
   watcher exists and learning is on. Voxtype waits for this hook before it
-  goes idle, so the hook forks its work into a detached process and returns.
+  goes idle, so the hook forks its work into a detached process and
+  returns. With the user's own post_output_command, the post-process CLI
+  starts a detached drain once the queue is large (see history.enqueue).
 * ``pre_output_command`` is never wired.
 * ``[output.post_process]`` is wired (non-destructively, as before) when any
   capture feature or vocabulary/dictionary needs it.
@@ -88,7 +91,9 @@ def needed(feats: dict) -> dict[str, bool]:
     learning = feats["learning"]["enabled"] and _module_exists("voxtype_tui.learn_watch")
     return {
         PRE_RECORDING: bool(capture),
-        POST_OUTPUT: bool(archive or learning),
+        # Usage/history need it too: the detached post-output worker drains
+        # the queue after every dictation, without anyone reading.
+        POST_OUTPUT: bool(capture or learning),
         "post_process": bool(capture or feats["learning"]["enabled"]),
     }
 
@@ -632,6 +637,10 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(unwire_all()))
         elif event == "--sync":
             print(json.dumps(sync_config()))
+        elif event == "--maintain":
+            from . import history
+
+            history.maintain()
         else:
             sys.stderr.write("usage: voxtype-tui-hook pre-recording|pre-output|post-output\n")
     except Exception as e:  # never break dictation
