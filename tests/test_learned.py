@@ -367,7 +367,8 @@ def test_r1_same_letters_spelling_applies():
 
 def test_r1_fail_open_returns_original_input():
     L.compiled_path().parent.mkdir(parents=True, exist_ok=True)
-    L.compiled_path().write_text(json.dumps({"aliases": {"omashi": ["Omarchy", "l_x"]},
+    L.store_path().write_text(json.dumps({"version": 1, "entries": [], "generation": "g1"}))
+    L.compiled_path().write_text(json.dumps({"aliases": {"omashi": ["Omarchy", "l_x"]}, "generation": "g1",
                                              "max_n": 1, "terms": 5}))  # aliases ok, terms broken
     assert L.apply("on Omashi") == ("on Omashi", [])
 
@@ -496,3 +497,41 @@ def test_no_wordlist_explicit_kind_is_still_honoured(monkeypatch):
     out = L.submit_correction(rec("on Omashi"), "on Omarchy", "fix", kind="sounds_like")
     assert out["applied"][0]["kind"] == "sounds_like"
     assert L.apply("on Omashi")[0] == "on Omarchy"
+
+
+def _fail_compiled_writes(monkeypatch):
+    real = L._atomic_write_json
+
+    def write(path, data, **k):
+        if Path(path) == L.compiled_path():
+            raise OSError(28, "No space left on device")
+        return real(path, data, **k)
+    monkeypatch.setattr(L, "_atomic_write_json", write)
+
+
+def test_stale_compiled_file_never_outlives_a_reject(monkeypatch):
+    eid = L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")["applied"][0]["id"]
+    assert L.apply("on Omashi")[0] == "on Omarchy"
+    _fail_compiled_writes(monkeypatch)
+    with pytest.raises(OSError):
+        L.reject(eid)  # learned.json committed, learned.apply.json did not
+    assert L.load()["entries"][0]["state"] == "rejected"
+    assert L.apply("on Omashi") == ("on Omashi", [])
+
+
+def test_stale_compiled_file_falls_back_to_the_store(monkeypatch):
+    L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")
+    _fail_compiled_writes(monkeypatch)
+    with pytest.raises(OSError):
+        L.submit_correction(rec("ask code max now", "r2"), "ask Codemax now", "fix", kind="replace")
+    # the new entry is in the store only: apply uses the store, not the old compiled copy
+    assert L.apply("on Omashi and code max")[0] == "on Omarchy and Codemax"
+
+
+def test_copied_files_keep_using_the_compiled_copy(tmp_path):
+    eid = L.submit_correction(rec("on Omashi"), "on Omarchy", "fix")["applied"][0]["id"]
+    for p in (L.store_path(), L.compiled_path()):  # e.g. restored from a backup: new inodes
+        data = p.read_bytes()
+        p.unlink()
+        p.write_bytes(data)
+    assert L.apply("on Omashi") == ("on Omarchy", [eid])

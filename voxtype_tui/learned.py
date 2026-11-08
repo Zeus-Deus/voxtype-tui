@@ -204,10 +204,25 @@ def _valid_entry(e: object) -> bool:
 
 
 def _save(store: dict) -> None:
-    """Write the store and the compiled apply file. Caller holds the lock."""
+    """Write the store and the compiled apply file. Caller holds the lock.
+
+    Both carry the same ``generation`` and the compiled file records the
+    store file's identity, so :func:`apply` can tell when a crash or a
+    failed write left the compiled copy behind the store (it then works
+    from the store instead)."""
     _recompute_dormant(store)
+    store["generation"] = os.urandom(8).hex()
     _atomic_write_json(store_path(), store)
-    _atomic_write_json(compiled_path(), _compile(store), indent=None)
+    comp = _compile(store)
+    comp["generation"] = store["generation"]
+    comp["store"] = _file_key(store_path())
+    _atomic_write_json(compiled_path(), comp, indent=None)
+
+
+def _file_key(path: Path) -> list[int]:
+    """Cheap identity of a file (one stat): changes on every atomic save."""
+    st = os.stat(path)
+    return [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
 
 
 # ---------------------------------------------------------------- flags
@@ -809,6 +824,33 @@ def _load_compiled() -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _current_view() -> dict | None:
+    """The compiled view that matches ``learned.json``.
+
+    Fast path: the compiled file names the store file it was built from
+    (one stat). Otherwise (a write between the two files failed, or the
+    files were copied) read the store: same generation = the compiled file
+    is still right; else compile the store in memory. No store = nothing
+    learned, whatever an orphan compiled file says."""
+    comp = _load_compiled()
+    try:
+        key = _file_key(store_path())
+    except OSError:
+        return None
+    if comp is not None and comp.get("store") == key:
+        return comp
+    try:
+        raw = json.loads(store_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    gen = raw.get("generation") if isinstance(raw, dict) else None
+    if comp is not None and isinstance(gen, str) and comp.get("generation") == gen:
+        return comp
+    store = load()
+    _recompute_dormant(store)
+    return _compile(store)
+
+
 def _overlaps(a: int, b: int, spans: list[tuple[int, int]]) -> bool:
     return any(a < e and s < b for s, e in spans)
 
@@ -871,7 +913,7 @@ def apply(text: str, protected_spans: Iterable[tuple[int, int]] = (), *,
     try:
         if not text or not isinstance(text, str) or len(text) > MAX_TEXT_CHARS:
             return text, []
-        comp = _load_compiled()
+        comp = _current_view()
         if not comp or not (comp.get("aliases") or comp.get("terms")):
             return text, []
         if not learning_flags()["enabled"]:

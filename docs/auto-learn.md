@@ -108,7 +108,7 @@ paused. Reset deletes all of them.
 | File | Content |
 |---|---|
 | `~/.config/voxtype-tui/learned.json` | learned entries (0600) |
-| `~/.config/voxtype-tui/learned.apply.json` | compiled copy read on every dictation (derived) |
+| `~/.config/voxtype-tui/learned.apply.json` | compiled copy read on every dictation (derived; stamped with the generation of `learned.json` and ignored when it does not match, e.g. after a failed write) |
 | `~/.config/voxtype-tui/learn-everywhere.json` | which managed edits are ours |
 | `$XDG_RUNTIME_DIR/voxtype-tui/learn-watch.log` | watcher events, no text (RAM) |
 
