@@ -31,10 +31,10 @@ def test_span_shifts_on_edit_before_and_ignores_after():
     assert s.text() == "the option on Omashi."
 
 
-def test_span_includes_typing_right_after():
+def test_span_does_not_take_in_new_words_typed_after_it():
     s = W.Span("on Omashi", 0, 9)
     s.update("on Omashi and more")
-    assert s.text() == "on Omashi and more"
+    assert s.text() == "on Omashi"
 
 
 def test_span_straddling_edit_is_broken():
@@ -217,3 +217,103 @@ def test_repeat_on_an_already_active_entry_does_not_notify(tmp_path, monkeypatch
     _drive_watch(monkeypatch, o, e, "w1")   # unambiguous: active at once, notified
     _drive_watch(monkeypatch, o, e, "w2")   # nothing new became active
     assert len(notified) == 1
+
+
+# ---------------------------------------------------------------- replaced by a newer dictation
+
+def _run_child_and_term(tmp_path, scenario):
+    """Run the real on_post_output in a child process against a fake field
+    and SIGTERM it once ``scenario`` is reached, as a newer watcher does."""
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+    repo = Path(__file__).resolve().parent.parent
+    work = tmp_path / "work"
+    work.mkdir()
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("XDG_", "VOXTYPE_TUI_LEARN"))}
+    env.update(HOME=str(tmp_path), XDG_CONFIG_HOME=str(tmp_path / "config"),
+               XDG_DATA_HOME=str(tmp_path / "data"), XDG_STATE_HOME=str(tmp_path / "state"),
+               XDG_RUNTIME_DIR=str(tmp_path / "run"), PYTHONPATH=str(repo),
+               VOXTYPE_TUI_SYSTEMCTL="0")
+    env.pop("HYPRLAND_INSTANCE_SIGNATURE", None)
+    child = subprocess.Popen([sys.executable, str(repo / "tests" / "_learn_watch_child.py"),
+                              scenario, str(work)], cwd=str(repo), env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        until = time.monotonic() + 20
+        while not (work / "ready").exists():
+            assert child.poll() is None, child.communicate()
+            assert time.monotonic() < until, "child never reached the scenario"
+            time.sleep(0.02)
+        time.sleep(0.1)
+        child.send_signal(signal.SIGTERM)
+        code = child.wait(timeout=10)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+    out = work / "out.json"
+    return code, (json.loads(out.read_text()) if out.exists() else None), tmp_path
+
+
+def test_sigterm_while_waiting_for_the_text_returns_normally(tmp_path):
+    code, out, _home = _run_child_and_term(tmp_path, "prearm")
+    assert code == 0                        # not killed by the default SIGTERM action
+    assert out is not None and out["cleanup"] is True   # the caller's finally ran
+    assert out["res"]["ok"] is False and out["res"]["reason"] == "replaced by a newer dictation"
+
+
+def test_replaced_by_a_newer_dictation_never_learns(tmp_path):
+    code, out, home = _run_child_and_term(tmp_path, "armed")
+    assert code == 0 and out is not None and out["cleanup"] is True
+    res = out["res"]
+    assert res["end"] == "replaced by a newer dictation"
+    assert "learned" not in res
+    store = home / "config" / "voxtype-tui" / "learned.json"
+    entries = json.loads(store.read_text())["entries"] if store.exists() else []
+    assert entries == []
+
+
+def test_span_ignores_text_glued_to_the_end_of_a_finished_sentence():
+    s = W.Span("Make it simple.", 0, 15)
+    s.update("Make it simple.Hey")
+    s.update("Make it simple.Hey there.")
+    assert s.text() == "Make it simple."
+
+
+def test_span_keeps_retyping_the_last_word():
+    full = "on Omashi"
+    s = W.Span(full, 0, len(full))
+    for n in range(1, 7):                    # backspace "Omashi"
+        s.update(full[:-n])
+    for n in range(1, len("Omarchy") + 1):   # retype it
+        s.update("on " + "Omarchy"[:n])
+    assert s.text() == "on Omarchy"
+
+
+def test_span_keeps_retyping_after_deleting_the_whole_last_word_and_its_space():
+    full = "on Omashi."
+    s = W.Span(full, 0, len(full))
+    cur = full
+    while cur != "on":
+        cur = cur[:-1]
+        s.update(cur)
+    for ch in " Omarchy.":
+        cur += ch
+        s.update(cur)
+    assert s.text() == "on Omarchy."
+
+
+def test_span_keeps_finishing_a_cut_off_last_word():
+    s = W.Span("on Omarch", 0, 9)
+    s.update("on Omarchy")
+    assert s.text() == "on Omarchy"
+
+
+def test_span_still_sees_return_typed_at_its_end():
+    s = W.Span("on Omarchy.", 0, 11)
+    s.update("on Omarchy.\n")
+    assert s.text() == "on Omarchy.\n"

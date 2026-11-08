@@ -16,7 +16,9 @@ delivered a dictation. It then:
    edited span to :func:`learned.submit_correction` with source ``atspi``.
 
 It costs nothing while idle: it only exists for one correction window.
-A newer dictation replaces a running watcher. Every failure just exits.
+A newer dictation replaces a running watcher (SIGTERM): it then ends at
+once and learns nothing from that window, because the newer text may
+already sit right after the span. Every failure just exits.
 Terminals expose no text over AT-SPI and are skipped up front; use History
 > Fix there.
 
@@ -50,8 +52,11 @@ NO_TEXT_CLASSES = frozenset({
     "ghostty", "org.wezfurlong.wezterm", "wezterm", "xterm", "st", "urxvt",
 })
 
+REPLACED = "replaced by a newer dictation"
+
 _log_path: Path | None = None
 _verbose = False
+_term = {"requested": False}
 
 
 def _runtime_dir() -> Path:
@@ -109,8 +114,36 @@ def spawn(record_id: str | None = None, text: str | None = None) -> bool:
 
 # ---------------------------------------------------------------- single instance
 
+def _on_sigterm(_signum, _frame) -> None:
+    _term["requested"] = True
+
+
+def _replaced() -> bool:
+    return bool(_term["requested"])
+
+
+def _hold_sigterm():
+    """From now on SIGTERM (a newer dictation's watcher) only asks this
+    watcher to end: every wait loop checks :func:`_replaced` and returns
+    normally, so callers' cleanup runs. Returns the previous handler."""
+    _term["requested"] = False
+    try:
+        return signal.signal(signal.SIGTERM, _on_sigterm)
+    except ValueError:  # not the main thread: keep the default
+        return None
+
+
+def _restore_sigterm(prev) -> None:
+    if prev is None:
+        return
+    with contextlib.suppress(ValueError, TypeError):
+        if signal.getsignal(signal.SIGTERM) is _on_sigterm:
+            signal.signal(signal.SIGTERM, prev)
+
+
 def _claim_slot() -> None:
-    """Replace any running watcher: it finishes its window now."""
+    """Replace any running watcher: it finishes its window now. Call
+    :func:`_hold_sigterm` first, so a newer watcher can't kill this one."""
     d = _runtime_dir()
     d.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
@@ -305,14 +338,32 @@ def locate(full: str, needle: str, caret_at: int) -> int:
     return best
 
 
+def _wordish(ch: str) -> bool:
+    return ch.isalnum() or ch in "'\u2019-_"
+
+
 class Span:
-    """The dictated span inside a field, kept up to date as the text changes."""
+    """The dictated span inside a field, kept up to date as the text changes.
+
+    Text typed right at its end joins it only when it is part of fixing the
+    span: Return, finishing its last word (``Omarch`` + ``y``), or retyping
+    after you deleted back into it. Anything else typed after it (new words,
+    or a newer dictation glued to ``simple.``) is outside the span."""
 
     def __init__(self, full: str, start: int, end: int):
         self.prev = full
         self.start = start
         self.end = end
         self.broken = False
+        self.retyping = False  # an edit reached the span's end: retyped text belongs to it
+
+    def _joins(self, inserted: str) -> bool:
+        if not inserted:
+            return False
+        if inserted[0] == "\n" or self.retyping:
+            return True
+        last = self.prev[self.end - 1] if self.end > self.start else ""
+        return bool(last) and _wordish(last) and _wordish(inserted[0])
 
     def update(self, cur: str) -> None:
         prev = self.prev
@@ -327,10 +378,13 @@ class Span:
             s += 1
         old_a, old_b = p, len(prev) - s  # changed range in prev
         delta = len(cur) - len(prev)
-        if old_a >= self.start and old_b <= self.end + 0:
-            self.end += delta          # edit inside (or at the end of) the span
-        elif old_a == self.end and old_b == self.end:
-            self.end += delta          # typing right after it
+        if old_a == old_b == self.end:
+            if self._joins(cur[p:len(cur) - s]):
+                self.end += delta      # typing right after it, as part of the fix
+        elif old_a >= self.start and old_b <= self.end:
+            if old_b == self.end and old_b > old_a:
+                self.retyping = True   # deleted or replaced up to the end
+            self.end += delta          # edit inside the span
         elif old_b <= self.start:
             self.start += delta        # edit before it: shift
             self.end += delta
@@ -375,11 +429,15 @@ def watch(final: str, *, window: dict | None, record: dict | None, window_s: flo
     find_until = min(deadline, time.monotonic() + FIND_RETRY_S)
     pids = _pid_tree(int(window["pid"]))
     while True:
+        if _replaced():
+            return {**res, "reason": REPLACED}
         apps = find_apps(Atspi, pids)
         node = find_focused_text(Atspi, apps) if apps else None
         if node is not None or time.monotonic() >= find_until:
             break
         time.sleep(0.2)
+    if _replaced():
+        return {**res, "reason": REPLACED}
     if node is None:
         return {**res, "reason": f"no focused text field on the accessibility bus ({cls})"}
     if is_password(Atspi, node):
@@ -392,6 +450,9 @@ def watch(final: str, *, window: dict | None, record: dict | None, window_s: flo
     # user pastes it themselves).
     span = None
     while time.monotonic() < deadline:
+        if _replaced():
+            log(f"end: {REPLACED} (before the dictated text appeared)")
+            return {**res, "reason": REPLACED}
         st0 = _states(Atspi, node)
         if Atspi.StateType.DEFUNCT in st0 or Atspi.StateType.FOCUSED not in st0:
             return {**res, "reason": "focus left before the dictated text appeared"}
@@ -415,6 +476,10 @@ def watch(final: str, *, window: dict | None, record: dict | None, window_s: flo
 
     def sample(_why: str) -> None:
         if state["end"]:
+            return
+        if _replaced():
+            # Checked before reading: the newer text may already be in the field.
+            finish(REPLACED)
             return
         st = _states(Atspi, node)
         if Atspi.StateType.DEFUNCT in st:
@@ -460,18 +525,17 @@ def watch(final: str, *, window: dict | None, record: dict | None, window_s: flo
         listener.register("object:state-changed:focused")
 
     def tick() -> bool:
+        if _replaced():
+            finish(REPLACED)
+            return False
         if time.monotonic() >= deadline:
             finish("timeout")
             return False
         sample("poll")
         return not state["end"]
 
-    def on_term(*_a) -> bool:
-        finish("replaced by a newer dictation")
-        return False
-
-    with contextlib.suppress(Exception):
-        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, on_term)
+    # SIGTERM is handled by the Python handler installed at slot claim
+    # (_hold_sigterm) for the watcher's whole life; the poll sees it.
     GLib.timeout_add(POLL_MS, tick)
     loop.run()
     with contextlib.suppress(Exception):
@@ -483,6 +547,10 @@ def watch(final: str, *, window: dict | None, record: dict | None, window_s: flo
     res = {"ok": True, "end": state["end"], "edited": edited if _debug_text() else len(edited),
            "changed": edited.strip() != needle}
     log(f"end: {state['end']} edited={_t(edited)}")
+    if state["end"] == REPLACED:
+        # The newer dictation may be glued to the span: never learn from it.
+        # History > Fix still works for this dictation.
+        return res
     if state.get("broken") or edited.strip() == needle or not submit:
         return res
     rec = dict(record or {})
@@ -516,6 +584,8 @@ def _record_text(record_id: str | None) -> dict | None:
     if not record_id:
         return None
     for _ in range(10):  # the record may land a moment after post-output
+        if _replaced():
+            return None
         rec = learned.find_record(record_id)
         if rec:
             return rec
@@ -550,6 +620,7 @@ def on_post_output(record: dict, window: dict | None = None) -> dict | None:
     started (the delivery window); without it the window is read now, which
     is later when the hook did other work first. Never raises."""
     global _log_path
+    prev_term = None
     try:
         if window is None:
             window = active_window()  # the window the text was just delivered to
@@ -561,6 +632,7 @@ def on_post_output(record: dict, window: dict | None = None) -> dict | None:
             return None
         _runtime_dir().mkdir(parents=True, exist_ok=True)
         _log_path = _runtime_dir() / "learn-watch.log"
+        prev_term = _hold_sigterm()
         _claim_slot()
         rec = dict(record)
         if window is not None:
@@ -574,6 +646,7 @@ def on_post_output(record: dict, window: dict | None = None) -> dict | None:
         return None
     finally:
         _release_slot()
+        _restore_sigterm(prev_term)
 
 
 def _safe_result(res: dict) -> dict:
@@ -595,12 +668,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
     _verbose = a.verbose
+    prev_term = None
     try:
         from . import learned
         if not learned.is_enabled():
             return 0
         _runtime_dir().mkdir(parents=True, exist_ok=True)
         _log_path = _runtime_dir() / "learn-watch.log"
+        prev_term = _hold_sigterm()
         _claim_slot()
         rec = _record_text(a.id) if a.id else None
         if rec is None and a.text is None:
@@ -620,6 +695,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     finally:
         _release_slot()
+        _restore_sigterm(prev_term)
 
 
 if __name__ == "__main__":
